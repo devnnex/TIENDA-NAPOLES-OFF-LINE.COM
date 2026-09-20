@@ -2,6 +2,7 @@ const SYNC_INTERVAL_MS = 1500;
 const CHAT_SYNC_INTERVAL_MS = 1200;
 const OFFLINE_SYNC_PULSE_MS = 2500;
 const REMOTE_STORAGE_POLL_MS = 4000;
+const REMOTE_CONFIRMATION_HOLD_MS = 15000;
 
 const SUPABASE_CONFIG = {
   url: "https://izvcbkwgtciuoampunba.supabase.co",
@@ -1022,9 +1023,25 @@ const App = (() => {
     }
   };
 
-  const flushOfflineQueue = (force = false) => {
-    navigator.serviceWorker?.controller?.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force });
-  };
+  const flushOfflineQueue = (force = false, timeoutMs = 30000) => new Promise((resolve) => {
+    const controller = navigator.serviceWorker?.controller;
+    if (!controller) {
+      resolve({ ok: false, counts: { pending: 1, syncing: 0, confirmed: 0, failed: 0, conflict: 0 } });
+      return;
+    }
+    const channel = new MessageChannel();
+    let finished = false;
+    const finish = (result) => {
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(timer);
+      channel.port1.close();
+      resolve(result || { ok: false, counts: { pending: 1 } });
+    };
+    const timer = window.setTimeout(() => finish({ ok: false, counts: { pending: 1 } }), timeoutMs);
+    channel.port1.onmessage = (event) => finish(event.data || { ok: false, counts: { pending: 1 } });
+    controller.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force }, [channel.port2]);
+  });
 
   const getOfflineSyncStatus = (timeoutMs = 800) => new Promise((resolve) => {
     const controller = navigator.serviceWorker?.controller;
@@ -2187,6 +2204,19 @@ const App = (() => {
     }
   };
 
+  const flushPendingOfflineWrites = async () => {
+    const result = await flushOfflineQueue(true);
+    const counts = result?.counts || await getOfflineSyncStatus();
+    return !navigator.onLine || Number(counts.pending || 0) + Number(counts.syncing || 0) === 0;
+  };
+
+  const refreshOperationalDataNow = async () => {
+    const flushed = await flushPendingOfflineWrites();
+    if (!flushed) return false;
+    await refreshAdminNow();
+    return true;
+  };
+
   const startRemoteStoragePolling = () => {
     window.clearInterval(state.remoteStoragePollTimer);
     state.remoteStoragePollTimer = window.setInterval(() => { void refreshRemoteStorageNow(); }, REMOTE_STORAGE_POLL_MS);
@@ -3252,6 +3282,7 @@ const App = (() => {
   const mergeOptimisticSessions = (serverSessions = []) => {
     const merged = new Map(serverSessions.map((session) => [session.id, session]));
     state.optimisticSessionStates.forEach((overlay, sessionId) => {
+      const now = Date.now();
       const serverSession = merged.get(sessionId);
       if (overlay.mode === "remove") {
         merged.delete(sessionId);
@@ -3269,7 +3300,12 @@ const App = (() => {
         String(serverSession?.assigned_waiter_id || "") === String(overlay.expectedSession.assigned_waiter_id || "")
       );
       if (serverSession && expectedItemConfirmed && expectedSessionConfirmed) {
-        state.optimisticSessionStates.delete(sessionId);
+        const confirmedAt = Number(overlay.confirmedAt || now);
+        if (now - confirmedAt >= REMOTE_CONFIRMATION_HOLD_MS) {
+          state.optimisticSessionStates.delete(sessionId);
+        } else {
+          state.optimisticSessionStates.set(sessionId, { ...overlay, session: serverSession, confirmedAt });
+        }
         merged.set(sessionId, serverSession);
       } else {
         merged.set(sessionId, overlay.session);
@@ -8120,6 +8156,7 @@ const App = (() => {
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
         await runRefreshAction(target, async () => {
+          if (!await refreshOperationalDataNow()) return false;
           const flushed = await flushAppsScriptOutbox();
           if (!flushed || readAppsScriptOutbox().length) return false;
           const coreRefreshed = await refreshCoreNow();
@@ -8130,7 +8167,10 @@ const App = (() => {
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
-      if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => (await loadIncomeReport()) || !navigator.onLine, "Ingresos actualizados.");
+      if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => {
+        if (!await refreshOperationalDataNow()) return false;
+        return (await loadIncomeReport()) || !navigator.onLine;
+      }, "Ingresos actualizados.");
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
       if (target.id === "cancelInventoryEdit") {
@@ -8138,6 +8178,7 @@ const App = (() => {
         $("#inventoryDialog")?.close();
       }
       if (target.id === "refreshInventoryMovements") await runRefreshAction(target, async () => {
+        if (!await refreshOperationalDataNow()) return false;
         if (!navigator.onLine) {
           renderInventoryMovements();
           return true;

@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.6.0",
+  version: "2.7.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -24,7 +24,8 @@ var APP = {
     details: "Detalle_Ventas",
     payments: "Pagos",
     movements: "Movimientos_Inventario",
-    daily: "Ingresos_Diarios"
+    daily: "Ingresos_Diarios",
+    operations: "Operaciones_Sync"
   }
 };
 
@@ -54,7 +55,8 @@ var HEADERS = {
     "fecha", "numero_ventas", "ingreso_bruto", "efectivo", "transferencia", "bre_b",
     "descuentos", "impuestos", "servicio", "costo_mercancia", "utilidad_bruta", "actualizado_en",
     "ventas_procesadas"
-  ]
+  ],
+  operations: ["operation_id", "accion", "estado", "creado_en"]
 };
 
 function onOpen() {
@@ -141,6 +143,10 @@ function apiRequest(payloadText) {
     }
     var user = validateSupabaseUser_(request.authToken);
     var payload = request.payload || {};
+    var operationId = String(request.operationId || "").trim();
+    if (operationId && syncOperationExists_(operationId)) {
+      return { ok: true, duplicate: true, operationId: operationId };
+    }
     var result;
     if (request.action === "get_inventory") result = getInventory_();
     else if (request.action === "get_inventory_movements") {
@@ -154,7 +160,7 @@ function apiRequest(payloadText) {
     else if (request.action === "record_sale") result = recordSale_(payload.invoice, user, request.authToken);
     else if (request.action === "edit_sale") {
       requireAdmin_(user);
-      result = editSale_(payload.invoice, user);
+      result = editSale_(payload.invoice, user, operationId);
     }
     else if (request.action === "delete_sale") {
       requireAdmin_(user);
@@ -192,6 +198,7 @@ function apiRequest(payloadText) {
     }
     if (result && result.ok === false) return result;
     result.ok = true;
+    if (operationId) recordSyncOperation_(operationId, request.action);
     return result;
   } catch (error) {
     try {
@@ -269,6 +276,22 @@ function ensureAllSheets_(spreadsheet) {
   ensureSheet_(spreadsheet, APP.sheets.payments, HEADERS.payments);
   ensureSheet_(spreadsheet, APP.sheets.movements, HEADERS.movements);
   ensureSheet_(spreadsheet, APP.sheets.daily, HEADERS.daily);
+  ensureSheet_(spreadsheet, APP.sheets.operations, HEADERS.operations);
+}
+
+function syncOperationExists_(operationId) {
+  if (!operationId) return false;
+  var sheet = getSpreadsheet_().getSheetByName(APP.sheets.operations);
+  if (!sheet || sheet.getLastRow() < 2) return false;
+  return Boolean(sheet.getRange(2, 1, sheet.getLastRow() - 1, 1)
+    .createTextFinder(operationId).matchEntireCell(true).findNext());
+}
+
+function recordSyncOperation_(operationId, action) {
+  if (!operationId) return;
+  var sheet = getSpreadsheet_().getSheetByName(APP.sheets.operations);
+  if (!sheet || syncOperationExists_(operationId)) return;
+  sheet.appendRow([operationId, String(action || ""), "confirmed", new Date().toISOString()]);
 }
 
 function seedConfiguration_(spreadsheet) {
@@ -493,6 +516,18 @@ function upsertInventory_(item, user) {
     var table = readInventoryTable_();
     var rowIndex = findInventoryIndex_(table.rows, item.productId);
     var current = rowIndex >= 0 ? table.rows[rowIndex] : null;
+    var hasRequestedVersion = item.version !== undefined && item.version !== null && item.version !== "";
+    var requestedVersion = asNumber_(item.version);
+    var currentVersion = current ? asNumber_(current[12]) : 0;
+    if (current && hasRequestedVersion && requestedVersion < currentVersion) {
+      return {
+        ok: false,
+        retryable: false,
+        conflict: true,
+        error: "El inventario remoto tiene una versión más reciente.",
+        item: inventoryRowToObject_(current)
+      };
+    }
     var next = inventoryObjectToRow_(item, current);
     var beforeStock = current ? asNumber_(current[7]) : 0;
     var afterStock = asNumber_(next[7]);
@@ -523,6 +558,8 @@ function syncInventory_(items, user) {
       if (!item || !item.productId) return;
       var rowIndex = findInventoryIndex_(rows, item.productId);
       var current = rowIndex >= 0 ? rows[rowIndex] : null;
+      var hasRequestedVersion = item.version !== undefined && item.version !== null && item.version !== "";
+      if (current && hasRequestedVersion && asNumber_(item.version) < asNumber_(current[12])) return;
       var next = inventoryObjectToRow_(item, current);
       if (rowIndex >= 0) rows[rowIndex] = next;
       else rows.push(next);
@@ -590,6 +627,16 @@ function setInventoryStock_(payload, user) {
     var rowIndex = findInventoryIndex_(table.rows, productId);
     if (rowIndex < 0) return { ok: false, retryable: false, error: "El producto ya no existe en el inventario." };
     var row = table.rows[rowIndex];
+    var hasRequestedVersion = payload.version !== undefined && payload.version !== null && payload.version !== "";
+    if (hasRequestedVersion && asNumber_(payload.version) < asNumber_(row[12])) {
+      return {
+        ok: false,
+        retryable: false,
+        conflict: true,
+        error: "La existencia remota tiene una versión más reciente.",
+        item: inventoryRowToObject_(row)
+      };
+    }
     row[7] = stock;
     row[10] = String(payload.updatedAt || new Date().toISOString());
     row[12] = asNumber_(row[12]) + 1;
@@ -795,7 +842,7 @@ function writeDataRows_(sheet, rows, width) {
   if (previous > rows.length) sheet.getRange(rows.length + 2, 1, previous - rows.length, width).clearContent();
 }
 
-function editSale_(invoice, user) {
+function editSale_(invoice, user, operationId) {
   if (!invoice || !invoice.id || !invoice.totals || !Array.isArray(invoice.items) || !invoice.items.length) throw new Error("Correccion de venta incompleta.");
   return withScriptLock_(function () {
     var spreadsheet = getSpreadsheet_();
@@ -830,6 +877,8 @@ function editSale_(invoice, user) {
       var inventoryIndex = findInventoryIndex_(inventory.rows, productId);
       if (inventoryIndex < 0) return;
       var row = inventory.rows[inventoryIndex];
+      var operationMarker = "CORRECCION_VENTA " + safeText_(operationId || saleId);
+      if (String(row[11] || "") === operationMarker) return;
       var delta = asNumber_(oldQuantityByProduct[productId]) - asNumber_(newQuantityByProduct[productId]);
       if (!delta) return;
       var before = asNumber_(row[7]);
@@ -837,10 +886,10 @@ function editSale_(invoice, user) {
       if (after < 0) throw new Error("La correccion requiere mas existencias de " + String(row[2] || "un producto") + " de las disponibles.");
       row[7] = after;
       row[10] = new Date().toISOString();
-      row[11] = "CORRECCION_VENTA " + saleId;
+      row[11] = operationMarker;
       row[12] = asNumber_(row[12]) + 1;
       inventory.rows[inventoryIndex] = row;
-      editMovements.push(["EDIT-" + saleId + "-" + productId + "-" + new Date().getTime(), productId, safeText_(row[1]), safeText_(row[2]), "CORRECCION_VENTA", delta, before, after, asNumber_(row[5]), safeText_(invoice.number), safeText_(invoice.sessionId), new Date().toISOString(), safeText_(user.full_name || user.username)]);
+      editMovements.push(["EDIT-" + safeText_(operationId || saleId) + "-" + productId, productId, safeText_(row[1]), safeText_(row[2]), "CORRECCION_VENTA", delta, before, after, asNumber_(row[5]), safeText_(invoice.number), safeText_(invoice.sessionId), new Date().toISOString(), safeText_(user.full_name || user.username)]);
     });
     writeInventoryRows_(inventory.sheet, inventory.rows);
     appendRows_(movementsSheet, editMovements);
@@ -916,11 +965,13 @@ function deleteSale_(saleIdValue, user) {
       var inventoryIndex = findInventoryIndex_(inventory.rows, productId);
       if (inventoryIndex < 0) return;
       var row = inventory.rows[inventoryIndex];
+      var deleteMarker = "VENTA_ELIMINADA " + saleId;
+      if (String(row[11] || "") === deleteMarker) return;
       var before = asNumber_(row[7]);
       var after = before + quantities[productId];
       row[7] = after;
       row[10] = now;
-      row[11] = "VENTA_ELIMINADA " + saleId;
+      row[11] = deleteMarker;
       row[12] = asNumber_(row[12]) + 1;
       inventory.rows[inventoryIndex] = row;
       restoredMovements.push(["DELETE-SALE-" + saleId + "-" + productId, productId, safeText_(row[1]), safeText_(row[2]), "VENTA_ELIMINADA", quantities[productId], before, after, asNumber_(row[5]), safeText_(sale[1]), safeText_(sale[2]), now, safeText_(user.full_name || user.username)]);

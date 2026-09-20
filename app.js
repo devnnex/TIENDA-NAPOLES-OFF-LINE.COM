@@ -1,18 +1,20 @@
-const SYNC_INTERVAL_MS = 5000;
+const SYNC_INTERVAL_MS = 1500;
 const CHAT_SYNC_INTERVAL_MS = 1200;
+const OFFLINE_SYNC_PULSE_MS = 2500;
+const REMOTE_STORAGE_POLL_MS = 4000;
 
 const SUPABASE_CONFIG = {
   url: "https://izvcbkwgtciuoampunba.supabase.co",
   anonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml6dmNia3dndGNpdW9hbXB1bmJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc0MzEzMzIsImV4cCI6MjEwMzAwNzMzMn0.cA7GCGeA-140TginBpEHPULKJrEDkpt3ixAMuAwzoPY"
 };
 
-// Al duplicar una instalación se pega a veces la URL REST completa. supabase-js
-// necesita solo el origen del proyecto y construye internamente /rest/v1.
+try { SUPABASE_CONFIG.url = new URL(String(SUPABASE_CONFIG.url || "").trim()).origin; } catch (error) { /* La validación existente mostrará la configuración incompleta. */ }
+
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
   webAppUrl: "https://script.google.com/macros/s/AKfycbzG7bSHYEjNAV0hXgTUX43ydzDFufw8IAJ31ZneZWcTbpDktI8lSli4YqeGxhWn9SjWtA/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.6.0";
+const APPS_SCRIPT_REQUIRED_VERSION = "2.7.0";
 
 const SupabaseDb = (() => {
   let authToken = "";
@@ -23,6 +25,8 @@ const SupabaseDb = (() => {
     getAdminSnapshot: "get_admin_snapshot",
     getClientSnapshot: "get_client_snapshot",
     getClientTableState: "get_client_table_state",
+    getInitialSetupStatus: "get_initial_setup_status",
+    bootstrapFirstAdmin: "bootstrap_first_admin",
     getCurrentUser: "get_current_user",
     listUsers: "list_users",
     saveUser: "save_user",
@@ -87,6 +91,8 @@ const App = (() => {
   const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
   const TIP_SETTINGS_STORAGE_KEY = "tienda_napoles_tip_settings_v1";
   const TIP_SPLIT_STORAGE_KEY = "tienda_napoles_tip_split_people_v1";
+  const TIP_RESET_STORAGE_KEY = "tienda_napoles_tip_reset_invoices_v1";
+  const OFFLINE_ADMIN_SNAPSHOT_KEY = "tienda_napoles_offline_admin_snapshot_v1";
   const USER_LIST_CACHE_KEY = "tienda_napoles_users_v1";
   const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
   const CATEGORY_PRESETS = ["Snack", "Bebidas", "Medicina", "Otros"];
@@ -271,6 +277,7 @@ const App = (() => {
     invoiceHistory: [],
     inventorySearch: "",
     inventoryStatusFilter: "all",
+    inventoryCategoryFilter: "all",
     incomeReport: null,
     incomeLoading: false,
     incomeRequestId: 0,
@@ -283,10 +290,12 @@ const App = (() => {
     activePaymentTip: 0,
     tipSettings: { enabled: false, percentage: 10 },
     tipSplitPeople: 1,
+    clearedTipInvoiceKeys: new Set(),
     paymentProcessing: false,
     lastPaidReceipt: null,
     appsScriptOutboxBusy: false,
     appsScriptOutboxTimer: null,
+    remoteStorageSyncBusy: false,
     alertFilter: "all",
     optimisticRequestStates: new Map(),
     optimisticSessionStates: new Map(),
@@ -312,7 +321,16 @@ const App = (() => {
     alarmStopTimer: null,
     adminPollTimer: null,
     adminSyncBusy: false,
+    coreSyncBusy: false,
+    localSupabaseWrites: 0,
+    offlineSyncTimer: null,
+    remoteStoragePollTimer: null,
     activeAdminSection: "dashboard",
+    dashboardTableZoneFilter: "all",
+    serviceTableZoneFilter: "all",
+    outdoorTableDraftIds: null,
+    outdoorTableDraftDirty: false,
+    sectionRenderTimer: null,
     pwaBrandSignature: "",
     pwaBrandSyncToken: 0,
     pwaManifestObjectUrl: "",
@@ -489,31 +507,36 @@ const App = (() => {
       state.sb.from("business_settings").select("*").eq("is_primary", true).maybeSingle(),
       null
     );
-    state.business = data || {
+    state.business = data || state.business || {
       business_name: "Tu restaurante",
       subtitle: "Servicio a la mesa rapido y claro",
       accent_color: "#f05a28",
-      currency: DEFAULT_CURRENCY
+      currency: DEFAULT_CURRENCY,
+      tips_enabled: false,
+      tip_percentage: 10
     };
+    applyBusinessTipSettings();
     document.documentElement.style.setProperty("--accent", state.business.accent_color || "#f05a28");
+    return Boolean(data);
   };
 
   const loadCore = async () => {
     const [tables, categories, items] = await Promise.all([
-      db(state.sb.from("restaurant_tables").select("*").order("table_number", { ascending: true }), []),
-      db(state.sb.from("menu_categories").select("*").order("sort_order", { ascending: true }), []),
+      db(state.sb.from("restaurant_tables").select("*").order("table_number", { ascending: true }), null),
+      db(state.sb.from("menu_categories").select("*").order("sort_order", { ascending: true }), null),
       db(
         state.sb
           .from("menu_items")
           .select("*, menu_categories(name)")
           .order("sort_order", { ascending: true }),
-        []
+        null
       )
     ]);
-    state.tables = tables || [];
-    state.categories = categories || [];
-    state.items = items || [];
+    if (Array.isArray(tables)) state.tables = tables;
+    if (Array.isArray(categories)) state.categories = categories;
+    if (Array.isArray(items)) state.items = items;
     loadInventoryStore();
+    return Array.isArray(tables) && Array.isArray(categories) && Array.isArray(items);
   };
 
   const ensurePresetCategories = async () => {
@@ -552,6 +575,11 @@ const App = (() => {
   const isServicePoint = (table) => Boolean(servicePointKind(table));
 
   const normalTables = () => state.tables.filter((table) => !isServicePoint(table));
+
+  const isOutdoorTable = (table) => table?.is_outdoor === true;
+
+  const tableMatchesZone = (table, filter = "all") => filter === "all"
+    || (filter === "outdoor" ? isOutdoorTable(table) : !isOutdoorTable(table));
 
   const sessionLabel = (session) => session?.sale_channel === "walk_in" || !session?.table_id
     ? "Venta individual"
@@ -646,7 +674,15 @@ const App = (() => {
       const target = link.getAttribute("href")?.replace("#", "");
       link.classList.toggle("active", target === section);
     });
-    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+    if (section === "movements" && navigator.onLine && isAppsScriptConfigured()) {
+      const list = $("#inventoryMovementList");
+      const summary = $("#movementSummary");
+      if (list) list.innerHTML = emptyState("Actualizando movimientos", "Consultando el historial oficial...", "refresh-cw");
+      if (summary) summary.innerHTML = "";
+      refreshIcons();
+    }
+    clearTimeout(state.sectionRenderTimer);
+    state.sectionRenderTimer = window.setTimeout(() => {
       if (state.activeAdminSection !== section) return;
       if (section === "dashboard") {
         renderAlerts();
@@ -661,7 +697,7 @@ const App = (() => {
       }
       if (section === "inventory") renderInventory();
       if (section === "movements") {
-        renderInventoryMovements();
+        if (!navigator.onLine || !isAppsScriptConfigured()) renderInventoryMovements();
         void loadInventoryMovements();
       }
       if (section === "income") {
@@ -672,7 +708,7 @@ const App = (() => {
       if (section === "users") renderUsers();
       if (section === "assistant") renderAdminAi();
       refreshIcons();
-    }));
+    }, 60);
   };
 
   const findTableFromUrl = () => {
@@ -932,6 +968,67 @@ const App = (() => {
     state.pwaRegistrationPromise = navigator.serviceWorker.register("./service-worker.js", { scope: "./" })
       .catch(() => null);
     return state.pwaRegistrationPromise;
+  };
+
+  const readOfflineAdminSnapshot = () => {
+    try {
+      const snapshot = JSON.parse(localStorage.getItem(OFFLINE_ADMIN_SNAPSHOT_KEY) || "null");
+      return Array.isArray(snapshot?.sessions) && Array.isArray(snapshot?.requests) ? snapshot : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const persistOfflineAdminSnapshot = () => {
+    try {
+      localStorage.setItem(OFFLINE_ADMIN_SNAPSHOT_KEY, JSON.stringify({
+        sessions: state.sessions,
+        requests: state.requests,
+        removedSessions: Array.from(state.optimisticSessionStates.entries())
+          .filter(([, overlay]) => overlay.mode === "remove" && Date.now() < Number(overlay.retainUntil || 0))
+          .map(([id, overlay]) => ({ id, retainUntil: overlay.retainUntil })),
+        updatedAt: new Date().toISOString()
+      }));
+    } catch (_) {
+      // La aplicación sigue operativa; la cola del service worker conserva escrituras pendientes.
+    }
+  };
+
+  const flushOfflineQueue = (force = false) => {
+    navigator.serviceWorker?.controller?.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force });
+  };
+
+  const getOfflineSyncStatus = (timeoutMs = 800) => new Promise((resolve) => {
+    const controller = navigator.serviceWorker?.controller;
+    if (!controller) {
+      // Sin un worker controlador no es seguro adelantar Apps Script a una
+      // escritura de Supabase que todavia puede estar viajando por la red.
+      resolve({ pending: 1, syncing: 0, confirmed: 0, failed: 0, conflict: 0 });
+      return;
+    }
+    const channel = new MessageChannel();
+    let finished = false;
+    const finish = (counts = {}) => {
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(timer);
+      resolve({ pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0, ...counts });
+    };
+    const timer = window.setTimeout(() => finish({ pending: 1 }), timeoutMs);
+    channel.port1.onmessage = (event) => finish(event.data?.counts || {});
+    controller.postMessage({ type: "GET_OFFLINE_SYNC_STATUS" }, [channel.port2]);
+  });
+
+  const hasPendingSupabaseWrites = async () => {
+    if (state.localSupabaseWrites > 0) return true;
+    const counts = await getOfflineSyncStatus();
+    return Number(counts.pending || 0) + Number(counts.syncing || 0) > 0;
+  };
+
+  const startOfflineSyncPulse = () => {
+    window.clearInterval(state.offlineSyncTimer);
+    state.offlineSyncTimer = window.setInterval(flushOfflineQueue, OFFLINE_SYNC_PULSE_MS);
+    flushOfflineQueue();
   };
 
   const waitForPwaController = async () => {
@@ -1588,6 +1685,17 @@ const App = (() => {
     }
   };
 
+  function applyBusinessTipSettings() {
+    if (!state.business || !Object.prototype.hasOwnProperty.call(state.business, "tips_enabled")) return false;
+    const percentage = Math.min(100, Math.max(1, Number(state.business.tip_percentage || 10)));
+    state.tipSettings = {
+      enabled: state.business.tips_enabled === true,
+      percentage: Number.isFinite(percentage) ? percentage : 10
+    };
+    try { localStorage.setItem(TIP_SETTINGS_STORAGE_KEY, JSON.stringify(state.tipSettings)); } catch (error) { /* Respaldo local opcional. */ }
+    return true;
+  }
+
   const productAcronym = (name = "") => normalizeText(name)
     .split(" ")
     .filter(Boolean)
@@ -1605,7 +1713,10 @@ const App = (() => {
     const storedTips = readLocalJson(TIP_SETTINGS_STORAGE_KEY, {});
     const storedPercentage = Math.min(100, Math.max(1, Number(storedTips?.percentage || 10)));
     state.tipSettings = { enabled: storedTips?.enabled === true, percentage: Number.isFinite(storedPercentage) ? storedPercentage : 10 };
+    applyBusinessTipSettings();
     state.tipSplitPeople = Math.min(100, Math.max(1, Number(localStorage.getItem(TIP_SPLIT_STORAGE_KEY) || 1)));
+    const clearedTips = readLocalJson(TIP_RESET_STORAGE_KEY, []);
+    state.clearedTipInvoiceKeys = new Set(Array.isArray(clearedTips) ? clearedTips.map(String) : []);
     if (state.page === "admin") loadWalkInDrafts();
   };
 
@@ -1663,6 +1774,16 @@ const App = (() => {
     }
   };
 
+  const tipInvoiceKey = (invoice) => String(invoice?.id || invoice?.sessionId || invoice?.number || "");
+
+  const persistClearedTipInvoices = () => {
+    try {
+      localStorage.setItem(TIP_RESET_STORAGE_KEY, JSON.stringify([...state.clearedTipInvoiceKeys]));
+    } catch (error) {
+      toast("No se pudo reiniciar las propinas en este equipo.", "error", "tip-reset-storage-failed");
+    }
+  };
+
   const persistInventoryMovements = () => {
     try {
       localStorage.setItem(INVENTORY_MOVEMENTS_STORAGE_KEY, JSON.stringify(state.inventoryMovements.slice(-3000)));
@@ -1700,7 +1821,10 @@ const App = (() => {
       stock: Math.max(0, Number(meta.stock || 0)),
       minStock: Math.max(0, Number(meta.minStock ?? 5)),
       unit: meta.unit || "unidad",
-      updatedAt: meta.updatedAt || ""
+      updatedAt: meta.updatedAt || "",
+      version: meta.version === undefined || meta.version === null || meta.version === ""
+        ? null
+        : Math.max(0, Number(meta.version || 0))
     };
   };
 
@@ -1795,7 +1919,7 @@ const App = (() => {
     return true;
   };
 
-  const appsScriptRequest = async (action, payload = {}, timeoutMs = 25000) => {
+  const appsScriptRequest = async (action, payload = {}, timeoutMs = 4000, operationId = "") => {
     if (!isAppsScriptConfigured()) throw new Error("El respaldo remoto no esta configurado.");
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -1805,6 +1929,7 @@ const App = (() => {
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({
           action,
+          operationId,
           authToken: state.authToken,
           origin: location.origin,
           payload
@@ -1840,12 +1965,19 @@ const App = (() => {
       stock: inventory.stock,
       minStock: inventory.minStock,
       isAvailable: item.is_available !== false,
-      updatedAt: inventory.updatedAt || new Date().toISOString()
+      updatedAt: inventory.updatedAt || new Date().toISOString(),
+      version: inventory.version
     };
   };
 
-  const applyRemoteInventoryItems = (items = []) => {
+  const applyRemoteInventoryItems = (items = [], { replace = false } = {}) => {
     if (!Array.isArray(items)) return;
+    if (replace) {
+      const remoteIds = new Set(items.map((item) => String(item?.productId || "")).filter(Boolean));
+      Object.keys(state.inventoryMeta).forEach((productId) => {
+        if (!remoteIds.has(String(productId))) delete state.inventoryMeta[productId];
+      });
+    }
     items.forEach((remote) => {
       const item = state.items.find((entry) => entry.id === remote.productId);
       if (!item) return;
@@ -1891,14 +2023,15 @@ const App = (() => {
   };
 
   const flushAppsScriptOutbox = async () => {
-    if (state.appsScriptOutboxBusy || !isAppsScriptConfigured() || !navigator.onLine) return false;
+    if (state.appsScriptOutboxBusy || !isAppsScriptConfigured()) return false;
+    if (await hasPendingSupabaseWrites()) return false;
     state.appsScriptOutboxBusy = true;
     try {
       let jobs = readAppsScriptOutbox();
       while (jobs.length) {
         const job = jobs[0];
         setInventorySyncStatus(`Sincronizando ${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}`, "pending", "refresh-cw");
-        const result = await appsScriptRequest(job.action, job.payload);
+        const result = await appsScriptRequest(job.action, job.payload, 4000, job.id);
         const queuedAfterRequest = readAppsScriptOutbox();
         const pendingAfterCurrent = queuedAfterRequest.filter((entry) => entry.id !== job.id);
         const pendingProductIds = new Set(pendingAfterCurrent.map((entry) =>
@@ -1993,23 +2126,38 @@ const App = (() => {
 
   const syncInventoryWithAppsScript = async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    if (readAppsScriptOutbox().length || await hasPendingSupabaseWrites()) return false;
     try {
       const result = await appsScriptRequest("get_inventory");
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
-      if (Array.isArray(result.items) && result.items.length) {
-        applyRemoteInventoryItems(result.items);
-      } else {
-        const localItems = state.items
-          .filter((item) => Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id))
-          .map(inventoryPayload);
-        if (localItems.length) enqueueAppsScriptJob("sync_inventory", { items: localItems }, "inventory:initial-sync");
-      }
+      if (!Array.isArray(result.items)) throw new Error("El inventario remoto devolvió una respuesta inválida.");
+      applyRemoteInventoryItems(result.items, { replace: true });
       setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
       return true;
     } catch (error) {
       setInventorySyncStatus("Usando respaldo local", "error", "cloud-off");
       return false;
     }
+  };
+
+  const refreshRemoteStorageNow = async () => {
+    if (state.appsScriptOutboxBusy || state.remoteStorageSyncBusy || !isAppsScriptConfigured() || !state.currentUser) return false;
+    state.remoteStorageSyncBusy = true;
+    try {
+      if (readAppsScriptOutbox().length) return flushAppsScriptOutbox();
+      const synced = await syncInventoryWithAppsScript();
+      if (!synced) return false;
+      if (state.activeAdminSection === "movements") await loadInventoryMovements();
+      if (state.activeAdminSection === "income") await loadIncomeReport();
+      return true;
+    } finally {
+      state.remoteStorageSyncBusy = false;
+    }
+  };
+
+  const startRemoteStoragePolling = () => {
+    window.clearInterval(state.remoteStoragePollTimer);
+    state.remoteStoragePollTimer = window.setInterval(() => { void refreshRemoteStorageNow(); }, REMOTE_STORAGE_POLL_MS);
   };
 
   const queueInventoryUpsert = (item, movement = {}) => {
@@ -2980,6 +3128,10 @@ const App = (() => {
       .channel(`table:${state.currentTable.id}`, { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refresh)
       .on("broadcast", { event: "chat-refresh" }, () => void loadChatMessages())
+      .on("postgres_changes", { event: "*", schema: "public", table: "business_settings" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "restaurant_tables" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_categories" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_items" }, () => void refreshCoreNow())
       .on("broadcast", { event: "typing" }, ({ payload }) => {
         if (String(payload?.sessionId) === String(state.currentSession?.id) && payload?.role === "staff") setPeerTyping(payload.typing, "staff");
       })
@@ -3039,7 +3191,10 @@ const App = (() => {
     renderBillChat();
     renderAssistant();
     bindClient();
-    state.adminBroadcastChannel = state.sb.channel("admin", { config: { broadcast: { self: false }, private: false } }).subscribe();
+    state.adminBroadcastChannel = state.sb
+      .channel("admin", { config: { broadcast: { self: false }, private: false } })
+      .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
+      .subscribe();
     subscribeClient();
     setLoading(false);
     // La pantalla queda usable tras el bootstrap; la cuenta se hidrata en segundo plano.
@@ -3068,7 +3223,9 @@ const App = (() => {
       const serverSession = merged.get(sessionId);
       if (overlay.mode === "remove") {
         merged.delete(sessionId);
-        if (!serverSession) state.optimisticSessionStates.delete(sessionId);
+        if (!serverSession && Date.now() >= Number(overlay.retainUntil || 0)) {
+          state.optimisticSessionStates.delete(sessionId);
+        }
         return;
       }
       const expectedItems = overlay.expectedItems || (overlay.expectedItem ? [overlay.expectedItem] : []);
@@ -3373,6 +3530,12 @@ const App = (() => {
   };
 
   const loadAdminData = async () => {
+    const cachedSnapshot = readOfflineAdminSnapshot();
+    (cachedSnapshot?.removedSessions || []).forEach((entry) => {
+      if (entry?.id && Date.now() < Number(entry.retainUntil || 0) && !state.optimisticSessionStates.has(entry.id)) {
+        state.optimisticSessionStates.set(entry.id, { mode: "remove", session: null, retainUntil: entry.retainUntil });
+      }
+    });
     const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
     if (!snapshot) {
       const [requests, sessions] = await Promise.all([
@@ -3387,8 +3550,14 @@ const App = (() => {
           []
         )
       ]);
+      if (cachedSnapshot && (!navigator.onLine || (!(requests || []).length && !(sessions || []).length))) {
+        state.requests = mergeOptimisticRequests(cachedSnapshot.requests);
+        state.sessions = mergeOptimisticSessions(cachedSnapshot.sessions);
+        return false;
+      }
       state.requests = mergeOptimisticRequests(requests || []);
       state.sessions = mergeOptimisticSessions(sessions || []);
+      persistOfflineAdminSnapshot();
       return true;
     }
     const requests = mergeOptimisticRequests(snapshot.requests || []);
@@ -3406,7 +3575,36 @@ const App = (() => {
     state.adminSnapshotSignature = signature;
     state.requests = requests;
     state.sessions = sessions;
+    persistOfflineAdminSnapshot();
     return true;
+  };
+
+  const refreshCoreNow = async () => {
+    if (state.coreSyncBusy || await hasPendingSupabaseWrites()) return false;
+    state.coreSyncBusy = true;
+    try {
+      const [businessLoaded, coreLoaded] = await Promise.all([loadBusiness(), loadCore()]);
+      applyBusinessTipSettings();
+      if (!state.outdoorTableDraftDirty) state.outdoorTableDraftIds = null;
+      persistBootstrapCache();
+      if (state.page === "admin") {
+        renderBrand();
+        syncTipFeatureVisibility();
+        renderTables();
+        renderServiceTables();
+        renderTableManager();
+        renderMenuManager();
+        renderInventory();
+        if (state.activeAdminSection === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
+      }
+      else {
+        renderBrand();
+        renderMenu();
+      }
+      return businessLoaded || coreLoaded;
+    } finally {
+      state.coreSyncBusy = false;
+    }
   };
 
   const updateNavRequestBadge = () => {
@@ -3487,7 +3685,8 @@ const App = (() => {
         table.table_number,
         table.table_name,
         table.qr_code,
-        table.is_active
+        table.is_active,
+        table.is_outdoor
       ]),
       sessions: state.sessions.map((session) => [
         session.id,
@@ -3496,7 +3695,8 @@ const App = (() => {
         sessionTotal(session),
         (session.session_items || []).length
       ]),
-      requests: activeRequests().map((request) => [request.id, request.table_id, request.request_type, request.status])
+      requests: activeRequests().map((request) => [request.id, request.table_id, request.request_type, request.status]),
+      filters: [state.dashboardTableZoneFilter, state.serviceTableZoneFilter]
     });
 
   const groupedActiveRequests = () => {
@@ -3571,13 +3771,14 @@ const App = (() => {
     refreshIcons();
   };
 
-  const compactTableTiles = () => normalTables()
+  const compactTableTiles = (zoneFilter = "all") => normalTables()
     .filter((table) => table.is_active !== false)
+    .filter((table) => tableMatchesZone(table, zoneFilter))
     .map((table) => {
       const session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
       const pending = state.requests.filter((request) => request.table_id === table.id && request.status === "pending").length;
       const occupied = Boolean(session);
-      return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
+      return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${isOutdoorTable(table) ? "outdoor" : "indoor"} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
     }).join("");
 
   const renderTables = () => {
@@ -3585,14 +3786,20 @@ const App = (() => {
     if (!box) return;
     state.tableRenderSignature = tablesSignature();
     box.classList.add("compact-tables-grid");
-    box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea las mesas del negocio para comenzar.", "layout-grid");
+    const filter = state.dashboardTableZoneFilter;
+    const select = $("#dashboardTableZoneFilter");
+    if (select) select.value = filter;
+    box.innerHTML = compactTableTiles(filter) || emptyState("Sin mesas", filter === "all" ? "Crea las mesas del negocio para comenzar." : "No hay mesas en esta ubicación.", "layout-grid");
     refreshIcons();
   };
 
   const renderServiceTables = () => {
     const box = $("#waiterTablesGrid");
     if (!box) return;
-    box.innerHTML = compactTableTiles() || emptyState("Sin mesas", "Crea una mesa activa para atenderla.", "armchair");
+    const filter = state.serviceTableZoneFilter;
+    const select = $("#serviceTableZoneFilter");
+    if (select) select.value = filter;
+    box.innerHTML = compactTableTiles(filter) || emptyState("Sin mesas", filter === "all" ? "Crea una mesa activa para atenderla." : "No hay mesas en esta ubicación.", "armchair");
     renderServicePoints();
     refreshIcons();
   };
@@ -3663,6 +3870,68 @@ const App = (() => {
     })();
   };
 
+  const renderOutdoorTableConfigurator = () => {
+    const selector = $("#outdoorTableSelector");
+    const from = $("#outdoorTableFrom");
+    const to = $("#outdoorTableTo");
+    if (!selector || !from || !to) return;
+    const tables = normalTables()
+      .filter((table) => table.is_active !== false)
+      .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+    const validIds = new Set(tables.map((table) => String(table.id)));
+    if (!(state.outdoorTableDraftIds instanceof Set)) {
+      state.outdoorTableDraftIds = new Set(tables.filter(isOutdoorTable).map((table) => String(table.id)));
+    } else {
+      state.outdoorTableDraftIds = new Set([...state.outdoorTableDraftIds].filter((id) => validIds.has(String(id))));
+    }
+    const options = tables.map((table) => `<option value="${escapeHTML(table.id)}">M${escapeHTML(table.table_number)} · ${escapeHTML(table.table_name || "Mesa")}</option>`).join("");
+    const previousFrom = from.value;
+    const previousTo = to.value;
+    from.innerHTML = options || '<option value="">Sin mesas</option>';
+    to.innerHTML = options || '<option value="">Sin mesas</option>';
+    if (validIds.has(previousFrom)) from.value = previousFrom;
+    if (validIds.has(previousTo)) to.value = previousTo;
+    else if (tables.length) to.value = String(tables[tables.length - 1].id);
+    selector.innerHTML = tables.length
+      ? tables.map((table) => `
+          <label class="outdoor-table-option">
+            <input type="checkbox" data-outdoor-table="${escapeHTML(table.id)}" ${state.outdoorTableDraftIds.has(String(table.id)) ? "checked" : ""}>
+            <span>${icon("armchair", 16)} M${escapeHTML(table.table_number)}</span>
+          </label>`).join("")
+      : emptyState("Sin mesas", "Crea una mesa para poder asignar su ubicación.", "armchair");
+    const status = $("#tableZoneSettingStatus");
+    if (status) {
+      const count = state.outdoorTableDraftIds.size;
+      status.textContent = count
+        ? `${count} mesa${count === 1 ? "" : "s"} marcada${count === 1 ? "" : "s"} como afuera. Las demás se consideran de adentro.`
+        : "Todas las mesas están configuradas como mesas de adentro.";
+    }
+    refreshIcons();
+  };
+
+  const runRefreshAction = async (button, action, successMessage) => {
+    if (!button || button.disabled) return false;
+    const markup = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = `${icon("loader-circle", 17)} Actualizando...`;
+    refreshIcons();
+    try {
+      const refreshed = await action();
+      if (refreshed) toast(successMessage, "ok");
+      else if (!navigator.onLine) toast("Información local actualizada. Los cambios pendientes se sincronizarán al volver la conexión.", "ok");
+      else toast("No fue posible completar la actualización. La información visible se conservó.", "error", `refresh-failed:${button.id}`);
+      return Boolean(refreshed);
+    } catch (error) {
+      console.error(error);
+      toast("No fue posible completar la actualización. La información visible se conservó.", "error", `refresh-failed:${button.id}`);
+      return false;
+    } finally {
+      button.disabled = false;
+      button.innerHTML = markup;
+      refreshIcons();
+    }
+  };
+
   const renderBusinessForm = () => {
     const form = $("#businessForm");
     if (!form) return;
@@ -3687,6 +3956,7 @@ const App = (() => {
       if (status) status.textContent = hasImage ? "Imagen cargada" : "Seleccionar imagen";
       box?.classList.toggle("has-file", hasImage);
     });
+    renderOutdoorTableConfigurator();
   };
 
   const renderTableManager = () => {
@@ -4008,6 +4278,7 @@ const App = (() => {
   const renderMenuManager = () => {
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
+      const selectedValue = select.value;
       const excludedInventoryCategories = new Set(["entrada", "entradas", "plato fuerte", "platos fuertes", "postre", "postres"]);
       const categories = select.closest("#inventoryForm")
         ? state.categories.filter((category) => !excludedInventoryCategories.has(normalizeText(category.name)))
@@ -4016,6 +4287,7 @@ const App = (() => {
         <option value="">Elegir categoria</option>
         ${categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name)}</option>`).join("")}
       `;
+      if ([...select.options].some((option) => option.value === selectedValue)) select.value = selectedValue;
     });
 
     renderConsumptionProductOptions($("#consumptionProductSearch")?.value || "");
@@ -4106,6 +4378,28 @@ const App = (() => {
       <span><small>Venta potencial</small><strong>${money(sale * stock)}</strong></span>`;
   };
 
+  const renderInventoryCategoryFilter = () => {
+    const select = $("#inventoryCategoryFilter");
+    if (!select) return;
+    const categories = [...state.categories]
+      .filter((category) => category?.id && state.items.some((item) => String(item.category_id || "") === String(category.id)))
+      .sort((left, right) => Number(left.sort_order || 0) - Number(right.sort_order || 0) || String(left.name || "").localeCompare(String(right.name || ""), "es"));
+    const validIds = new Set(categories.map((category) => String(category.id)));
+    const hasUncategorized = state.items.some((item) => !item.category_id);
+    if (state.inventoryCategoryFilter !== "all"
+      && state.inventoryCategoryFilter !== "uncategorized"
+      && !validIds.has(String(state.inventoryCategoryFilter))) {
+      state.inventoryCategoryFilter = "all";
+    }
+    if (state.inventoryCategoryFilter === "uncategorized" && !hasUncategorized) state.inventoryCategoryFilter = "all";
+    select.innerHTML = [
+      '<option value="all">Todas</option>',
+      ...categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name || "Sin categoría")}</option>`),
+      ...(hasUncategorized ? ['<option value="uncategorized">Sin categoría</option>'] : [])
+    ].join("");
+    select.value = state.inventoryCategoryFilter;
+  };
+
   const renderInventory = () => {
     const metrics = $("#inventoryMetrics");
     const list = $("#inventoryList");
@@ -4117,9 +4411,12 @@ const App = (() => {
       <article><span>${icon("trending-up", 19)} Venta potencial</span><strong>${money(summary.saleValue)}</strong><small>Antes de gastos</small></article>
       <article class="${summary.low || summary.out ? "inventory-alert-metric" : ""}"><span>${icon("triangle-alert", 19)} Alertas</span><strong>${summary.low + summary.out}</strong><small>${summary.out} agotados · ${summary.low} por reponer</small></article>`;
 
+    renderInventoryCategoryFilter();
     const query = state.inventorySearch;
     const products = matchingProducts(query, { includeUnavailable: true })
-      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter);
+      .filter((item) => state.inventoryStatusFilter === "all" || inventoryStatus(item) === state.inventoryStatusFilter)
+      .filter((item) => state.inventoryCategoryFilter === "all"
+        || (state.inventoryCategoryFilter === "uncategorized" ? !item.category_id : String(item.category_id || "") === String(state.inventoryCategoryFilter)));
     list.innerHTML = products.length
       ? products.map((item) => {
           const inventory = inventoryFor(item);
@@ -4177,12 +4474,39 @@ const App = (() => {
     refreshIcons();
   };
 
+  const pendingInventoryMovementIds = () => {
+    const ids = new Set();
+    readAppsScriptOutbox().forEach((job) => {
+      if (job.action === "adjust_inventory" && job.payload?.adjustment?.eventId) {
+        ids.add(String(job.payload.adjustment.eventId));
+      }
+      if (job.action === "upsert_inventory" && job.payload?.item?.movementEventId) {
+        ids.add(String(job.payload.item.movementEventId));
+      }
+      if (job.action === "record_sale" && job.payload?.invoice) {
+        const invoice = job.payload.invoice;
+        const saleId = String(invoice.id || invoice.sessionId || "");
+        (invoice.items || []).forEach((line) => {
+          if (saleId && line.menu_item_id) ids.add(`SALE-${saleId}-${line.menu_item_id}`);
+        });
+      }
+    });
+    return ids;
+  };
+
   const loadInventoryMovements = async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) {
+      renderInventoryMovements();
+      return true;
+    }
     try {
       const result = await appsScriptRequest("get_inventory_movements", { limit: 800 });
-      if (!result?.ok || !Array.isArray(result.movements)) return false;
-      const merged = new Map(state.inventoryMovements.map((movement) => [movement.movementId, movement]));
+      if (!result?.ok || !Array.isArray(result.movements)) throw new Error(result?.error || "El historial remoto devolvió una respuesta inválida.");
+      const pendingIds = pendingInventoryMovementIds();
+      const merged = new Map(state.inventoryMovements
+        .filter((movement) => pendingIds.has(String(movement.movementId || "")))
+        .map((movement) => [movement.movementId, movement]));
       result.movements.forEach((movement) => merged.set(movement.movementId, movement));
       state.inventoryMovements = Array.from(merged.values()).slice(-3000);
       persistInventoryMovements();
@@ -4257,10 +4581,11 @@ const App = (() => {
     let categoryId = form.category_id.value;
     const newCategory = form.new_category.value.trim();
     if (!categoryId && newCategory) {
-      const category = await db(state.sb.from("menu_categories").insert({ name: newCategory, is_active: true }).select("*").single(), null);
-      if (!category) return;
-      state.categories = [...state.categories, category];
-      categoryId = category.id;
+      categoryId = uid();
+      const localCategory = { id: categoryId, name: newCategory, sort_order: 0, is_active: true, updated_at: new Date().toISOString(), _offline_pending: true };
+      state.categories = [...state.categories, localCategory];
+      persistBootstrapCache();
+      void retryQuiet(() => state.sb.from("menu_categories").insert({ id: categoryId, name: newCategory, sort_order: 0, is_active: true }).select("*").single(), 4);
     }
     const payload = {
       category_id: categoryId || null,
@@ -4271,26 +4596,32 @@ const App = (() => {
       is_available: form.is_available.checked,
       sort_order: state.items.find((item) => item.id === id)?.sort_order || 0
     };
-    const saved = await db(id
-      ? state.sb.from("menu_items").update(payload).eq("id", id).select("*").single()
-      : state.sb.from("menu_items").insert(payload).select("*").single(), null);
-    if (!saved) return;
+    const recordId = id || uid();
+    const existingItem = id ? state.items.find((item) => item.id === id) : null;
     const category = state.categories.find((entry) => entry.id === categoryId);
-    const hydrated = { ...saved, menu_categories: category ? { name: category.name } : null };
+    const hydrated = {
+      ...(existingItem || {}),
+      ...payload,
+      id: recordId,
+      menu_categories: category ? { name: category.name } : null,
+      updated_at: new Date().toISOString(),
+      _offline_pending: true
+    };
     state.items = id
       ? state.items.map((item) => item.id === id ? hydrated : item)
       : [...state.items, hydrated];
-    state.inventoryMeta[saved.id] = {
+    state.inventoryMeta[recordId] = {
       code: (form.product_code.value.trim() || productAcronym(name)).toUpperCase(),
       costPrice,
       stock,
       minStock,
       unit: form.unit.value || "unidad",
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      version: previousInventory?.version ?? null
     };
     const beforeStock = Number(previousInventory?.stock || 0);
     const stockDelta = stock - beforeStock;
-    const movementEventId = (!id || stockDelta) ? `product:${saved.id}:${Date.now()}` : "";
+    const movementEventId = (!id || stockDelta) ? `product:${recordId}:${Date.now()}` : "";
     if (movementEventId) {
       recordLocalInventoryMovement({
         eventId: movementEventId,
@@ -4314,6 +4645,19 @@ const App = (() => {
     renderMenuManager();
     renderInventory();
     toast(id ? "Producto e inventario actualizados." : "Producto agregado al inventario.");
+    void (async () => {
+      const saved = await retryQuiet(() => {
+        const query = id
+          ? state.sb.from("menu_items").update(payload).eq("id", recordId)
+          : state.sb.from("menu_items").insert({ ...payload, id: recordId });
+        return query.select("*").single();
+      }, 4);
+      if (!saved) return;
+      state.items = state.items.map((item) => item.id === recordId
+        ? { ...saved, menu_categories: saved.menu_categories || hydrated.menu_categories }
+        : item);
+      persistBootstrapCache();
+    })();
   };
 
   const renderInventoryAdjustmentPreview = () => {
@@ -4366,7 +4710,12 @@ const App = (() => {
       updatedAt: new Date().toISOString()
     };
     persistInventoryStore();
-    enqueueAppsScriptJob("set_inventory_stock", { productId: item.id, stock: nextStock, updatedAt: state.inventoryMeta[id].updatedAt }, `inventory-stock:${item.id}`);
+    enqueueAppsScriptJob("set_inventory_stock", {
+      productId: item.id,
+      stock: nextStock,
+      updatedAt: state.inventoryMeta[id].updatedAt,
+      version: current.version
+    }, `inventory-stock:${item.id}`);
     $("#inventoryAdjustDialog")?.close();
     renderInventory();
     toast(`Existencia de ${item.name} actualizada a ${nextStock.toLocaleString("es-CO", { maximumFractionDigits: 2 })}.`, "ok", `stock-adjusted:${id}:${nextStock}`);
@@ -4541,18 +4890,33 @@ const App = (() => {
   };
 
   const mergeIncomeReport = (remote, filters) => {
-    const remoteKeys = new Set(remote.recordKeys || (remote.records || []).map((record) => record.saleId));
-    const pending = localIncomeRecords(filters).filter((record) => !remoteKeys.has(record.saleId));
+    const jobs = readAppsScriptOutbox();
+    const pendingSaleIds = new Set(jobs
+      .filter((job) => ["record_sale", "edit_sale"].includes(job.action))
+      .map((job) => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || ""))
+      .filter(Boolean));
+    const deletedSaleIds = new Set(jobs
+      .filter((job) => job.action === "delete_sale")
+      .map((job) => String(job.payload?.saleId || ""))
+      .filter(Boolean));
+    const excludedRemote = (remote.records || []).filter((record) => deletedSaleIds.has(String(record.saleId || "")) || pendingSaleIds.has(String(record.saleId || "")));
+    const visibleRemote = (remote.records || []).filter((record) => !deletedSaleIds.has(String(record.saleId || "")) && !pendingSaleIds.has(String(record.saleId || "")));
+    const pending = localIncomeRecords(filters)
+      .filter((record) => pendingSaleIds.has(String(record.saleId || "")));
     const pendingTotals = incomeTotalsFromRecords(pending);
+    const excludedTotals = incomeTotalsFromRecords(excludedRemote);
     const totals = { ...(remote.totals || {}) };
-    Object.keys(pendingTotals).forEach((key) => { totals[key] = Number(totals[key] || 0) + (key === "averageTicket" ? 0 : Number(pendingTotals[key] || 0)); });
+    Object.keys(pendingTotals).forEach((key) => {
+      if (key === "averageTicket") return;
+      totals[key] = Number(totals[key] || 0) - Number(excludedTotals[key] || 0) + Number(pendingTotals[key] || 0);
+    });
     totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
     return {
       ...remote,
       filters,
       totals,
-      records: [...pending, ...(remote.records || [])].sort((left, right) => String(right.date).localeCompare(String(left.date))),
-      totalRecords: Number(remote.totalRecords || 0) + pending.length,
+      records: [...pending, ...visibleRemote].sort((left, right) => String(right.date).localeCompare(String(left.date))),
+      totalRecords: Math.max(0, Number(remote.totalRecords || 0) - excludedRemote.length + pending.length),
       pendingCount: pending.length,
       localOnly: false
     };
@@ -4707,10 +5071,17 @@ const App = (() => {
 
   const loadIncomeReport = async () => {
     if (!$("#income") || state.currentUser?.role !== "admin") return false;
+    if (state.incomeLoading) return false;
     const filters = incomeFiltersFromForm();
     if (filters.dateFrom > filters.dateTo) {
       toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
       return false;
+    }
+    if (readAppsScriptOutbox().some((job) => job.action === "clear_income")) {
+      state.incomeReport = localIncomeReport(filters);
+      renderIncomeReport();
+      setIncomeReportStatus("Reinicio pendiente de sincronización", "warning", "hard-drive");
+      return true;
     }
     const requestId = ++state.incomeRequestId;
     state.incomeLoading = true;
@@ -4719,7 +5090,7 @@ const App = (() => {
     setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
-      const result = await appsScriptRequest("get_income_report", { filters }, 40000);
+      const result = await appsScriptRequest("get_income_report", { filters }, 4000);
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
@@ -4736,17 +5107,6 @@ const App = (() => {
     } finally {
       if (requestId === state.incomeRequestId) state.incomeLoading = false;
     }
-  };
-
-  const waitForRemoteQueue = async () => {
-    const deadline = Date.now() + 30000;
-    while (state.appsScriptOutboxBusy && Date.now() < deadline) {
-      await new Promise((resolve) => window.setTimeout(resolve, 100));
-    }
-    if (state.appsScriptOutboxBusy) throw new Error("Hay cambios anteriores que todavía se están guardando. Intenta nuevamente en unos segundos.");
-    if (!readAppsScriptOutbox().length) return;
-    const synced = await flushAppsScriptOutbox();
-    if (!synced || readAppsScriptOutbox().length) throw new Error("No fue posible terminar de guardar los cambios anteriores.");
   };
 
   const resetSectionData = async (section) => {
@@ -4795,11 +5155,6 @@ const App = (() => {
 
     const button = $(`[data-reset-section="${section}"]`);
     const buttonMarkup = button?.innerHTML || "";
-    if (button) {
-      button.disabled = true;
-      button.classList.add("is-resetting");
-      button.innerHTML = `${icon("loader-circle", 17)} Eliminando...`;
-    }
 
     const snapshot = {
       items: state.items.map((item) => ({ ...item })),
@@ -4848,33 +5203,9 @@ const App = (() => {
         renderIncomeReport();
       }
 
-      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
-      if (!isAppsScriptConfigured()) throw new Error("El respaldo remoto no está configurado.");
-      await waitForRemoteQueue();
-      const result = await appsScriptRequest(settings.action, {}, 40000);
-      if (!result?.ok || result.cleared !== true) throw new Error(result?.error || "No fue posible completar el reinicio.");
-      if (section === "inventory") {
-        state.items = [];
-        state.inventoryMeta = {};
-        persistInventoryStore();
-        persistBootstrapCache();
-        renderInventory();
-        renderMenuManager();
-        setInventorySyncStatus("Inventario vacío y sincronizado", "synced", "cloud-check");
-      }
-      if (section === "movements") {
-        state.inventoryMovements = [];
-        persistInventoryMovements();
-        renderInventoryMovements();
-      }
-      if (section === "income") {
-        state.invoiceHistory = [];
-        state.lastPaidReceipt = null;
-        persistInvoiceHistory();
-        state.incomeReport = localIncomeReport(incomeFiltersFromForm());
-        renderIncomeReport();
-        setIncomeReportStatus("0 facturas", "ready", "badge-check");
-      }
+      enqueueAppsScriptJob(settings.action, {}, `reset:${section}:${uid()}`);
+      if (section === "inventory") setInventorySyncStatus("Reinicio pendiente de sincronizacion", "pending", "refresh-cw");
+      if (section === "income") setIncomeReportStatus("0 facturas · sincronizacion pendiente", "warning", "hard-drive");
       toast(settings.success, "ok", `reset-complete:${section}`);
     } catch (error) {
       if (section === "inventory") {
@@ -4949,8 +5280,6 @@ const App = (() => {
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     if (!record) return;
     const reportBefore = state.incomeReport;
-    const invoicesBefore = [...state.invoiceHistory];
-    const inventoryBefore = JSON.parse(JSON.stringify(state.inventoryMeta));
     const outboxBefore = readAppsScriptOutbox();
     const remainingRecords = (reportBefore.records || []).filter((entry) => String(entry.saleId) !== String(saleId));
     const updatedTotals = { ...(reportBefore.totals || {}) };
@@ -4983,24 +5312,8 @@ const App = (() => {
     $("#deleteIncomeDialog")?.close();
     renderIncomeReport();
     renderInventory();
-    try {
-      if (!hadPendingSale || isAppsScriptConfigured()) {
-        const result = await appsScriptRequest("delete_sale", { saleId }, 40000);
-        if (!result?.ok) throw new Error(result?.error || "No se pudo eliminar la venta.");
-        if (Array.isArray(result?.items)) applyRemoteInventoryItems(result.items);
-      }
-      toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
-    } catch (error) {
-      state.incomeReport = reportBefore;
-      state.invoiceHistory = invoicesBefore;
-      state.inventoryMeta = inventoryBefore;
-      writeAppsScriptOutbox(outboxBefore);
-      persistInvoiceHistory();
-      persistInventoryStore();
-      renderIncomeReport();
-      renderInventory();
-      toast(String(error?.message || error), "error", `income-delete-failed:${saleId}`);
-    }
+    if (!hadPendingSale) enqueueAppsScriptJob("delete_sale", { saleId }, `sale-delete:${saleId}`);
+    toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
   };
 
   const saveIncomeEdit = async (form) => {
@@ -5049,25 +5362,55 @@ const App = (() => {
       totals: { subtotal, discount: 0, tax: 0, serviceFee: 0, total },
       items
     };
-    const submit = form.querySelector('button[type="submit"]');
-    if (submit) submit.disabled = true;
-    try {
-      const result = await appsScriptRequest("edit_sale", { invoice: corrected }, 40000);
-      if (!result?.ok) throw new Error(result?.error || "No se pudo corregir la venta.");
-      const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
-      if (localIndex >= 0) {
-        state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
-        persistInvoiceHistory();
-      }
-      $("#incomeEditDialog")?.close();
-      state.incomeReport = null;
-      await loadIncomeReport();
-      toast("Venta corregida. El cambio quedo registrado en auditoria.", "ok", `income-edited:${record.saleId}`);
-    } catch (error) {
-      toast(String(error?.message || error), "error", `income-edit-failed:${record.saleId}`);
-    } finally {
-      if (submit) submit.disabled = false;
+    const jobs = readAppsScriptOutbox();
+    const pendingSaleIndex = jobs.findIndex((job) => job.action === "record_sale"
+      && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(record.saleId));
+    if (pendingSaleIndex >= 0) {
+      jobs[pendingSaleIndex] = {
+        ...jobs[pendingSaleIndex],
+        payload: { invoice: { ...jobs[pendingSaleIndex].payload.invoice, ...corrected } }
+      };
+      writeAppsScriptOutbox(jobs);
+      void flushAppsScriptOutbox();
+    } else {
+      enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}`);
     }
+    const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
+    if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
+    else state.invoiceHistory.push(corrected);
+    persistInvoiceHistory();
+    const correctedCost = items.reduce((sum, item) => sum + Number(item.unit_cost || 0) * Number(item.quantity || 0), 0);
+    const correctedRecord = {
+      ...record,
+      table: corrected.table,
+      date: corrected.createdAt,
+      payer: corrected.payerName,
+      waiter: corrected.waiterName,
+      payments: corrected.payments,
+      isMixed: corrected.paymentMethod === "mixed",
+      reference: corrected.reference,
+      subtotal,
+      total,
+      cost: correctedCost,
+      profit: total - correctedCost,
+      items: corrected.items.map((item) => ({
+        lineId: item.id,
+        menuItemId: item.menu_item_id,
+        name: item.item_name,
+        quantity: item.quantity,
+        unitPrice: item.unit_price,
+        total: item.quantity * item.unit_price,
+        cost: item.quantity * item.unit_cost,
+        profit: item.quantity * (item.unit_price - item.unit_cost)
+      }))
+    };
+    state.incomeReport = {
+      ...state.incomeReport,
+      records: (state.incomeReport?.records || []).map((entry) => String(entry.saleId) === String(record.saleId) ? correctedRecord : entry)
+    };
+    $("#incomeEditDialog")?.close();
+    renderIncomeReport();
+    toast("Venta corregida. Se sincronizara automaticamente.", "ok", `income-edited:${record.saleId}`);
   };
 
   const exportIncomeCsv = () => {
@@ -5246,9 +5589,11 @@ const App = (() => {
     const recordsBox = $("#tipsRecords");
     const peopleInput = $("#tipSplitPeople");
     const splitResult = $("#tipSplitResult");
+    const resetButton = $("#resetTips");
     if (!kpis || !recordsBox || !peopleInput || !splitResult) return;
+    if (resetButton) resetButton.hidden = state.currentUser?.role !== "admin";
     const tipInvoices = state.invoiceHistory
-      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0)
+      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0 && !state.clearedTipInvoiceKeys.has(tipInvoiceKey(invoice)))
       .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
     const todayKey = localDateKey();
     const todayInvoices = tipInvoices.filter((invoice) => localDateKey(invoice.createdAt) === todayKey);
@@ -5277,6 +5622,16 @@ const App = (() => {
     refreshIcons();
   };
 
+  const resetTips = () => {
+    if (state.currentUser?.role !== "admin") return;
+    state.invoiceHistory
+      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0)
+      .forEach((invoice) => state.clearedTipInvoiceKeys.add(tipInvoiceKey(invoice)));
+    persistClearedTipInvoices();
+    renderTips();
+    toast("La sección de propinas quedó en $0.", "ok", "tips-reset");
+  };
+
   const renderAdmin = () => {
     renderAdminShell();
     renderAlerts();
@@ -5295,6 +5650,7 @@ const App = (() => {
   };
 
   const renderAdminLive = () => {
+    persistOfflineAdminSnapshot();
     renderAdminShell();
     renderAlerts();
     if (state.activeAdminSection === "dashboard" && tablesSignature() !== state.tableRenderSignature) renderTables();
@@ -5329,8 +5685,37 @@ const App = (() => {
     return true;
   };
 
+  const saveTipSettingsRemotely = async (settings = state.tipSettings) => {
+    const saved = await retryQuiet(
+      () => state.sb.from("business_settings").update({
+        tips_enabled: settings.enabled === true,
+        tip_percentage: Number(settings.percentage || 10)
+      }).eq("is_primary", true).select("*").maybeSingle(),
+      4
+    );
+    if (!saved) return false;
+    state.business = saved;
+    applyBusinessTipSettings();
+    persistBootstrapCache();
+    return true;
+  };
+
+  const saveOutdoorTableZonesRemotely = async (selectedIds) => retryQuiet(
+    () => state.sb.rpc("save_table_zones", {
+      auth_token: state.authToken,
+      outdoor_table_ids: [...selectedIds]
+    }),
+    4
+  );
+
   const saveBusiness = async (form) => {
+    const originalBusiness = state.business ? { ...state.business } : null;
+    const originalTipSettings = { ...state.tipSettings };
+    const originalTables = state.tables.map((table) => ({ ...table }));
     if (!updateTipSettingsFromForm(form, { renderForm: false })) return;
+    const outdoorIds = state.outdoorTableDraftIds instanceof Set
+      ? new Set(state.outdoorTableDraftIds)
+      : new Set(normalTables().filter(isOutdoorTable).map((table) => String(table.id)));
     const payload = {
       is_primary: true,
       business_name: form.business_name.value.trim() || "Tu restaurante",
@@ -5338,30 +5723,66 @@ const App = (() => {
       accent_color: form.accent_color.value || "#f05a28",
       currency: DEFAULT_CURRENCY,
       logo_url: form.logo_url.value.trim(),
-      cover_url: form.cover_url.value.trim()
+      cover_url: form.cover_url.value.trim(),
+      tips_enabled: state.tipSettings.enabled === true,
+      tip_percentage: Number(state.tipSettings.percentage || 10)
     };
-    const original = state.business;
     state.business = { ...(state.business || {}), ...payload };
+    state.tables = state.tables.map((table) => isServicePoint(table)
+      ? table
+      : { ...table, is_outdoor: outdoorIds.has(String(table.id)) });
     persistBootstrapCache();
     renderBrand();
     renderBusinessForm();
-    toast("Marca actualizada. El cliente ya vera esta personalizacion.");
-    void (async () => {
-      const saved = await retryQuiet(
-        () => state.sb.from("business_settings").upsert(payload, { onConflict: "is_primary" }).select("*").single(),
-        4
-      );
-      if (saved) {
-        state.business = saved;
-        persistBootstrapCache();
-        return;
+    renderTables();
+    renderServiceTables();
+    const submit = form.querySelector('button[type="submit"]');
+    const submitMarkup = submit?.innerHTML || "";
+    if (submit) {
+      submit.disabled = true;
+      submit.innerHTML = `${icon("loader-circle", 17)} Guardando...`;
+      refreshIcons();
+    }
+    const savedBusiness = await retryQuiet(
+      () => state.sb.from("business_settings").upsert(payload, { onConflict: "is_primary" }).select("*").single(),
+      4
+    );
+    const savedTables = savedBusiness ? await saveOutdoorTableZonesRemotely(outdoorIds) : null;
+    if (submit) {
+      submit.disabled = false;
+      submit.innerHTML = submitMarkup;
+    }
+    if (savedBusiness && savedTables) {
+      state.business = savedBusiness;
+      applyBusinessTipSettings();
+      if (Array.isArray(savedTables.tables)) {
+        const zones = new Map(savedTables.tables.map((table) => [String(table.id), table.is_outdoor === true]));
+        state.tables = state.tables.map((table) => zones.has(String(table.id)) ? { ...table, is_outdoor: zones.get(String(table.id)) } : table);
       }
-      state.business = original;
+      state.outdoorTableDraftIds = new Set(normalTables().filter(isOutdoorTable).map((table) => String(table.id)));
+      state.outdoorTableDraftDirty = false;
       persistBootstrapCache();
       renderBrand();
       renderBusinessForm();
-      toast("No se pudo guardar la marca. Se restauro la informacion.", "error", "business-save-failed");
-    })();
+      renderTables();
+      renderServiceTables();
+      toast("Configuración guardada. La marca, la propina y las mesas ya están actualizadas.");
+      refreshIcons();
+      return;
+    }
+    state.business = originalBusiness;
+    state.tipSettings = originalTipSettings;
+    state.tables = originalTables;
+    state.outdoorTableDraftIds = new Set(normalTables().filter(isOutdoorTable).map((table) => String(table.id)));
+    state.outdoorTableDraftDirty = false;
+    persistTipSettings();
+    persistBootstrapCache();
+    renderBrand();
+    renderBusinessForm();
+    renderTables();
+    renderServiceTables();
+    toast("No se pudo guardar la configuración. Se restauró la información anterior.", "error", "business-save-failed");
+    refreshIcons();
   };
 
   const uploadAsset = async (file, fieldName) => {
@@ -5420,9 +5841,10 @@ const App = (() => {
     toast(isUpdate ? "Mesa actualizada. QR listo para descargar." : "Mesa guardada. QR listo para descargar.");
     void (async () => {
       const saved = await retryQuiet(
-        () => isUpdate
-          ? state.sb.from("restaurant_tables").update(payload).eq("id", recordId).select("*").single()
-          : state.sb.from("restaurant_tables").insert({ ...payload, id: recordId }).select("*").single(),
+        () => {
+          if (!isUpdate) return state.sb.from("restaurant_tables").insert({ ...payload, id: recordId }).select("*").single();
+          return state.sb.from("restaurant_tables").update(payload).eq("id", recordId).select("*").single();
+        },
         4
       );
       if (saved) {
@@ -5449,30 +5871,46 @@ const App = (() => {
       toast("La categoria necesita nombre.", "error");
       return;
     }
-    const id = form.category_id.value;
-    const query = id
-      ? state.sb.from("menu_categories").update(payload).eq("id", id).select("*").single()
-      : state.sb.from("menu_categories").insert(payload).select("*").single();
-    const saved = await db(query, null);
-    if (saved) {
-      form.reset();
-      form.category_id.value = "";
-      form.category_active.checked = true;
-      await loadCore();
+    const existingId = form.category_id.value;
+    const recordId = existingId || uid();
+    const existing = state.categories.find((category) => category.id === recordId) || null;
+    const original = [...state.categories];
+    const optimistic = { ...(existing || {}), ...payload, id: recordId, updated_at: new Date().toISOString(), _offline_pending: true };
+    state.categories = existing
+      ? state.categories.map((category) => category.id === recordId ? optimistic : category)
+      : [...state.categories, optimistic];
+    form.reset();
+    form.category_id.value = "";
+    form.category_active.checked = true;
+    persistBootstrapCache();
+    renderAdmin();
+    toast("Categoria guardada.");
+    void (async () => {
+      const saved = await retryQuiet(() => {
+        if (!existing) return state.sb.from("menu_categories").insert({ ...payload, id: recordId }).select("*").single();
+        return state.sb.from("menu_categories").update(payload).eq("id", recordId).select("*").single();
+      }, 4);
+      if (saved) {
+        state.categories = state.categories.map((category) => category.id === recordId ? saved : category);
+        persistBootstrapCache();
+        return;
+      }
+      state.categories = original;
+      persistBootstrapCache();
       renderAdmin();
-      toast("Categoria guardada.");
-    }
+      toast("No se pudo guardar la categoria. Se restauro la informacion.", "error", `category-save-failed:${recordId}`);
+    })();
   };
 
   const saveItem = async (form) => {
     let categoryId = form.category_id.value;
     const newCategory = form.new_category.value.trim();
     if (!categoryId && newCategory) {
-      const category = await db(
-        state.sb.from("menu_categories").insert({ name: newCategory, is_active: true }).select("*").single(),
-        null
-      );
-      categoryId = category?.id || "";
+      categoryId = uid();
+      const localCategory = { id: categoryId, name: newCategory, sort_order: 0, is_active: true, updated_at: new Date().toISOString(), _offline_pending: true };
+      state.categories = [...state.categories, localCategory];
+      persistBootstrapCache();
+      void dbQuiet(state.sb.from("menu_categories").insert({ id: categoryId, name: newCategory, sort_order: 0, is_active: true }).select("*").single(), null);
     }
     const payload = {
       category_id: categoryId || null,
@@ -5487,19 +5925,45 @@ const App = (() => {
       toast("Producto y precio son obligatorios.", "error");
       return;
     }
-    const id = form.item_id.value;
-    const query = id
-      ? state.sb.from("menu_items").update(payload).eq("id", id).select("*").single()
-      : state.sb.from("menu_items").insert(payload).select("*").single();
-    const saved = await db(query, null);
-    if (saved) {
-      form.reset();
-      form.item_id.value = "";
-      form.is_available.checked = true;
-      await loadCore();
+    const existingId = form.item_id.value;
+    const recordId = existingId || uid();
+    const existing = state.items.find((item) => item.id === recordId) || null;
+    const original = [...state.items];
+    const category = state.categories.find((entry) => entry.id === categoryId);
+    const optimistic = {
+      ...(existing || {}),
+      ...payload,
+      id: recordId,
+      menu_categories: category ? { name: category.name } : null,
+      updated_at: new Date().toISOString(),
+      _offline_pending: true
+    };
+    state.items = existing
+      ? state.items.map((item) => item.id === recordId ? optimistic : item)
+      : [...state.items, optimistic];
+    form.reset();
+    form.item_id.value = "";
+    form.is_available.checked = true;
+    persistBootstrapCache();
+    renderAdmin();
+    toast("Producto guardado.");
+    void (async () => {
+      const saved = await retryQuiet(() => {
+        if (!existing) return state.sb.from("menu_items").insert({ ...payload, id: recordId }).select("*, menu_categories(name)").single();
+        return state.sb.from("menu_items").update(payload).eq("id", recordId).select("*, menu_categories(name)").single();
+      }, 4);
+      if (saved) {
+        state.items = state.items.map((item) => item.id === recordId
+          ? { ...saved, menu_categories: saved.menu_categories || optimistic.menu_categories }
+          : item);
+        persistBootstrapCache();
+        return;
+      }
+      state.items = original;
+      persistBootstrapCache();
       renderAdmin();
-      toast("Producto guardado.");
-    }
+      toast("No se pudo guardar el producto. Se restauro la informacion.", "error", `item-save-failed:${recordId}`);
+    })();
   };
 
   const acknowledgeRequestOptimistically = (requestIds, payload, failureMessage) => {
@@ -5687,7 +6151,13 @@ const App = (() => {
     }
     const originalSessions = state.sessions;
     const originalRequests = state.requests;
-    state.optimisticSessionStates.set(id, { mode: "remove", session });
+    state.optimisticSessionStates.set(id, {
+      mode: "remove",
+      session,
+      // Conserva la lapida durante varias lecturas para que una replica o una
+      // respuesta cacheada atrasada no haga reaparecer la cuenta ya cobrada.
+      retainUntil: Date.now() + 30_000
+    });
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
     state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
     renderAdminLive();
@@ -5716,7 +6186,11 @@ const App = (() => {
       toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
       return null;
     }
-    state.optimisticSessionStates.set(id, { mode: "remove", session: { ...session, ...saved } });
+    state.optimisticSessionStates.set(id, {
+      mode: "remove",
+      session: { ...session, ...saved },
+      retainUntil: Date.now() + 30_000
+    });
     await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq("session_id", id), null);
     return { session, saved, totals };
   };
@@ -5736,23 +6210,34 @@ const App = (() => {
     const issuedAt = new Date(invoice?.createdAt || Date.now());
     const payments = invoice?.payments || [];
     return `<!doctype html>
-      <html lang="es"><head><meta charset="utf-8"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
+      <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
       <style>
         @page { size: 80mm auto; margin: 3mm; }
-        * { box-sizing: border-box; }
-        body { width: 72mm; margin: 0 auto; color: #000; background: #fff; font: 12px/1.35 "Courier New", monospace; }
-        .logo { margin: 2mm 0 0; text-align: center; font: 900 22px/1 Arial, sans-serif; letter-spacing: .7px; }
+        * { box-sizing: border-box; color: #000; }
+        html { display: block; visibility: visible; min-height: 0; margin: 0; padding: 0; color: #000; background: #fff; }
+        body { display: block; visibility: visible; width: 72mm; max-width: 72mm; min-height: 0; margin: 0 auto; padding: 0 3mm; overflow-wrap: anywhere; color: #000; background: #fff; font: 700 10px/1.35 "Courier New", monospace; }
+        strong { color: #000; font-weight: 900; }
+        small { color: #000; font-size: 9px; font-weight: 700; }
+        .logo { margin: 2mm 0 0; text-align: center; font: 900 18px/1 Arial, sans-serif; letter-spacing: .5px; }
         .subtitle, .center { text-align: center; }
         .subtitle { margin: 1mm 0 3mm; font-weight: 700; }
         .rule { margin: 2.5mm 0; border-top: 1px dashed #000; }
-        .meta, .totals { display: grid; grid-template-columns: 1fr auto; gap: 1mm 3mm; }
+        .meta, .totals { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 1mm 2mm; align-items: start; width: 100%; padding: 0 2mm; }
         .items { display: grid; gap: 2mm; }
-        .item { display: grid; grid-template-columns: 1fr auto; gap: 2mm; }
+        .item { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 2mm; align-items: start; width: 100%; padding: 0 2mm; }
+        .meta > *, .totals > *, .item > * { min-width: 0; }
+        .meta strong { max-width: 30mm; overflow-wrap: anywhere; text-align: right; font-size: 9px; }
+        .totals strong, .item > strong { white-space: nowrap; text-align: right; font-size: 9px; }
         .item small { display: block; }
-        .total { margin-top: 1.5mm; font-size: 16px; font-weight: 900; }
+        .total { margin-top: 1.5mm; font-size: 13px; font-weight: 900; }
+        .totals strong.total { font-size: 12px; }
         .paid { padding: 1.5mm; border: 2px solid #000; text-align: center; font-weight: 900; }
         .footer { margin-top: 3mm; text-align: center; }
         @media screen { body { padding: 8mm 4mm; box-shadow: 0 0 22px #bbb; } }
+        @media print {
+          html { display: block !important; visibility: visible !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
+          body { display: block !important; visibility: visible !important; width: 72mm !important; max-width: 72mm !important; min-height: 0 !important; margin: 0 auto !important; padding: 0 3mm !important; overflow: visible !important; color: #000 !important; font-weight: 700 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        }
       </style></head><body>
         <div class="logo">${escapeHTML(businessName)}</div>
         <div class="subtitle">FACTURA DE VENTA</div>
@@ -5775,7 +6260,7 @@ const App = (() => {
           ${totals.discount ? `<span>Descuento</span><strong>-${money(totals.discount)}</strong>` : ""}
           ${totals.tax ? `<span>Impuestos</span><strong>${money(totals.tax)}</strong>` : ""}
           ${totals.serviceFee ? `<span>Servicio</span><strong>${money(totals.serviceFee)}</strong>` : ""}
-          ${chargedTip ? `<span>Propina voluntaria (${Number(invoice.tipPercentage || 0)}%)</span><strong>${money(chargedTip)}</strong>` : ""}
+          ${chargedTip ? `<span>Propina voluntaria${invoice.tipPercentage ? ` (${Number(invoice.tipPercentage)}%)` : ""}</span><strong>${money(chargedTip)}</strong>` : ""}
           ${suggestedTip ? `<span>Propina voluntaria sugerida (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong>` : ""}
           <span class="total">${suggestedTip ? "TOTAL SUGERIDO" : "TOTAL"}</span><strong class="total">${money(receiptTotal)}</strong>
         </div>
@@ -5783,7 +6268,6 @@ const App = (() => {
         ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.paymentMethod === "cash" && Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
         <div class="rule"></div>
         <div class="footer">Gracias por su compra<br><strong>${escapeHTML(businessName)}</strong></div>
-        <script>window.onload=function(){setTimeout(function(){window.print()},250)}<\/script>
       </body></html>`;
   };
 
@@ -5796,6 +6280,41 @@ const App = (() => {
     popup.document.open();
     popup.document.write(thermalReceiptHtml(session, invoice));
     popup.document.close();
+    const receiptDocument = popup.document;
+    const waitForReceiptLoad = () => {
+      if (receiptDocument.readyState === "complete") return Promise.resolve();
+      return new Promise((resolve) => {
+        const complete = () => {
+          if (receiptDocument.readyState !== "complete") return;
+          popup.removeEventListener("load", complete);
+          receiptDocument.removeEventListener("readystatechange", complete);
+          resolve();
+        };
+        popup.addEventListener("load", complete, { once: true });
+        receiptDocument.addEventListener("readystatechange", complete);
+      });
+    };
+    const printWhenReady = async () => {
+      await waitForReceiptLoad();
+      try {
+        if (receiptDocument.fonts?.ready) await receiptDocument.fonts.ready;
+        const images = Array.from(receiptDocument.images || []);
+        await Promise.all(images.map((image) => {
+          if (image.complete) return image.decode?.().catch(() => undefined);
+          return new Promise((resolve) => {
+            image.addEventListener("load", resolve, { once: true });
+            image.addEventListener("error", resolve, { once: true });
+          });
+        }));
+        await new Promise((resolve) => popup.requestAnimationFrame(() => popup.requestAnimationFrame(resolve)));
+      } finally {
+        if (!popup.closed) {
+          popup.focus();
+          popup.print();
+        }
+      }
+    };
+    void printWhenReady();
     return true;
   };
 
@@ -5842,7 +6361,9 @@ const App = (() => {
     const baseTotal = integerMoney(state.activePaymentBase);
     const enabled = tipsEnabled();
     const choice = form.tip_choice?.value || "";
-    const tip = enabled && choice === "with" ? tipAmountFor(baseTotal) : 0;
+    const manualTip = enabled && choice === "with" ? currencyInputNumber(form.tip_amount) : 0;
+    const suggestedTip = tipAmountFor(baseTotal);
+    const tip = enabled && choice === "with" ? (manualTip || suggestedTip) : 0;
     const total = baseTotal + tip;
     state.activePaymentTip = tip;
     state.activePaymentTotal = total;
@@ -5850,11 +6371,11 @@ const App = (() => {
     if ($("#paymentTotalHint")) $("#paymentTotalHint").textContent = enabled && !choice
       ? "Selecciona si el cliente paga con o sin propina para continuar."
       : tip
-        ? `Incluye ${money(tip)} de propina voluntaria.`
+        ? `Incluye ${money(tip)} de propina voluntaria${manualTip ? " ingresada manualmente" : ""}.`
         : "Total del consumo sin propina.";
     if ($("#paymentWithoutTipAmount")) $("#paymentWithoutTipAmount").textContent = money(baseTotal);
-    if ($("#paymentWithTipLabel")) $("#paymentWithTipLabel").textContent = `Con propina (${state.tipSettings.percentage}%)`;
-    if ($("#paymentWithTipAmount")) $("#paymentWithTipAmount").textContent = `${money(tipAmountFor(baseTotal))} · Total ${money(baseTotal + tipAmountFor(baseTotal))}`;
+    if ($("#paymentWithTipLabel")) $("#paymentWithTipLabel").textContent = manualTip ? "Con propina manual" : `Con propina (${state.tipSettings.percentage}%)`;
+    if ($("#paymentWithTipAmount")) $("#paymentWithTipAmount").textContent = `${money(manualTip || suggestedTip)} · Total ${money(baseTotal + (manualTip || suggestedTip))}`;
     setCurrencyInputValue(form.cash_received, total);
     setCurrencyInputValue(form.mixed_amount_one, total);
     setCurrencyInputValue(form.mixed_amount_two, 0);
@@ -5940,13 +6461,55 @@ const App = (() => {
     return { method, payments: [{ method: firstMethod, amount: firstAmount }, { method: secondMethod, amount: secondAmount }] };
   };
 
+  const reflectInvoiceInIncomeReport = (invoice) => {
+    const filters = incomeFiltersFromForm();
+    const localRecord = localIncomeRecords(filters)
+      .find((record) => String(record.saleId) === String(invoice.id || invoice.sessionId));
+    if (!localRecord) return;
+    if (!state.incomeReport) {
+      state.incomeReport = localIncomeReport(filters);
+      return;
+    }
+    const records = [
+      localRecord,
+      ...(state.incomeReport.records || []).filter((record) => String(record.saleId) !== String(localRecord.saleId))
+    ].sort((left, right) => String(right.date).localeCompare(String(left.date)));
+    state.incomeReport = {
+      ...state.incomeReport,
+      filters,
+      records,
+      totals: incomeTotalsFromRecords(records),
+      totalRecords: Math.max(Number(state.incomeReport.totalRecords || 0) + 1, records.length),
+      pendingCount: Number(state.incomeReport.pendingCount || 0) + 1
+    };
+  };
+
   const applyInvoiceToInventory = (invoice) => {
     if (state.invoiceHistory.some((entry) => entry.sessionId === invoice.sessionId)) return false;
     state.invoiceHistory.push(invoice);
     persistInvoiceHistory();
-    state.incomeReport = null;
+    reflectInvoiceInIncomeReport(invoice);
     enqueueAppsScriptJob("record_sale", { invoice }, `sale:${invoice.sessionId}`);
     return true;
+  };
+
+  const rollbackLocalPayment = ({ invoice, inventoryBefore, incomeReportBefore }) => {
+    const eventPrefix = `SALE-${invoice.id}-`;
+    state.invoiceHistory = state.invoiceHistory.filter((entry) => String(entry.id) !== String(invoice.id));
+    inventoryBefore.forEach((value, productId) => {
+      if (value === null) delete state.inventoryMeta[productId];
+      else state.inventoryMeta[productId] = value;
+    });
+    state.inventoryMovements = state.inventoryMovements.filter((movement) => !String(movement.movementId || "").startsWith(eventPrefix));
+    writeAppsScriptOutbox(readAppsScriptOutbox().filter((job) => job.dedupeKey !== `sale:${invoice.sessionId}`));
+    state.incomeReport = incomeReportBefore;
+    persistInvoiceHistory();
+    persistInventoryStore();
+    persistInventoryMovements();
+    renderInventory();
+    renderInventoryMovements();
+    renderIncomeReport();
+    renderTips();
   };
 
   const paidInventoryPlan = (session) => {
@@ -6019,6 +6582,12 @@ const App = (() => {
       toast("Agrega al menos un producto antes de cobrar.", "error", `empty-payment:${session.id}`);
       return;
     }
+    if (state.invoiceHistory.some((invoice) => String(invoice.sessionId) === String(session.id))) {
+      $("#paymentDialog")?.close();
+      void closeSession(session.id);
+      toast("Esta cuenta ya fue cobrada. Se retiro la copia atrasada de la pantalla.", "ok", `payment-already-recorded:${session.id}`);
+      return;
+    }
     if (tipsEnabled() && !form.tip_choice?.value) {
       toast("Selecciona si el cliente paga con o sin propina.", "error", "tip-choice-required");
       form.querySelector('input[name="tip_choice"]')?.focus({ preventScroll: true });
@@ -6046,21 +6615,16 @@ const App = (() => {
       state.paymentProcessing = false;
       return;
     }
-    const closed = await closeSession(session.id);
-    buttons.forEach((button) => { button.disabled = false; });
-    if (!closed) {
-      receiptWindow?.close();
-      state.paymentProcessing = false;
-      return;
-    }
-    const createdAt = closed.saved.closed_at || new Date().toISOString();
-    const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" ? Number(state.tipSettings.percentage) : 0;
-    const tipAmount = tipPercentage ? tipAmountFor(closed.totals.total, tipPercentage) : 0;
+    const createdAt = new Date().toISOString();
+    const totals = sessionTotals(session);
+    const manualTip = tipsEnabled() && form.tip_choice.value === "with" ? currencyInputNumber(form.tip_amount) : 0;
+    const tipPercentage = tipsEnabled() && form.tip_choice.value === "with" && !manualTip ? Number(state.tipSettings.percentage) : 0;
+    const tipAmount = manualTip || (tipPercentage ? tipAmountFor(totals.total, tipPercentage) : 0);
     const invoiceTotals = {
-      ...closed.totals,
-      baseTotal: integerMoney(closed.totals.total),
+      ...totals,
+      baseTotal: integerMoney(totals.total),
       tip: tipAmount,
-      total: integerMoney(closed.totals.total) + tipAmount
+      total: integerMoney(totals.total) + tipAmount
     };
     const invoice = {
       id: uid(),
@@ -6078,7 +6642,8 @@ const App = (() => {
       withTip: tipAmount > 0,
       tipPercentage,
       tipAmount,
-      baseTotal: integerMoney(closed.totals.total),
+      tipIsManual: manualTip > 0,
+      baseTotal: integerMoney(totals.total),
       reference: form.payment_reference.value.trim(),
       cashReceived: payment.method === "cash" ? currencyInputNumber(form.cash_received) : null,
       changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - invoiceTotals.total : 0,
@@ -6094,14 +6659,42 @@ const App = (() => {
         status: item.status
       }))
     };
+    const inventoryBefore = new Map(inventoryPlan.map(({ item }) => [
+      item.id,
+      Object.prototype.hasOwnProperty.call(state.inventoryMeta, item.id)
+        ? { ...state.inventoryMeta[item.id] }
+        : null
+    ]));
+    const incomeReportBefore = state.incomeReport;
+
+    // Desde aqui todo lo visible cambia en el mismo click. La confirmacion de
+    // Supabase sigue en segundo plano y Apps Script espera esa escritura.
+    state.localSupabaseWrites += 1;
+    const closePromise = closeSession(session.id);
     applyPaidInventoryLocally(invoice, inventoryPlan);
     applyInvoiceToInventory(invoice);
     $("#paymentDialog")?.close();
     renderInventory();
+    renderInventoryMovements();
+    renderIncomeReport();
     renderTips();
+    buttons.forEach((button) => { button.disabled = false; });
     if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;
+
+    let closed = null;
+    try {
+      closed = await closePromise;
+    } finally {
+      state.localSupabaseWrites = Math.max(0, state.localSupabaseWrites - 1);
+    }
+    if (!closed) {
+      receiptWindow?.close();
+      rollbackLocalPayment({ invoice, inventoryBefore, incomeReportBefore });
+      return;
+    }
+    void flushAppsScriptOutbox();
   };
 
   const renderConsumptionSelection = () => {
@@ -6109,15 +6702,61 @@ const App = (() => {
     const lines = $("#consumptionSelectionLines");
     const count = $("#consumptionSelectionCount");
     const total = $("#consumptionSelectionTotal");
+    const priceWarning = $("#consumptionSelectionPriceWarning");
     if (!box || !lines || !count || !total) return;
     const drafts = state.consumptionDrafts;
+    const canEditPrice = state.currentUser?.role !== "waiter";
+    const hasEditedPrice = drafts.some((draft) => draft.menuItemId && Number(draft.unitPrice) !== Number(draft.originalUnitPrice));
     box.hidden = drafts.length === 0;
     count.textContent = `${drafts.length} ${drafts.length === 1 ? "producto" : "productos"}`;
     total.textContent = money(drafts.reduce((sum, draft) => sum + draft.quantity * draft.unitPrice, 0));
-    lines.innerHTML = drafts.map((draft, index) => `<div><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
+    if (priceWarning) priceWarning.hidden = !hasEditedPrice;
+    lines.innerHTML = drafts.map((draft, index) => `<div><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong${canEditPrice ? ` class="consumption-draft-price" data-edit-consumption-draft="${index}" title="Doble clic para editar el precio unitario"` : ""}>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
     const form = $("#consumptionForm");
     if (form) form.quantity.required = drafts.length === 0;
     refreshIcons();
+  };
+
+  const editConsumptionDraftPrice = (priceElement) => {
+    if (state.currentUser?.role === "waiter") return;
+    const index = Number(priceElement?.dataset.editConsumptionDraft);
+    const draft = state.consumptionDrafts[index];
+    if (!Number.isInteger(index) || !draft) return;
+    const input = document.createElement("input");
+    input.className = "consumption-draft-price-editor";
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.autocomplete = "off";
+    input.setAttribute("aria-label", `Precio unitario de ${draft.itemName}`);
+    input.value = formattedCurrencyInput(draft.unitPrice);
+    let saved = false;
+    const save = () => {
+      if (saved) return;
+      saved = true;
+      draft.unitPrice = currencyInputNumber(input);
+      renderConsumptionSelection();
+    };
+    input.addEventListener("input", () => {
+      input.value = formattedCurrencyInput(input.value, { allowEmpty: true });
+      input.setSelectionRange?.(input.value.length, input.value.length);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        save();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        saved = true;
+        renderConsumptionSelection();
+      }
+    });
+    input.addEventListener("blur", save, { once: true });
+    priceElement.replaceWith(input);
+    window.requestAnimationFrame(() => {
+      input.focus({ preventScroll: true });
+      input.select();
+    });
   };
 
   const currentConsumptionDraft = (form, { quiet = false } = {}) => {
@@ -6134,6 +6773,7 @@ const App = (() => {
       itemName,
       quantity,
       unitPrice,
+      originalUnitPrice: selectedItem ? Number(selectedItem.price || 0) : null,
       notes: form.notes.value.trim(),
       payerName: form.payer_name.value.trim()
     };
@@ -6273,6 +6913,7 @@ const App = (() => {
     form.session_id.value = optimisticSessionId;
     form.pending_table_id.value = "";
     state.accountsRenderSignature = "";
+    persistOfflineAdminSnapshot();
     renderAdminLive();
     toast(`${drafts.length} ${drafts.length === 1 ? "producto agregado" : "productos agregados"} a la cuenta.`, "ok", `consumption-batch-optimistic:${optimisticSessionId}`);
 
@@ -6332,6 +6973,7 @@ const App = (() => {
       form.session_id.value = "";
       form.pending_table_id.value = table.id;
       state.accountsRenderSignature = "";
+      persistOfflineAdminSnapshot();
       renderAdminLive();
       toast("No fue posible abrir la cuenta de la mesa. La selección fue restaurada.", "error", `batch-session-failed:${optimisticSessionId}`);
       return null;
@@ -6397,10 +7039,12 @@ const App = (() => {
         assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
       } : null
     });
+    persistOfflineAdminSnapshot();
     return { sessionId: persistedSessionId, items: savedItems };
   };
 
   const confirmConsumptionSelection = async (form) => {
+    if (form.dataset.localSubmitInProgress === "1") return null;
     if (form.session_item_id.value) return addManualConsumption(form);
     const hasPendingEntry = Boolean(form.menu_item_id.value || form.item_name.value.trim() || form.quantity.value || $("#consumptionProductSearch")?.value.trim());
     const pendingEntry = currentConsumptionDraft(form, { quiet: true });
@@ -6415,28 +7059,29 @@ const App = (() => {
     }
     const drafts = [...state.consumptionDrafts];
     const quickCheckout = form.quick_checkout.value === "1";
-    const submit = $("#consumptionSubmitButton");
-    const queue = $("#consumptionQueueButton");
-    if (submit) submit.disabled = true;
-    if (queue) queue.disabled = true;
-    $("#consumptionDialog")?.close();
-    const result = await addConsumptionBatch(form, drafts);
-    if (submit) submit.disabled = false;
-    if (queue) queue.disabled = false;
-    if (!result) {
-      state.consumptionDrafts = drafts;
-      clearConsumptionEntry(form);
+    form.dataset.localSubmitInProgress = "1";
+    try {
+      const result = await addConsumptionBatch(form, drafts);
+      if (!result) {
+        state.consumptionDrafts = drafts;
+        clearConsumptionEntry(form);
+        renderConsumptionSelection();
+        return null;
+      }
+      state.consumptionDrafts = [];
       renderConsumptionSelection();
-      $("#consumptionDialog")?.showModal();
-      return null;
+      const sessionId = result.sessionId;
+      clearConsumptionEntry(form);
+      if (quickCheckout) {
+        $("#consumptionDialog")?.close();
+        openPaymentDialog(sessionId);
+      } else {
+        $("#consumptionProductSearch")?.focus({ preventScroll: true });
+      }
+      return sessionId;
+    } finally {
+      delete form.dataset.localSubmitInProgress;
     }
-    state.consumptionDrafts = [];
-    renderConsumptionSelection();
-    const sessionId = result.sessionId;
-    $("#consumptionDialog")?.close();
-    clearConsumptionEntry(form);
-    if (quickCheckout) openPaymentDialog(sessionId);
-    return sessionId;
   };
 
   const openConsumptionDialog = (sessionId = "", { pendingTableId = "", quickCheckout = false } = {}) => {
@@ -6662,6 +7307,7 @@ const App = (() => {
         assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
       }
     });
+    persistOfflineAdminSnapshot();
     if (!keepOpen) $("#consumptionDialog")?.close();
     renderAdminLive();
     if (isLocalWalkInSession(session)) {
@@ -6692,6 +7338,7 @@ const App = (() => {
     if (!saved) {
       state.optimisticSessionStates.delete(sessionId);
       state.sessions = state.sessions.map((entry) => entry.id === sessionId ? session : entry);
+      persistOfflineAdminSnapshot();
       renderAdmin();
       toast("No se pudo guardar el consumo. La cuenta fue restaurada y el inventario no cambio.", "error", `consumption-failed:${temporaryId}`);
       return null;
@@ -6716,6 +7363,7 @@ const App = (() => {
         assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
       } : null
     });
+    persistOfflineAdminSnapshot();
     if (!silent) toast(itemId ? "Consumo actualizado." : "Producto agregado a la cuenta.", "ok", `consumption-saved:${saved.id}`);
     if (openPaymentAfter) openPaymentDialog(sessionId);
     return { sessionId, item: saved };
@@ -6993,7 +7641,9 @@ const App = (() => {
     else renderAdmin();
     void (async () => {
       const removed = await retryQuiet(
-        () => state.sb.from(table).delete().eq("id", id).select("*").single(),
+        () => {
+          return state.sb.from(table).delete().eq("id", id).select("*").single();
+        },
         4
       );
       if (removed) {
@@ -7021,14 +7671,30 @@ const App = (() => {
       event.preventDefault();
       await saveBusiness(event.currentTarget);
     });
-    $("#businessForm")?.addEventListener("change", (event) => {
+    $("#businessForm")?.addEventListener("change", async (event) => {
       if (event.target.name === "tips_enabled") {
+        const previous = { ...state.tipSettings };
         if (updateTipSettingsFromForm(event.currentTarget, { toggleChanged: true })) {
-          toast(state.tipSettings.enabled ? `Propina voluntaria activada al ${state.tipSettings.percentage}%.` : "Propina voluntaria desactivada.");
+          const desired = { ...state.tipSettings };
+          if (await saveTipSettingsRemotely(desired)) {
+            toast(desired.enabled ? `Propina voluntaria activada al ${desired.percentage}% en todos los dispositivos.` : "Propina voluntaria desactivada en todos los dispositivos.");
+          } else {
+            state.tipSettings = previous;
+            persistTipSettings();
+            renderBusinessForm();
+            syncTipFeatureVisibility();
+            toast("No se pudo guardar la propina. Se restauró la configuración anterior.", "error", "tip-save-failed");
+          }
         }
       }
       if (event.target.name === "tip_percentage" && !event.currentTarget.tips_enabled.checked) {
-        updateTipSettingsFromForm(event.currentTarget);
+        const previous = { ...state.tipSettings };
+        if (updateTipSettingsFromForm(event.currentTarget) && !await saveTipSettingsRemotely({ ...state.tipSettings })) {
+          state.tipSettings = previous;
+          persistTipSettings();
+          renderBusinessForm();
+          toast("No se pudo guardar el porcentaje. Se restauró el valor anterior.", "error", "tip-percentage-save-failed");
+        }
       }
     });
     $("#tipSplitPeople")?.addEventListener("input", (event) => {
@@ -7038,6 +7704,7 @@ const App = (() => {
       localStorage.setItem(TIP_SPLIT_STORAGE_KEY, String(people));
       renderTips();
     });
+    $("#resetTips")?.addEventListener("click", resetTips);
     $("#tableForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await saveTable(event.currentTarget);
@@ -7108,6 +7775,18 @@ const App = (() => {
       state.inventoryStatusFilter = event.currentTarget.value || "all";
       renderInventory();
     });
+    $("#inventoryCategoryFilter")?.addEventListener("change", (event) => {
+      state.inventoryCategoryFilter = event.currentTarget.value || "all";
+      renderInventory();
+    });
+    $("#dashboardTableZoneFilter")?.addEventListener("change", (event) => {
+      state.dashboardTableZoneFilter = event.currentTarget.value || "all";
+      renderTables();
+    });
+    $("#serviceTableZoneFilter")?.addEventListener("change", (event) => {
+      state.serviceTableZoneFilter = event.currentTarget.value || "all";
+      renderServiceTables();
+    });
     $("#movementSearch")?.addEventListener("input", (event) => {
       state.movementSearch = event.currentTarget.value;
       renderInventoryMovements();
@@ -7127,6 +7806,10 @@ const App = (() => {
       else queueConsumptionDraft();
     });
     $("#consumptionQueueButton")?.addEventListener("click", queueConsumptionDraft);
+    $("#consumptionSelectionLines")?.addEventListener("dblclick", (event) => {
+      const price = event.target.closest("[data-edit-consumption-draft]");
+      if (price) editConsumptionDraftPrice(price);
+    });
     $("#paymentForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await processPayment(event.currentTarget, event.submitter);
@@ -7143,6 +7826,10 @@ const App = (() => {
       if (event.target.name === "mixed_method_one" || event.target.name === "mixed_method_two") syncMixedMethods(event.target.name);
     });
     $("#paymentForm")?.addEventListener("input", (event) => {
+      if (event.target.name === "tip_amount") {
+        event.currentTarget.tip_choice.value = "with";
+        updatePaymentTipChoice();
+      }
       if (event.target.name === "mixed_amount_one" || event.target.name === "mixed_amount_two") updateMixedPayment(event.target.name);
       if (event.target.name === "cash_received") updateCashChange();
     });
@@ -7297,6 +7984,15 @@ const App = (() => {
     $("#logoutButton")?.addEventListener("click", logoutAdmin);
 
     document.addEventListener("change", async (event) => {
+      if (event.target.matches("[data-outdoor-table]")) {
+        if (!(state.outdoorTableDraftIds instanceof Set)) state.outdoorTableDraftIds = new Set();
+        const id = String(event.target.dataset.outdoorTable || "");
+        if (event.target.checked) state.outdoorTableDraftIds.add(id);
+        else state.outdoorTableDraftIds.delete(id);
+        state.outdoorTableDraftDirty = true;
+        renderOutdoorTableConfigurator();
+        return;
+      }
       if (event.target.matches("[data-user-access]")) {
         await toggleUserAccess(event.target.dataset.userAccess, event.target.checked, event.target);
         return;
@@ -7366,25 +8062,56 @@ const App = (() => {
       if (target.id === "selectAllTableQrs") {
         setAllQrSelections(true);
       }
+      if (target.id === "selectOutdoorRange" || target.id === "clearOutdoorRange") {
+        const fromId = $("#outdoorTableFrom")?.value || "";
+        const toId = $("#outdoorTableTo")?.value || "";
+        const ordered = normalTables()
+          .filter((table) => table.is_active !== false)
+          .sort((left, right) => Number(left.table_number || 0) - Number(right.table_number || 0));
+        const fromIndex = ordered.findIndex((table) => String(table.id) === String(fromId));
+        const toIndex = ordered.findIndex((table) => String(table.id) === String(toId));
+        if (fromIndex >= 0 && toIndex >= 0) {
+          if (!(state.outdoorTableDraftIds instanceof Set)) state.outdoorTableDraftIds = new Set();
+          const first = Math.min(fromIndex, toIndex);
+          const last = Math.max(fromIndex, toIndex);
+          ordered.slice(first, last + 1).forEach((table) => {
+            if (target.id === "selectOutdoorRange") state.outdoorTableDraftIds.add(String(table.id));
+            else state.outdoorTableDraftIds.delete(String(table.id));
+          });
+          state.outdoorTableDraftDirty = true;
+          renderOutdoorTableConfigurator();
+        }
+      }
       if (target.id === "clearTableQrs") {
         setAllQrSelections(false);
       }
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
-        await syncInventoryWithAppsScript();
-        await flushAppsScriptOutbox();
+        await runRefreshAction(target, async () => {
+          const flushed = await flushAppsScriptOutbox();
+          if (!flushed || readAppsScriptOutbox().length) return false;
+          const coreRefreshed = await refreshCoreNow();
+          const inventoryRefreshed = await syncInventoryWithAppsScript();
+          return coreRefreshed && inventoryRefreshed;
+        }, "Inventario actualizado con la información más reciente.");
       }
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
-      if (target.id === "refreshIncomeReport") await loadIncomeReport();
+      if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => (await loadIncomeReport()) || !navigator.onLine, "Ingresos actualizados.");
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
       if (target.id === "cancelInventoryEdit") {
         resetInventoryForm();
         $("#inventoryDialog")?.close();
       }
-      if (target.id === "refreshInventoryMovements") await loadInventoryMovements();
+      if (target.id === "refreshInventoryMovements") await runRefreshAction(target, async () => {
+        if (!navigator.onLine) {
+          renderInventoryMovements();
+          return true;
+        }
+        return loadInventoryMovements();
+      }, "Movimientos actualizados desde la fuente oficial.");
       if (target.dataset.resetSection) {
         await resetSectionData(target.dataset.resetSection);
         return;
@@ -7505,13 +8232,18 @@ const App = (() => {
     const channel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
+      .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow)
+      .on("postgres_changes", { event: "*", schema: "public", table: "business_settings" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "restaurant_tables" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_categories" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "menu_items" }, () => void refreshCoreNow())
       .subscribe((status) => {
         if (status === "SUBSCRIBED") setRealtimeStatus("En vivo", "live");
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setRealtimeStatus("Respaldo cada 5 segundos", "fallback");
+          setRealtimeStatus("Respaldo cada 1,5 segundos", "fallback");
         }
       });
     state.subscriptions.push(channel);
@@ -7923,17 +8655,53 @@ const App = (() => {
     setLoading(false);
     applyCurrentUser();
     refreshIcons();
+    const form = $("#loginForm");
+    const errorBox = $("#loginError");
+    const regularCredentials = $("#loginCredentials");
+    const initialCredentials = $("#initialAdminCredentials");
+    const intro = $("#loginIntro");
+    const submitButton = $("#loginSubmit");
+    let initialSetup = false;
+    const setInitialSetupMode = (enabled) => {
+      initialSetup = Boolean(enabled);
+      if (regularCredentials) regularCredentials.hidden = initialSetup;
+      if (initialCredentials) initialCredentials.hidden = !initialSetup;
+      $$("input", regularCredentials || document).forEach((input) => { input.disabled = initialSetup; });
+      $$("input", initialCredentials || document).forEach((input) => { input.disabled = !initialSetup; });
+      if (intro) intro.textContent = initialSetup
+        ? "Crea el primer administrador para activar esta instalación."
+        : "Ingresa con tu usuario y PIN personal.";
+      if (submitButton) submitButton.innerHTML = initialSetup
+        ? `${icon("user-plus", 18)} Crear administrador`
+        : `${icon("log-in", 18)} Entrar`;
+      refreshIcons();
+    };
+    const setupStatus = await dbQuiet(state.sb.rpc("getInitialSetupStatus"), null);
+    setInitialSetupMode(Boolean(setupStatus?.needs_initial_admin));
     return new Promise((resolve) => {
-      const form = $("#loginForm");
       form?.addEventListener("submit", async (event) => {
         event.preventDefault();
-        const button = form.querySelector("[type='submit']");
-        const errorBox = $("#loginError");
+        const button = submitButton || form.querySelector("[type='submit']");
         if (button) button.disabled = true;
         if (errorBox) errorBox.textContent = "";
+        const username = initialSetup ? form.initialUsername.value.trim() : form.username.value.trim();
+        const pin = initialSetup ? form.initialPin.value : form.pin.value;
+        if (initialSetup) {
+          const created = await dbQuiet(state.sb.rpc("bootstrapFirstAdmin", {
+            full_name: form.initialFullName.value.trim(),
+            username,
+            pin
+          }), null);
+          if (!created?.id) {
+            if (errorBox) errorBox.textContent = "No fue posible crear el administrador. Revisa los datos e intenta nuevamente.";
+            if (button) button.disabled = false;
+            return;
+          }
+          setInitialSetupMode(false);
+        }
         const session = await dbQuiet(state.sb.rpc("login", {
-          username: form.username.value.trim(),
-          pin: form.pin.value
+          username,
+          pin
         }), null);
         if (!session?.token || !session?.user) {
           if (errorBox) errorBox.textContent = "Usuario o PIN incorrectos.";
@@ -8204,7 +8972,8 @@ const App = (() => {
     showAdminSection(initialSection);
     renderTableFormQr();
     initRemoteStorage();
-    window.addEventListener("online", flushAppsScriptOutbox);
+    startRemoteStoragePolling();
+    window.addEventListener("online", () => { void refreshRemoteStorageNow(); });
     startAdminPolling();
     if (pendingScan) {
       const cleanUrl = new URL(location.href);
@@ -8218,7 +8987,29 @@ const App = (() => {
 
   const init = async () => {
     state.page = document.body.dataset.page || "";
-    void registerPwa();
+    await registerPwa();
+    await waitForPwaController();
+    navigator.serviceWorker?.ready.then(startOfflineSyncPulse).catch(() => undefined);
+    window.addEventListener("online", () => flushOfflineQueue(true));
+    navigator.serviceWorker?.addEventListener("message", (event) => {
+      if (event.data?.type === "OFFLINE_SYNC_ISSUE") {
+        console.warn("[SYNC] operacion pendiente de revision", event.data);
+        void (async () => {
+          await refreshCoreNow();
+          if (state.page === "admin") await refreshAdminNow();
+        })();
+        return;
+      }
+      if (event.data?.type !== "OFFLINE_QUEUE_FLUSHED") return;
+      void (async () => {
+        await refreshCoreNow();
+        if (state.page === "admin") {
+          await refreshAdminNow();
+          await flushAppsScriptOutbox();
+        }
+        if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
+      })();
+    });
     if (!connect()) {
       document.body.innerHTML = `
         <main class="setup-screen">

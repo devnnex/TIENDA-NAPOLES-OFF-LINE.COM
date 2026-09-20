@@ -8,12 +8,11 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>Admin - Servicio a la mesa</title>
-    <link rel="preconnect" href="https://unpkg.com">
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260918-tip-payment-1">
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <link rel="stylesheet" href="style.css?v=20260920-offline-shared-refresh-zones-1">
+    <script src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="admin">
     <audio id="alarmAudio" src="sound/alarm.mp3" preload="auto"></audio>
@@ -23,10 +22,17 @@
         <i data-lucide="shield-check"></i>
         <span class="eyebrow">Acceso operativo</span>
         <h1>Iniciar sesion</h1>
-        <p>Ingresa con tu usuario y PIN personal.</p>
-        <label>Usuario<input name="username" type="text" autocomplete="username" required></label>
-        <label>PIN<input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required></label>
-        <button class="primary" type="submit"><i data-lucide="log-in"></i> Entrar</button>
+        <p id="loginIntro">Ingresa con tu usuario y PIN personal.</p>
+        <div id="loginCredentials">
+          <label>Usuario<input name="username" type="text" autocomplete="username" required></label>
+          <label>PIN<input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required></label>
+        </div>
+        <div id="initialAdminCredentials" hidden>
+          <label>Nombre completo<input name="initialFullName" type="text" autocomplete="name" disabled></label>
+          <label>Usuario<input name="initialUsername" type="text" autocomplete="username" disabled></label>
+          <label>PIN<input name="initialPin" type="password" inputmode="numeric" autocomplete="new-password" disabled></label>
+        </div>
+        <button class="primary" type="submit" id="loginSubmit"><i data-lucide="log-in"></i> Entrar</button>
         <small id="loginError" role="alert"></small>
       </form>
     </section>
@@ -116,6 +122,13 @@
               <span class="eyebrow">Salon</span>
               <h2>Estado de mesas</h2>
             </div>
+            <label class="table-zone-filter">Mostrar
+              <select id="dashboardTableZoneFilter" aria-label="Filtrar mesas del inicio por ubicación">
+                <option value="all">Todas</option>
+                <option value="outdoor">Afuera</option>
+                <option value="indoor">Adentro</option>
+              </select>
+            </label>
           </div>
           <div class="tables-grid" id="tablesGrid"></div>
         </div>
@@ -145,7 +158,6 @@
             <span><i data-lucide="image-up"></i> Portada</span>
             <small data-upload-status="cover_url">Seleccionar imagen</small>
           </label>
-          <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar marca</button>
           <div class="tip-setting-card wide">
             <div class="tip-setting-copy">
               <span class="tip-setting-icon"><i data-lucide="hand-coins"></i></span>
@@ -160,6 +172,23 @@
             </label>
             <small class="tip-setting-status" id="tipSettingStatus">Configura el porcentaje y enciende el switch para aplicarlo.</small>
           </div>
+          <div class="table-zone-setting-card wide">
+            <div class="table-zone-setting-head">
+              <span class="table-zone-setting-icon"><i data-lucide="map-pinned"></i></span>
+              <div><strong>Mesas de afuera</strong><small>Márcalas una por una o selecciona un rango. Se verán azules cuando estén libres y conservarán un borde azul cuando tengan consumo.</small></div>
+            </div>
+            <div class="table-zone-range">
+              <label>Desde<select id="outdoorTableFrom" aria-label="Primera mesa del rango"></select></label>
+              <label>Hasta<select id="outdoorTableTo" aria-label="Última mesa del rango"></select></label>
+              <div class="table-zone-range-actions">
+                <button class="ghost" id="selectOutdoorRange" type="button"><i data-lucide="tree-pine"></i> Afuera</button>
+                <button class="ghost" id="clearOutdoorRange" type="button"><i data-lucide="house"></i> Adentro</button>
+              </div>
+            </div>
+            <div class="outdoor-table-selector" id="outdoorTableSelector" aria-label="Seleccionar mesas de afuera"></div>
+            <small class="table-zone-setting-status" id="tableZoneSettingStatus">Las mesas no marcadas se consideran mesas de adentro.</small>
+          </div>
+          <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar configuración</button>
         </form>
       </section>
 
@@ -292,6 +321,11 @@
                   <option value="out">Agotados</option>
                 </select>
               </label>
+              <label>Categoría
+                <select id="inventoryCategoryFilter">
+                  <option value="all">Todas</option>
+                </select>
+              </label>
             </div>
             <div class="inventory-list" id="inventoryList"></div>
           </article>
@@ -406,7 +440,10 @@
             <h2>Propinas</h2>
             <p>Consulta lo acumulado hoy y calcula cuánto corresponde por persona.</p>
           </div>
-          <span class="tips-live-badge"><i data-lucide="sparkles"></i> Propina activa</span>
+          <div class="tips-section-actions">
+            <span class="tips-live-badge"><i data-lucide="sparkles"></i> Propina activa</span>
+            <button class="ghost small tips-reset-button" id="resetTips" type="button" hidden><i data-lucide="trash-2"></i> Reiniciar</button>
+          </div>
         </div>
         <div class="tips-kpis" id="tipsKpis"></div>
         <div class="tips-layout">
@@ -443,7 +480,16 @@
             <button class="ghost service-point-add" id="addServicePoint" type="button" data-admin-only><i data-lucide="plus"></i> Agregar puesto</button>
           </article>
           <article class="service-tables-panel">
-            <div class="service-block-title"><span><i data-lucide="armchair"></i></span><div><strong>Ventas por mesa</strong><small>Verde libre, amarillo con cuenta abierta</small></div></div>
+            <div class="service-table-heading">
+              <div class="service-block-title"><span><i data-lucide="armchair"></i></span><div><strong>Ventas por mesa</strong><small>Verde libre, azul afuera, amarillo con cuenta abierta</small></div></div>
+              <label class="table-zone-filter">Mostrar
+                <select id="serviceTableZoneFilter" aria-label="Filtrar mesas por ubicación">
+                  <option value="all">Todas</option>
+                  <option value="outdoor">Afuera</option>
+                  <option value="indoor">Adentro</option>
+                </select>
+              </label>
+            </div>
             <div class="compact-tables-grid" id="waiterTablesGrid"></div>
           </article>
           <article class="walk-in-sale-card">
@@ -545,6 +591,7 @@
           <div class="consumption-selection-head"><strong>Selección actual</strong><span id="consumptionSelectionCount">0 productos</span></div>
           <div class="consumption-selection-lines" id="consumptionSelectionLines"></div>
           <div class="consumption-selection-total"><span>Total de la selección</span><strong id="consumptionSelectionTotal">$0</strong></div>
+          <div class="consumption-selection-price-warning" id="consumptionSelectionPriceWarning" hidden><i data-lucide="triangle-alert"></i><span>Precio ha sido editado: posible consumo para las mesas de afuera. Cuidado.</span></div>
         </div>
         <div class="modal-actions">
           <button class="ghost" type="button" data-cancel-consumption>Cancelar</button>
@@ -597,8 +644,9 @@
 
         <fieldset class="payment-tip-choice" id="paymentTipChoice" hidden>
           <legend>¿Cómo desea pagar el cliente?</legend>
-          <label><input type="radio" name="tip_choice" value="without"><span><i data-lucide="receipt"></i><strong>Sin propina</strong><small id="paymentWithoutTipAmount">Total consumo</small></span></label>
-          <label><input type="radio" name="tip_choice" value="with"><span><i data-lucide="hand-coins"></i><strong id="paymentWithTipLabel">Con propina</strong><small id="paymentWithTipAmount">Propina voluntaria</small></span></label>
+          <label class="payment-tip-option"><input type="radio" name="tip_choice" value="without"><span><i data-lucide="receipt"></i><strong>Sin propina</strong><small id="paymentWithoutTipAmount">Total consumo</small></span></label>
+          <label class="payment-tip-option"><input type="radio" name="tip_choice" value="with"><span><i data-lucide="hand-coins"></i><strong id="paymentWithTipLabel">Con propina</strong><small id="paymentWithTipAmount">Propina voluntaria</small></span></label>
+          <label class="payment-tip-manual"><span><i data-lucide="banknote"></i> Propina en pesos (opcional)</span><input name="tip_amount" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input><small>Escribe el valor que deja el cliente para reemplazar la sugerencia.</small></label>
         </fieldset>
 
         <div class="payment-sale-lines" id="paymentSaleLines"></div>
@@ -749,9 +797,9 @@
       </form>
     </dialog>
 
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260918-tip-payment-1"></script>
+    <script src="vendor/lucide.min.js"></script>
+    <script src="vendor/qrcode.min.js"></script>
+    <script src="vendor/jspdf.umd.min.js"></script>
+    <script src="app.js?v=20260920-offline-shared-refresh-zones-1"></script>
   </body>
 </html>

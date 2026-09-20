@@ -1043,6 +1043,10 @@ const App = (() => {
     controller.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force }, [channel.port2]);
   });
 
+  const reportNetworkStatus = (online = navigator.onLine) => {
+    navigator.serviceWorker?.controller?.postMessage({ type: "SET_NETWORK_STATUS", online: Boolean(online) });
+  };
+
   const getOfflineSyncStatus = (timeoutMs = 800) => new Promise((resolve) => {
     const controller = navigator.serviceWorker?.controller;
     if (!controller) {
@@ -1057,6 +1061,7 @@ const App = (() => {
       if (finished) return;
       finished = true;
       window.clearTimeout(timer);
+      channel.port1.close();
       resolve({ pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0, ...counts });
     };
     const timer = window.setTimeout(() => finish({ pending: 1 }), timeoutMs);
@@ -1067,7 +1072,7 @@ const App = (() => {
   const hasPendingSupabaseWrites = async () => {
     if (state.localSupabaseWrites > 0) return true;
     const counts = await getOfflineSyncStatus();
-    return Number(counts.pending || 0) + Number(counts.syncing || 0) > 0;
+    return ["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0);
   };
 
   const startOfflineSyncPulse = () => {
@@ -2207,7 +2212,7 @@ const App = (() => {
   const flushPendingOfflineWrites = async () => {
     const result = await flushOfflineQueue(true);
     const counts = result?.counts || await getOfflineSyncStatus();
-    return !navigator.onLine || Number(counts.pending || 0) + Number(counts.syncing || 0) === 0;
+    return !navigator.onLine || !["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0);
   };
 
   const refreshOperationalDataNow = async () => {
@@ -2215,6 +2220,21 @@ const App = (() => {
     if (!flushed) return false;
     await refreshAdminNow();
     return true;
+  };
+
+  let reconnectSyncPromise = null;
+  const synchronizeAfterReconnect = () => {
+    if (reconnectSyncPromise) return reconnectSyncPromise;
+    reconnectSyncPromise = (async () => {
+      const result = await flushOfflineQueue(true);
+      const counts = result?.counts || await getOfflineSyncStatus();
+      if (["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0)) return false;
+      await refreshCoreNow();
+      if (state.page === "admin") await refreshAdminNow();
+      if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
+      return true;
+    })().finally(() => { reconnectSyncPromise = null; });
+    return reconnectSyncPromise;
   };
 
   const startRemoteStoragePolling = () => {
@@ -3312,6 +3332,50 @@ const App = (() => {
       }
     });
     return Array.from(merged.values());
+  };
+
+  const applyOfflineSessionRemap = ({ previousId, sessionId, tableId } = {}) => {
+    const fromId = String(previousId || "");
+    const toId = String(sessionId || "");
+    if (!fromId || !toId || fromId === toId) return false;
+    const overlay = state.optimisticSessionStates.get(fromId);
+    const localSession = overlay?.session || state.sessions.find((entry) => String(entry.id) === fromId);
+    const remoteSession = state.sessions.find((entry) => String(entry.id) === toId);
+    if (!localSession && !overlay) return false;
+    const expectedItems = (overlay?.expectedItems || (overlay?.expectedItem ? [overlay.expectedItem] : []))
+      .map((item) => ({ ...item, session_id: toId }));
+    const itemMap = new Map((remoteSession?.session_items || []).map((item) => [String(item.id), item]));
+    expectedItems.forEach((item) => itemMap.set(String(item.id), item));
+    const expectedSession = overlay?.expectedSession || {};
+    const mergedSession = {
+      ...(localSession || {}),
+      ...(remoteSession || {}),
+      id: toId,
+      table_id: remoteSession?.table_id || localSession?.table_id || tableId || null,
+      payer_name: Object.prototype.hasOwnProperty.call(expectedSession, "payer_name")
+        ? expectedSession.payer_name : (remoteSession?.payer_name || localSession?.payer_name || ""),
+      assigned_waiter_id: Object.prototype.hasOwnProperty.call(expectedSession, "assigned_waiter_id")
+        ? expectedSession.assigned_waiter_id : (remoteSession?.assigned_waiter_id || localSession?.assigned_waiter_id || null),
+      restaurant_tables: remoteSession?.restaurant_tables || localSession?.restaurant_tables || null,
+      session_items: Array.from(itemMap.values())
+    };
+    state.sessions = [mergedSession, ...state.sessions.filter((entry) => ![fromId, toId].includes(String(entry.id)))];
+    state.optimisticSessionStates.delete(fromId);
+    if (overlay) {
+      state.optimisticSessionStates.set(toId, {
+        ...overlay,
+        session: mergedSession,
+        ...(overlay.expectedItem ? { expectedItem: { ...overlay.expectedItem, session_id: toId } } : {}),
+        ...(overlay.expectedItems ? { expectedItems } : {})
+      });
+    }
+    if (String(state.currentSession?.id || "") === fromId) state.currentSession = mergedSession;
+    const consumptionForm = $("#consumptionForm");
+    if (consumptionForm && String(consumptionForm.session_id?.value || "") === fromId) consumptionForm.session_id.value = toId;
+    state.adminSnapshotSignature = "";
+    persistOfflineAdminSnapshot();
+    if (state.page === "admin") renderAdminLive();
+    return true;
   };
 
   const isSongRequest = (request) => request.request_type === "other"
@@ -9062,9 +9126,18 @@ const App = (() => {
     state.page = document.body.dataset.page || "";
     await registerPwa();
     await waitForPwaController();
+    reportNetworkStatus();
     navigator.serviceWorker?.ready.then(startOfflineSyncPulse).catch(() => undefined);
-    window.addEventListener("online", () => flushOfflineQueue(true));
+    window.addEventListener("online", () => {
+      reportNetworkStatus(true);
+      void synchronizeAfterReconnect();
+    });
+    window.addEventListener("offline", () => reportNetworkStatus(false));
     navigator.serviceWorker?.addEventListener("message", (event) => {
+      if (event.data?.type === "OFFLINE_SESSION_REMAPPED") {
+        applyOfflineSessionRemap(event.data);
+        return;
+      }
       if (event.data?.type === "OFFLINE_SYNC_ISSUE") {
         console.warn("[SYNC] operacion pendiente de revision", event.data);
         void (async () => {

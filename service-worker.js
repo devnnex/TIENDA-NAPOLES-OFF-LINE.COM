@@ -1,5 +1,5 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v1";
-const REMOTE_CACHE = "tienda-napoles-offline-remote-v1";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v2";
+const REMOTE_CACHE = "tienda-napoles-offline-remote-v2";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
 const CONFIRMED_RETENTION_MS = 2_000;
@@ -82,7 +82,9 @@ const entryCounts = async () => (await listEntries()).reduce((counts, entry) => 
 }, { pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0 });
 
 const hasBlockingEntries = async () => (await listEntries())
-  .some((entry) => ["pending", "syncing"].includes(entry.status));
+  .some((entry) => ["pending", "syncing", "failed", "conflict"].includes(entry.status));
+
+let networkAvailable = true;
 
 const extractRecordId = (url, payload) => {
   const raw = url.searchParams.get("id") || "";
@@ -274,13 +276,112 @@ const scheduleConfirmedCleanup = () => {
 const recoverInterruptedEntries = async () => {
   const entries = await listEntries();
   await Promise.all(entries
-    .filter((entry) => entry.status === "syncing")
+    .filter((entry) => entry.status === "syncing"
+      || (["failed", "conflict"].includes(entry.status) && ["table_sessions", "session_items"].includes(entry.entity)))
     .map((entry) => putEntry({ ...entry, status: "pending", nextAttemptAt: 0 })));
 };
 
 const notifyClients = async (type, payload = {}) => {
   const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
   windows.forEach((client) => client.postMessage({ type, ...payload }));
+};
+
+const replaceSessionReference = (value, previousId, nextId) => {
+  if (Array.isArray(value)) return value.map((entry) => replaceSessionReference(entry, previousId, nextId));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, entryValue]) => [
+    key,
+    ["session_id", "p_session_id"].includes(key) && String(entryValue || "") === previousId
+      ? nextId
+      : replaceSessionReference(entryValue, previousId, nextId)
+  ]));
+};
+
+const remapQueuedSessionReferences = async (previousId, nextId, currentEntryId) => {
+  const entries = await listEntries();
+  for (const stored of entries) {
+    if (stored.id === currentEntryId || stored.status === "confirmed") continue;
+    const entry = normalizeStoredEntry(stored);
+    const payload = replaceSessionReference(entry.payload, previousId, nextId);
+    const url = new URL(entry.url);
+    ["id", "session_id"].forEach((key) => {
+      if (url.searchParams.get(key) === `eq.${previousId}`) url.searchParams.set(key, `eq.${nextId}`);
+    });
+    const remapsOwnId = entry.entity === "table_sessions" && String(entry.recordId || "") === previousId;
+    const recordIds = remapsOwnId
+      ? (entry.recordIds || []).map((id) => String(id) === previousId ? nextId : id)
+      : entry.recordIds;
+    const changed = JSON.stringify(payload) !== JSON.stringify(entry.payload)
+      || url.href !== entry.url || remapsOwnId;
+    if (!changed) continue;
+    await putEntry({
+      ...entry,
+      payload,
+      body: entry.body ? JSON.stringify(payload) : entry.body,
+      url: url.href,
+      recordId: remapsOwnId ? nextId : entry.recordId,
+      recordIds,
+      status: "pending",
+      nextAttemptAt: 0,
+      lastError: ""
+    });
+  }
+};
+
+const resolveOpenSessionConflict = async (entry) => {
+  if (entry.entity !== "table_sessions" || entry.method !== "POST" || Array.isArray(entry.payload)) return null;
+  const tableId = String(entry.payload?.table_id || "");
+  const localSessionId = String(entry.payload?.id || entry.recordId || "");
+  if (!tableId || !localSessionId || String(entry.payload?.status || "open") !== "open") return null;
+  const lookupUrl = new URL(entry.url);
+  lookupUrl.search = "";
+  lookupUrl.searchParams.set("table_id", `eq.${tableId}`);
+  lookupUrl.searchParams.set("status", "eq.open");
+  lookupUrl.searchParams.set("select", "*");
+  lookupUrl.searchParams.set("order", "opened_at.desc");
+  lookupUrl.searchParams.set("limit", "1");
+  const headers = new Headers(entry.headers);
+  ["content-type", "content-length", "prefer"].forEach((name) => headers.delete(name));
+  headers.set("Accept", "application/json");
+  try {
+    const lookup = await fetchWithTimeout(new Request(lookupUrl.href, { method: "GET", headers }), REMOTE_WRITE_TIMEOUT_MS);
+    if (!lookup.ok) return null;
+    const rows = await lookup.json();
+    const remoteSession = Array.isArray(rows) ? rows[0] : rows;
+    const remoteSessionId = String(remoteSession?.id || "");
+    if (!remoteSessionId) return null;
+
+    const updatePayload = Object.fromEntries(Object.entries(entry.payload || {})
+      .filter(([key]) => !["id", "table_id", "status", "created_at", "updated_at", "opened_at"].includes(key)));
+    if (Object.keys(updatePayload).length) {
+      const updateUrl = new URL(entry.url);
+      updateUrl.search = "";
+      updateUrl.searchParams.set("id", `eq.${remoteSessionId}`);
+      updateUrl.searchParams.set("select", "id");
+      const updateHeaders = new Headers(entry.headers);
+      updateHeaders.set("Content-Type", "application/json");
+      updateHeaders.set("Accept", "application/json");
+      updateHeaders.set("Prefer", "return=representation");
+      const updated = await fetchWithTimeout(new Request(updateUrl.href, {
+        method: "PATCH",
+        headers: updateHeaders,
+        body: JSON.stringify(updatePayload)
+      }), REMOTE_WRITE_TIMEOUT_MS);
+      if (!updated.ok) return null;
+      const updatedRows = await updated.json();
+      if (!(Array.isArray(updatedRows) ? updatedRows : [updatedRows]).some((row) => String(row?.id || "") === remoteSessionId)) return null;
+    }
+
+    await remapQueuedSessionReferences(localSessionId, remoteSessionId, entry.id);
+    await notifyClients("OFFLINE_SESSION_REMAPPED", {
+      previousId: localSessionId,
+      sessionId: remoteSessionId,
+      tableId
+    });
+    return remoteSessionId;
+  } catch (_) {
+    return null;
+  }
 };
 
 const retryDelay = (attempts) => Math.min(MAX_RETRY_DELAY_MS, 500 * Math.pow(2, Math.min(attempts, 6)));
@@ -322,17 +423,25 @@ const verifyRestMutation = async (entry) => {
 };
 
 let flushingQueue = null;
+let forceFlushRequested = false;
 
 const flushQueue = (force = false) => {
+  if (!networkAvailable) return entryCounts();
+  if (force) forceFlushRequested = true;
   if (flushingQueue) return flushingQueue;
+  const forceThisRun = forceFlushRequested;
+  forceFlushRequested = false;
   flushingQueue = (async () => {
     let confirmedAny = false;
     await recoverInterruptedEntries();
     await purgeConfirmedEntries();
     while (true) {
+      if (!networkAvailable) break;
       const now = Date.now();
+      const forceCurrentPass = forceThisRun || forceFlushRequested;
+      forceFlushRequested = false;
       const found = (await listEntries())
-        .filter((candidate) => candidate.status === "pending" && (force || Number(candidate.nextAttemptAt || 0) <= now))
+        .filter((candidate) => candidate.status === "pending" && (forceCurrentPass || Number(candidate.nextAttemptAt || 0) <= now))
         .sort((left, right) => Number(left.createdOrder || new Date(left.createdAt || left.queuedAt || 0).getTime())
           - Number(right.createdOrder || new Date(right.createdAt || right.queuedAt || 0).getTime()))[0];
       const entry = found ? normalizeStoredEntry(found) : null;
@@ -354,6 +463,7 @@ const flushQueue = (force = false) => {
           confirmed = await verifyRestMutation(entry);
         }
         if (!confirmed && [406, 409].includes(response.status)) confirmed = await verifyRestMutation(entry);
+        if (!confirmed && response.status === 409) confirmed = Boolean(await resolveOpenSessionConflict(entry));
         if (confirmed) {
           await putEntry({ ...entry, status: "confirmed", confirmedAt: new Date().toISOString(), lastError: "" });
           scheduleConfirmedCleanup();
@@ -367,6 +477,14 @@ const flushQueue = (force = false) => {
           await putEntry({ ...entry, status: "pending", attempts, lastError: message, nextAttemptAt: Date.now() + retryDelay(attempts) });
           syncLog("retry", { operationId: entry.operationId, attempts, error: message });
         } else {
+          const recoverableSessionConflict = response.status === 409
+            && ["table_sessions", "session_items"].includes(entry.entity);
+          if (recoverableSessionConflict) {
+            const attempts = Number(entry.attempts || 0) + 1;
+            await putEntry({ ...entry, status: "pending", attempts, lastError: message, nextAttemptAt: Date.now() + retryDelay(attempts) });
+            syncLog("retry", { operationId: entry.operationId, attempts, error: message });
+            break;
+          }
           const status = [406, 409].includes(response.status) ? "conflict" : "failed";
           await putEntry({ ...entry, status, attempts: Number(entry.attempts || 0) + 1, lastError: message });
           syncLog(status, { operationId: entry.operationId, error: message });
@@ -389,7 +507,12 @@ const flushQueue = (force = false) => {
     await purgeConfirmedEntries();
     if (confirmedAny) await notifyClients("OFFLINE_QUEUE_FLUSHED", { counts: await entryCounts() });
     return entryCounts();
-  })().finally(() => { flushingQueue = null; });
+  })().finally(() => {
+    const rerunForced = forceFlushRequested && networkAvailable;
+    forceFlushRequested = false;
+    flushingQueue = null;
+    if (rerunForced) void flushQueue(true);
+  });
   return flushingQueue;
 };
 
@@ -400,7 +523,7 @@ const saveLocallyThenSend = async (request) => {
   if (self.registration.sync) {
     try { await self.registration.sync.register("tienda-napoles-sync"); } catch (_) { /* El pulso de la app tambien reintenta. */ }
   }
-  void flushQueue();
+  if (networkAvailable) void flushQueue();
   return queuedResponse(entry);
 };
 
@@ -418,6 +541,7 @@ const networkFirst = async (request) => {
   const cache = await caches.open(REMOTE_CACHE);
   const remote = isRemoteDataRequest(new URL(request.url));
   try {
+    if (remote && !networkAvailable) throw new Error("offline");
     if (remote && await hasBlockingEntries()) throw new Error("pending_local_writes");
     const response = remote ? await fetchWithTimeout(request) : await fetch(request);
     if (response.ok && request.method === "GET") await cache.put(request, response.clone());
@@ -430,6 +554,9 @@ const networkFirst = async (request) => {
 };
 
 const directSupabaseRequest = async (request, url) => {
+  if (!networkAvailable) {
+    return new Response('{"message":"offline"}', { status: 503, headers: { "Content-Type": "application/json" } });
+  }
   if (RECONCILIATION_RPC_NAMES.has(rpcNameFor(url)) && await hasBlockingEntries()) {
     return new Response('{"message":"pending_local_writes"}', { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -455,7 +582,6 @@ self.addEventListener("activate", (event) => {
       .filter((name) => name.startsWith("tienda-napoles-offline-") && ![OFFLINE_CACHE, REMOTE_CACHE].includes(name))
       .map((name) => caches.delete(name)));
     await self.clients.claim();
-    await flushQueue();
   })());
 });
 
@@ -497,6 +623,9 @@ self.addEventListener("sync", (event) => {
 });
 
 self.addEventListener("message", (event) => {
+  if (event.data?.type === "SET_NETWORK_STATUS") {
+    networkAvailable = event.data.online !== false;
+  }
   if (event.data?.type === "FLUSH_OFFLINE_QUEUE") {
     event.waitUntil(flushQueue(event.data?.force === true).then((counts) => event.ports?.[0]?.postMessage({ ok: true, counts })));
   }

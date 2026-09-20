@@ -279,6 +279,107 @@ test("15 conserva CREATE -> UPDATE -> DELETE en ese orden", async () => {
   assert.deepEqual(sent, operations);
 });
 
+test("16 fusiona una cuenta offline con la sesion remota abierta", async () => {
+  const localSessionId = "11111111-1111-4111-8111-111111111111";
+  const remoteSessionId = "22222222-2222-4222-8222-222222222222";
+  const tableId = "33333333-3333-4333-8333-333333333333";
+  const sessionEntry = await api.serializeRequest(request("table_sessions", "POST", {
+    id: localSessionId,
+    table_id: tableId,
+    status: "open",
+    sale_channel: "table",
+    payer_name: "Cliente offline"
+  }));
+  sessionEntry.createdOrder = 1;
+  sessionEntry.status = "conflict";
+  const itemEntry = await api.serializeRequest(request("session_items", "POST", [{
+    session_id: localSessionId,
+    table_id: tableId,
+    item_name: "Producto offline",
+    quantity: 2,
+    unit_price: 7000,
+    status: "served"
+  }]));
+  itemEntry.createdOrder = 2;
+  await api.putEntry(sessionEntry);
+  await api.putEntry(itemEntry);
+  let uploadedSessionId = "";
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (input.method === "POST" && url.pathname.endsWith("/table_sessions")) {
+      return new Response("conflict", { status: 409 });
+    }
+    if (input.method === "GET" && url.pathname.endsWith("/table_sessions")) {
+      if (url.searchParams.get("table_id") === `eq.${tableId}`) {
+        return new Response(JSON.stringify([{ id: remoteSessionId, table_id: tableId, status: "open" }]), { status: 200 });
+      }
+      return new Response("[]", { status: 200 });
+    }
+    if (input.method === "PATCH" && url.pathname.endsWith("/table_sessions")) {
+      assert.equal(url.searchParams.get("id"), `eq.${remoteSessionId}`);
+      return new Response(JSON.stringify([{ id: remoteSessionId }]), { status: 200 });
+    }
+    if (input.method === "POST" && url.pathname.endsWith("/session_items")) {
+      uploadedSessionId = JSON.parse(await input.text())[0].session_id;
+      return new Response("[]", { status: 201 });
+    }
+    return new Response("[]", { status: 200 });
+  };
+  await api.flushQueue(true);
+  const entries = await api.listEntries();
+  assert.equal(uploadedSessionId, remoteSessionId);
+  assert.equal(entries.every((entry) => entry.status === "confirmed"), true);
+});
+
+test("17 una reconexion forzada acelera la cola que ya estaba trabajando", async () => {
+  await api.putEntry(pendingEntry({ id: "active-1", createdOrder: 1 }));
+  await api.putEntry(pendingEntry({
+    id: "delayed-2",
+    recordId: "row-2",
+    recordIds: ["row-2"],
+    body: JSON.stringify({ id: "row-2", name: "Dos" }),
+    payload: { id: "row-2", name: "Dos" },
+    createdOrder: 2,
+    nextAttemptAt: Date.now() + 60_000
+  }));
+  let releaseFirst;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const gate = new Promise((resolve) => { releaseFirst = resolve; });
+  let sent = 0;
+  remoteFetch = async () => {
+    sent += 1;
+    if (sent === 1) {
+      markStarted();
+      await gate;
+    }
+    return new Response("[]", { status: 201 });
+  };
+  const running = api.flushQueue(false);
+  await started;
+  const forced = api.flushQueue(true);
+  releaseFirst();
+  await Promise.all([running, forced]);
+  assert.equal(sent, 2);
+});
+
+test("18 no consume tiempo de red mientras el equipo esta offline", async () => {
+  await api.putEntry(pendingEntry());
+  let sent = 0;
+  remoteFetch = async () => {
+    sent += 1;
+    return new Response("[]", { status: 201 });
+  };
+  const messageListener = listeners.get("message");
+  messageListener({ data: { type: "SET_NETWORK_STATUS", online: false }, waitUntil: () => undefined, ports: [] });
+  await api.flushQueue(true);
+  assert.equal(sent, 0);
+  assert.equal((await api.listEntries())[0].status, "pending");
+  messageListener({ data: { type: "SET_NETWORK_STATUS", online: true }, waitUntil: () => undefined, ports: [] });
+  await api.flushQueue(true);
+  assert.equal(sent, 1);
+});
+
 (async () => {
   let passed = 0;
   for (const scenario of tests) {

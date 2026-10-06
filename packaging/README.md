@@ -1,9 +1,9 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.2.exe` con Inno Setup 6. Esta version
-agrega apertura de cajon por impresora POS ESC/POS y ajusta la presentacion del
-modal de consumos; no cambia la logica de sincronizacion.
+`dist/Tienda-Napoles-Offline-Setup-1.0.3.exe` con Inno Setup 6. Esta version
+permite iniciar sesion sin internet tras una entrada online previa en el mismo
+usuario de Windows. Conserva la apertura de cajon POS y el modal de consumos.
 
 El instalador copia solo los archivos necesarios para ejecutar la aplicacion,
 crea el acceso directo del escritorio y una entrada del menu Inicio. Instala en
@@ -11,6 +11,15 @@ el perfil del usuario, sin pedir permisos de administrador. El iniciador usa el
 mismo `http://127.0.0.1:8766` y el perfil habitual de Chrome o Edge; por eso
 conserva los datos offline que ya existen en ese navegador. No borres los datos
 del navegador ni cambies de perfil si hay operaciones pendientes.
+
+El primer acceso de cada usuario en este PC requiere internet. Despues, el
+usuario y PIN se pueden validar sin red durante 30 dias desde el ultimo login
+online. El PIN no se guarda en claro: un verificador y el token/perfil quedan
+protegidos por DPAPI del usuario de Windows. Tras cinco PIN erróneos, espera
+cinco minutos. Al volver internet, el sistema solicita un token nuevo antes
+de enviar cambios pendientes. Si el usuario fue desactivado o su PIN cambio
+en el backend, se pedira iniciar sesion otra vez online. Borrar el perfil de
+Windows o usar otro usuario de Windows no conserva este acceso local.
 
 Para un cajon conectado al puerto DK de una impresora de recibos compatible
 con ESC/POS: instala en Windows el controlador de la impresora, conecta el

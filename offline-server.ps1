@@ -43,6 +43,7 @@ function Send-Json($response, [int]$statusCode, $value) {
 }
 
 $drawerBridgeLoaded = $false
+$loginVaultLoaded = $false
 
 try {
   $listener.Start()
@@ -67,6 +68,56 @@ try {
 
       if ($request.Url.AbsolutePath -eq "/__tienda_napoles_drawer_health") {
         Send-Text $response 200 "OK"
+        continue
+      }
+
+      if ($request.Url.AbsolutePath -eq "/__tienda_napoles_login_health") {
+        Send-Text $response 200 "OK"
+        continue
+      }
+
+      if ($request.Url.AbsolutePath -eq "/__tienda_napoles_login") {
+        if ($request.HttpMethod -ne "POST" -or
+            $request.Headers["Origin"] -ne "http://127.0.0.1:$Port" -or
+            $request.Headers["X-Tienda-Napoles-Login"] -ne "1" -or
+            -not [System.Net.IPAddress]::IsLoopback($request.RemoteEndPoint.Address)) {
+          Send-Json $response 403 @{ error = "Solicitud local no autorizada." }
+          continue
+        }
+        if ($request.ContentLength64 -lt 1 -or $request.ContentLength64 -gt 16000) {
+          Send-Json $response 400 @{ error = "Credencial local no valida." }
+          continue
+        }
+        try {
+          if (-not $loginVaultLoaded) {
+            Add-Type -Path (Join-Path $root "offline-login-vault.cs") -ReferencedAssemblies "System.Security.dll" -ErrorAction Stop
+            $loginVaultLoaded = $true
+          }
+          $reader = New-Object System.IO.StreamReader($request.InputStream, [System.Text.Encoding]::UTF8)
+          $payload = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
+          switch ([string]$payload.action) {
+            "enroll" {
+              $userJson = $payload.user | ConvertTo-Json -Compress -Depth 8
+              [OfflineLoginVault]::Enroll([string]$payload.username, [string]$payload.pin, [string]$payload.token, $userJson)
+              Send-Json $response 200 @{ ok = $true }
+            }
+            "verify" {
+              $result = [OfflineLoginVault]::Verify([string]$payload.username, [string]$payload.pin)
+              if ($result.Status -eq "ok") {
+                Send-Json $response 200 @{ status = "ok"; token = $result.Token; user = ($result.UserJson | ConvertFrom-Json) }
+              } else {
+                Send-Json $response 200 @{ status = $result.Status }
+              }
+            }
+            "forget" {
+              [OfflineLoginVault]::Forget([string]$payload.username)
+              Send-Json $response 200 @{ ok = $true }
+            }
+            default { Send-Json $response 400 @{ error = "Operacion local no valida." } }
+          }
+        } catch {
+          Send-Json $response 503 @{ error = "No se pudo validar el acceso local en este equipo." }
+        }
         continue
       }
 

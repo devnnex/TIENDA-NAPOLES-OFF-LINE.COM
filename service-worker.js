@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v14";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v15";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -842,6 +842,12 @@ self.addEventListener("fetch", (event) => {
     const response = saveLocallyThenSend(request);
     event.respondWith(response);
     event.waitUntil(response.then(() => flushQueue()));
+    return;
+  }
+  if (isSupabaseRequest(url) && request.method === "POST" && url.pathname.endsWith("/rpc/login")) {
+    // La renovacion de una sesion abierta offline debe funcionar antes de
+    // reanudar el envio de operaciones pendientes.
+    event.respondWith(fetch(request));
     return;
   }
   if (isSupabaseRequest(url) && request.method === "POST" && url.pathname.includes("/rpc/")) {

@@ -419,6 +419,10 @@ const App = (() => {
     sessions: [],
     authToken: "",
     currentUser: null,
+    offlineLoginPending: false,
+    offlineLoginPin: "",
+    offlineLoginUsername: "",
+    offlineLoginNextRetryAt: 0,
     users: [],
     userCredentialPins: {},
     inventoryMeta: {},
@@ -1354,6 +1358,10 @@ const App = (() => {
   const startOfflineSyncPulse = () => {
     window.clearInterval(state.offlineSyncTimer);
     const pulse = async () => {
+      if (state.page === "admin" && state.offlineLoginPending) {
+        if (navigator.onLine) await refreshOfflineLogin();
+        if (state.offlineLoginPending) return;
+      }
       await flushOfflineQueue();
       if (state.page === "admin" && state.currentUser) await flushAppsScriptOutbox();
       await updateGlobalSyncStatus();
@@ -2741,6 +2749,7 @@ const App = (() => {
   const synchronizeAfterReconnect = (reason = "reconnect") => {
     if (reconnectSyncPromise) return reconnectSyncPromise;
     reconnectSyncPromise = (async () => {
+      if (state.page === "admin" && state.offlineLoginPending && !await refreshOfflineLogin()) return false;
       const startedAt = performance.now();
       recordSyncEvent("sync-cycle-started", { destination: "all", action: reason });
       // Las lecturas independientes comienzan de inmediato. Una operación
@@ -9852,37 +9861,93 @@ const App = (() => {
 
   const ADMIN_USER_CACHE_KEY = "la_licorera_17_admin_user_v1";
 
+  const offlineLoginRequest = async (payload) => {
+    const response = await fetch("/__tienda_napoles_login", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Tienda-Napoles-Login": "1" },
+      body: JSON.stringify(payload)
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "No se pudo acceder a la autorización local.");
+    return data;
+  };
+
+  const rememberOnlineLogin = async (username, pin, session) => {
+    try {
+      await offlineLoginRequest({ action: "enroll", username, pin, token: session.token, user: session.user });
+    } catch (error) {
+      toast("Entraste en línea, pero no se pudo preparar el acceso sin internet en este PC.", "error", "offline-login-enroll-failed");
+    }
+  };
+
+  const forgetOfflineLogin = async (username) => {
+    if (!username) return;
+    try { await offlineLoginRequest({ action: "forget", username }); }
+    catch (error) { console.warn("No se pudo retirar el acceso local.", error); }
+  };
+
+  let offlineLoginRefreshPromise = null;
+  const refreshOfflineLogin = () => {
+    if (!state.offlineLoginPending) return Promise.resolve(true);
+    if (!navigator.onLine || Date.now() < state.offlineLoginNextRetryAt) return Promise.resolve(false);
+    if (offlineLoginRefreshPromise) return offlineLoginRefreshPromise;
+    offlineLoginRefreshPromise = (async () => {
+      const username = state.offlineLoginUsername;
+      const pin = state.offlineLoginPin;
+      let result;
+      try { result = await state.sb.rpc("login", { username, pin }); }
+      catch (error) { result = { error }; }
+      if (result.error) {
+        state.offlineLoginNextRetryAt = Date.now() + 10000;
+        return false;
+      }
+      const session = result.data;
+      if (!session?.token || String(session.user?.id) !== String(state.currentUser?.id)) {
+        await forgetOfflineLogin(username);
+        state.offlineLoginPending = false;
+        state.offlineLoginPin = "";
+        state.authToken = "";
+        state.currentUser = null;
+        state.sb.setAuthToken("");
+        sessionStorage.removeItem("la_licorera_17_admin_token");
+        localStorage.removeItem(ADMIN_USER_CACHE_KEY);
+        location.reload();
+        return false;
+      }
+      state.authToken = session.token;
+      state.currentUser = session.user;
+      state.sb.setAuthToken(session.token);
+      sessionStorage.setItem("la_licorera_17_admin_token", session.token);
+      localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(session.user));
+      await rememberOnlineLogin(username, pin, session);
+      state.offlineLoginPending = false;
+      state.offlineLoginPin = "";
+      state.offlineLoginUsername = "";
+      state.offlineLoginNextRetryAt = 0;
+      applyCurrentUser();
+      reportNetworkStatus(true);
+      window.setTimeout(() => void synchronizeAfterReconnect("offline-login-renewed"), 0);
+      return true;
+    })().finally(() => { offlineLoginRefreshPromise = null; });
+    return offlineLoginRefreshPromise;
+  };
+
   const waitForAdminLogin = async () => {
     const storedToken = sessionStorage.getItem("la_licorera_17_admin_token") || "";
     localStorage.removeItem("la_licorera_17_admin_token");
-    let cachedUser = null;
-    try { cachedUser = JSON.parse(localStorage.getItem(ADMIN_USER_CACHE_KEY) || "null"); } catch (error) { /* cache opcional */ }
-    if (storedToken) {
+    if (storedToken && !navigator.onLine) sessionStorage.removeItem("la_licorera_17_admin_token");
+    if (storedToken && navigator.onLine) {
       state.authToken = storedToken;
       state.sb.setAuthToken(storedToken);
-      if (!navigator.onLine && cachedUser?.id) {
-        state.currentUser = cachedUser;
-        applyCurrentUser();
-        return true;
-      }
       let user = null;
-      let validationError = null;
       try {
         const validation = await state.sb.rpc("getCurrentUser", { auth_token: storedToken });
         user = validation.data;
-        validationError = validation.error;
-      } catch (error) {
-        validationError = error;
-      }
+      } catch (error) { /* El formulario pedirá el PIN. */ }
       if (user) {
         state.currentUser = user;
         localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(user));
-        applyCurrentUser();
-        return true;
-      }
-      const rejected = /sesion vencida|autenticacion requerida|usuario inactivo/i.test(String(validationError?.message || validationError || ""));
-      if (!rejected && cachedUser?.id) {
-        state.currentUser = cachedUser;
         applyCurrentUser();
         return true;
       }
@@ -9917,7 +9982,7 @@ const App = (() => {
         : `${icon("log-in", 18)} Entrar`;
       refreshIcons();
     };
-    const setupStatus = await dbQuiet(state.sb.rpc("getInitialSetupStatus"), null);
+    const setupStatus = navigator.onLine ? await dbQuiet(state.sb.rpc("getInitialSetupStatus"), null) : null;
     setInitialSetupMode(Boolean(setupStatus?.needs_initial_admin));
     return new Promise((resolve) => {
       form?.addEventListener("submit", async (event) => {
@@ -9940,12 +10005,39 @@ const App = (() => {
           }
           setInitialSetupMode(false);
         }
-        const session = await dbQuiet(state.sb.rpc("login", {
-          username,
-          pin
-        }), null);
+        let session = null;
+        let loginError = null;
+        if (navigator.onLine) {
+          try {
+            const result = await state.sb.rpc("login", { username, pin });
+            session = result.data;
+            loginError = result.error;
+          } catch (error) { loginError = error; }
+        }
+        const offlineAttempt = !navigator.onLine || (loginError && /fetch|network|offline|timeout|abort/i.test(String(loginError?.message || loginError)));
+        if (!session && offlineAttempt) {
+          try {
+            const local = await offlineLoginRequest({ action: "verify", username, pin });
+            if (local.status === "ok" && local.token && local.user?.id && local.user.is_active !== false) {
+              session = { token: local.token, user: local.user };
+              state.offlineLoginPending = true;
+              state.offlineLoginPin = pin;
+              state.offlineLoginUsername = username;
+              reportNetworkStatus(false);
+            } else if (errorBox) {
+              errorBox.textContent = ({
+                missing: "Para entrar sin internet, inicia sesión una vez con conexión en este PC.",
+                expired: "El acceso sin internet venció. Entra una vez con conexión para renovarlo.",
+                locked: "Demasiados intentos. Espera cinco minutos y vuelve a intentar.",
+                invalid: "Usuario o PIN incorrectos."
+              })[local.status] || "No se pudo validar el acceso sin internet.";
+            }
+          } catch (error) {
+            if (errorBox) errorBox.textContent = "No se pudo validar el acceso local en este equipo.";
+          }
+        }
         if (!session?.token || !session?.user) {
-          if (errorBox) errorBox.textContent = "Usuario o PIN incorrectos.";
+          if (errorBox && !errorBox.textContent) errorBox.textContent = "Usuario o PIN incorrectos.";
           if (button) button.disabled = false;
           return;
         }
@@ -9954,6 +10046,7 @@ const App = (() => {
         state.sb.setAuthToken(session.token);
         sessionStorage.setItem("la_licorera_17_admin_token", session.token);
         localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(session.user));
+        if (!state.offlineLoginPending) await rememberOnlineLogin(username, pin, session);
         applyCurrentUser();
         setLoading(true);
         resolve(true);
@@ -10172,6 +10265,7 @@ const App = (() => {
       return;
     }
     state.users = mergeUsers(state.users.map((entry) => String(entry.id) === String(saved.id) ? saved : entry));
+    if (!nextActive) await forgetOfflineLogin(user.username);
     persistUsersCache();
     renderUsers();
     toast(nextActive ? `Acceso habilitado para ${saved.full_name}.` : `Acceso deshabilitado para ${saved.full_name}.`, "ok", `user-access-saved:${saved.id}:${nextActive}`);
@@ -10218,6 +10312,9 @@ const App = (() => {
       return;
     }
     state.users = mergeUsers(state.users.map((user) => String(user.id) === String(saved.id) ? saved : user), [saved]);
+    if (previousUser && (pin || previousUser.username !== saved.username || previousUser.role !== saved.role || saved.is_active === false)) {
+      await forgetOfflineLogin(previousUser.username);
+    }
     if (pin) {
       state.userCredentialPins[saved.id] = pin;
       persistUserCredentialPins();
@@ -10280,6 +10377,7 @@ const App = (() => {
       return;
     }
     state.users = state.users.filter((entry) => entry.id !== id);
+    await forgetOfflineLogin(user.username);
     delete state.userCredentialPins[id];
     persistUserCredentialPins();
     persistUsersCache();
@@ -10299,6 +10397,9 @@ const App = (() => {
     const token = state.authToken;
     state.authToken = "";
     state.currentUser = null;
+    state.offlineLoginPending = false;
+    state.offlineLoginPin = "";
+    state.offlineLoginUsername = "";
     state.sb.setAuthToken("");
     sessionStorage.removeItem("la_licorera_17_admin_token");
     localStorage.removeItem(ADMIN_USER_CACHE_KEY);
@@ -10369,7 +10470,7 @@ const App = (() => {
     reportNetworkStatus();
     navigator.serviceWorker?.ready.then(startOfflineSyncPulse).catch(() => undefined);
     window.addEventListener("online", () => {
-      reportNetworkStatus(true);
+      reportNetworkStatus(!(state.page === "admin" && state.offlineLoginPending));
       void synchronizeAfterReconnect("online");
     });
     window.addEventListener("offline", () => {

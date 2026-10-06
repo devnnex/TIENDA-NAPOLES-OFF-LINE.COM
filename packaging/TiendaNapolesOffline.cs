@@ -12,8 +12,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Iniciador de Tienda Napoles Offline sin consola")]
 [assembly: AssemblyCompany("Tienda Napoles")]
 [assembly: AssemblyProduct("Tienda Napoles Offline")]
-[assembly: AssemblyVersion("1.0.2.0")]
-[assembly: AssemblyFileVersion("1.0.2.0")]
+[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyFileVersion("1.0.3.0")]
 
 internal static class TiendaNapolesOffline
 {
@@ -21,6 +21,7 @@ internal static class TiendaNapolesOffline
     private const string AppUrl = "http://127.0.0.1:8766/admin.html";
     private const string InstallMarkerUrl = "http://127.0.0.1:8766/tienda-napoles-installed.marker";
     private const string DrawerHealthUrl = "http://127.0.0.1:8766/__tienda_napoles_drawer_health";
+    private const string LoginHealthUrl = "http://127.0.0.1:8766/__tienda_napoles_login_health";
     private const string InstallMarker = "TiendaNapolesOffline:1B759C3D-EEAC-42F1-8C91-A400775027C1";
 
     [STAThread]
@@ -36,9 +37,9 @@ internal static class TiendaNapolesOffline
                 return;
             }
 
-            if (ServerIsReady() && (!ServerIsInstalledCopy() || !ServerSupportsDrawer()))
+            if (ServerIsReady() && (!ServerIsInstalledCopy() || !ServerSupportsDrawer() || !ServerSupportsLogin()))
             {
-                if (!TryStopPreviousServer(appDirectory, !ServerSupportsDrawer()))
+                if (!TryStopPreviousServer(appDirectory, !ServerSupportsDrawer() || !ServerSupportsLogin()))
                 {
                     ShowError("El puerto local esta ocupado por otro proceso que no se pudo identificar como Tienda Napoles. Cierra esa aplicacion e intenta de nuevo.");
                     return;
@@ -138,6 +139,19 @@ internal static class TiendaNapolesOffline
         try
         {
             var request = (HttpWebRequest)WebRequest.Create(DrawerHealthUrl);
+            request.Proxy = null;
+            request.Timeout = 1000;
+            using (var response = (HttpWebResponse)request.GetResponse())
+                return response.StatusCode == HttpStatusCode.OK;
+        }
+        catch (WebException) { return false; }
+    }
+
+    private static bool ServerSupportsLogin()
+    {
+        try
+        {
+            var request = (HttpWebRequest)WebRequest.Create(LoginHealthUrl);
             request.Proxy = null;
             request.Timeout = 1000;
             using (var response = (HttpWebResponse)request.GetResponse())

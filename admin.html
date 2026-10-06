@@ -119,19 +119,27 @@
           <div class="alerts-panel" id="alertsPanel"></div>
         </div>
 
-        <div class="panel">
+        <div class="panel dashboard-tables-panel">
           <div class="section-head">
             <div>
-              <span class="eyebrow">Salon</span>
+              <div class="dashboard-table-heading-top">
+                <span class="eyebrow">Salon</span>
+                <label class="dashboard-table-search"><i data-lucide="search"></i><input id="dashboardTableSearch" type="search" autocomplete="off" placeholder="Buscar M1 o M 1" aria-label="Buscar mesa o terraza en inicio"></label>
+              </div>
               <h2>Estado de mesas</h2>
             </div>
-            <label class="table-zone-filter">Mostrar
-              <select id="dashboardTableZoneFilter" aria-label="Filtrar mesas del inicio por ubicación">
-                <option value="all">Todas</option>
-                <option value="outdoor">Afuera</option>
-                <option value="indoor">Adentro</option>
-              </select>
-            </label>
+            <div class="dashboard-table-filters">
+              <label class="table-zone-filter">Mostrar
+                <select id="dashboardTableZoneFilter" aria-label="Filtrar mesas del inicio por ubicación">
+                  <option value="all">Todas</option>
+                  <option value="outdoor">Afuera</option>
+                  <option value="indoor">Adentro</option>
+                </select>
+              </label>
+              <label class="table-zone-filter">Tipo
+                <select id="dashboardTableGroupFilter" aria-label="Filtrar mesas del inicio por nombre"><option value="all">Todos los nombres</option></select>
+              </label>
+            </div>
           </div>
           <div class="tables-grid" id="tablesGrid"></div>
         </div>
@@ -175,6 +183,16 @@
             </label>
             <small class="tip-setting-status" id="tipSettingStatus">Configura el porcentaje y enciende el switch para aplicarlo.</small>
           </div>
+          <div class="tip-setting-card qr-regeneration-card wide">
+            <div class="tip-setting-copy">
+              <span class="tip-setting-icon"><i data-lucide="qr-code"></i></span>
+              <div><strong>Regenerar códigos QR</strong><small>Desactivado por seguridad. Habilítalo aquí solo cuando necesites reemplazar un QR impreso en esta aplicación.</small></div>
+            </div>
+            <label class="modern-switch" title="Permitir regenerar QR en esta aplicación">
+              <input name="qr_regeneration_enabled" type="checkbox" role="switch" aria-label="Permitir regenerar códigos QR en esta aplicación">
+              <span aria-hidden="true"></span>
+            </label>
+          </div>
           <div class="table-zone-setting-card wide">
             <div class="table-zone-setting-head">
               <span class="table-zone-setting-icon"><i data-lucide="map-pinned"></i></span>
@@ -207,7 +225,7 @@
           <form class="compact-form menu-form" id="tableForm">
             <input type="hidden" name="table_id">
             <label>Numero<input name="table_number" type="number" min="1" placeholder="1"></label>
-            <label>Nombre<input name="table_name" type="text" placeholder="Terraza 1"></label>
+            <label>Nombre<input name="table_name" type="text" placeholder="TERRAZA 1" autocapitalize="characters"></label>
             <div class="generated-qr-card wide">
               <div class="qr-preview" id="qrPreview"></div>
               <div>
@@ -233,9 +251,14 @@
               </button>
             </div>
           </div>
-          <label class="table-manager-search">Buscar mesa
-            <span><i data-lucide="search"></i><input id="tableManagerSearch" type="search" autocomplete="off" placeholder="Numero o nombre de la mesa"></span>
-          </label>
+          <div class="table-manager-filters">
+            <label class="table-zone-filter">Filtrar nombre
+              <select id="tableManagerGroupFilter" aria-label="Filtrar mesas y terrazas para imprimir QR"><option value="all">Todos los nombres</option></select>
+            </label>
+            <label class="table-manager-search">Buscar mesa
+              <span><i data-lucide="search"></i><input id="tableManagerSearch" type="search" autocomplete="off" placeholder="Número o nombre de la mesa"></span>
+            </label>
+          </div>
           <div class="manager-list" id="tableManagerList"></div>
         </div>
 
@@ -476,7 +499,7 @@
             <div class="service-points-head">
               <div class="service-block-title"><span><i data-lucide="wine"></i></span><div><strong>Puntos sin QR</strong><small>Atiéndelos igual que una mesa y reconoce de dónde viene cada cuenta.</small></div></div>
               <div class="service-zone-tabs" role="tablist" aria-label="Elegir zona">
-                <button class="ghost is-active" type="button" data-service-zone="bar" role="tab" aria-selected="true">Barras del bar</button>
+                <button class="ghost is-active" type="button" data-service-zone="bar" role="tab" aria-selected="true">Terrazas</button>
                 <button class="ghost" type="button" data-service-zone="planter" role="tab" aria-selected="false">Materas</button>
               </div>
             </div>

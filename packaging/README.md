@@ -1,9 +1,10 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.3.exe` con Inno Setup 6. Esta version
-permite iniciar sesion sin internet tras una entrada online previa en el mismo
-usuario de Windows. Conserva la apertura de cajon POS y el modal de consumos.
+`dist/Tienda-Napoles-Offline-Setup-1.0.4.exe` con Inno Setup 6. Esta versión
+agrega filtros de mesas y terrazas, selección segura de QR y control para
+habilitar su regeneración desde Marca. Conserva el acceso offline y el resto
+de la operación existente.
 
 El instalador copia solo los archivos necesarios para ejecutar la aplicacion,
 crea el acceso directo del escritorio y una entrada del menu Inicio. Instala en

@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v13";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v14";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -815,6 +815,10 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
+  if (url.origin === self.location.origin && url.pathname.startsWith("/__tienda_napoles_drawer")) {
+    event.respondWith(fetch(request));
+    return;
+  }
   if (request.method === "GET") {
     if (url.origin === self.location.origin) {
       if (DYNAMIC_BRAND_ASSETS.has(url.pathname.split("/").pop())) {

@@ -1,8 +1,9 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.1.exe` con Inno Setup 6. No modifica
-`app.js`, el Service Worker, el servidor local ni la logica de sincronizacion.
+`dist/Tienda-Napoles-Offline-Setup-1.0.2.exe` con Inno Setup 6. Esta version
+agrega apertura de cajon por impresora POS ESC/POS y ajusta la presentacion del
+modal de consumos; no cambia la logica de sincronizacion.
 
 El instalador copia solo los archivos necesarios para ejecutar la aplicacion,
 crea el acceso directo del escritorio y una entrada del menu Inicio. Instala en
@@ -10,6 +11,19 @@ el perfil del usuario, sin pedir permisos de administrador. El iniciador usa el
 mismo `http://127.0.0.1:8766` y el perfil habitual de Chrome o Edge; por eso
 conserva los datos offline que ya existen en ese navegador. No borres los datos
 del navegador ni cambies de perfil si hay operaciones pendientes.
+
+Para un cajon conectado al puerto DK de una impresora de recibos compatible
+con ESC/POS: instala en Windows el controlador de la impresora, conecta el
+cajon y pulsa **Abrir caja**. La primera vez selecciona la impresora POS y el
+pin 2 (o pin 5 si lo indica el fabricante); despues pulsa **Probar y guardar**.
+Las siguientes aperturas son de un clic. El boton de ajustes permite cambiar
+la impresora. Windows gestiona su puerto USB, COM o de red. Se conserva un
+puente `window.posCashDrawer` existente.
+
+Un cajon USB/OPOS independiente o con protocolo propietario requiere su driver
+y una integracion especifica. Sin conocer y probar el modelo no se puede
+garantizar compatibilidad universal. La respuesta de Windows confirma que la
+orden entro a la cola de impresion, no que el cajon se abrio fisicamente.
 
 Al cerrar la ventana con la X, el servidor local puede seguir activo para que
 la siguiente apertura sea inmediata. El iniciador comprueba que sea la copia

@@ -12,14 +12,15 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Iniciador de Tienda Napoles Offline sin consola")]
 [assembly: AssemblyCompany("Tienda Napoles")]
 [assembly: AssemblyProduct("Tienda Napoles Offline")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
 
 internal static class TiendaNapolesOffline
 {
     private const string HealthUrl = "http://127.0.0.1:8766/__tienda_napoles_health";
     private const string AppUrl = "http://127.0.0.1:8766/admin.html";
     private const string InstallMarkerUrl = "http://127.0.0.1:8766/tienda-napoles-installed.marker";
+    private const string DrawerHealthUrl = "http://127.0.0.1:8766/__tienda_napoles_drawer_health";
     private const string InstallMarker = "TiendaNapolesOffline:1B759C3D-EEAC-42F1-8C91-A400775027C1";
 
     [STAThread]
@@ -35,9 +36,9 @@ internal static class TiendaNapolesOffline
                 return;
             }
 
-            if (ServerIsReady() && !ServerIsInstalledCopy())
+            if (ServerIsReady() && (!ServerIsInstalledCopy() || !ServerSupportsDrawer()))
             {
-                if (!TryStopPreviousServer(appDirectory))
+                if (!TryStopPreviousServer(appDirectory, !ServerSupportsDrawer()))
                 {
                     ShowError("El puerto local esta ocupado por otro proceso que no se pudo identificar como Tienda Napoles. Cierra esa aplicacion e intenta de nuevo.");
                     return;
@@ -132,7 +133,20 @@ internal static class TiendaNapolesOffline
         }
     }
 
-    private static bool TryStopPreviousServer(string appDirectory)
+    private static bool ServerSupportsDrawer()
+    {
+        try
+        {
+            var request = (HttpWebRequest)WebRequest.Create(DrawerHealthUrl);
+            request.Proxy = null;
+            request.Timeout = 1000;
+            using (var response = (HttpWebResponse)request.GetResponse())
+                return response.StatusCode == HttpStatusCode.OK;
+        }
+        catch (WebException) { return false; }
+    }
+
+    private static bool TryStopPreviousServer(string appDirectory, bool allowInstalledDirectory)
     {
         Process previous = null;
         int matches = 0;
@@ -147,7 +161,7 @@ internal static class TiendaNapolesOffline
                 {
                     string scriptPath = GetServerScriptPath(entry["CommandLine"] as string);
                     if (scriptPath == null || !File.Exists(scriptPath)) continue;
-                    if (string.Equals(Path.GetDirectoryName(scriptPath).TrimEnd(Path.DirectorySeparatorChar),
+                    if (!allowInstalledDirectory && string.Equals(Path.GetDirectoryName(scriptPath).TrimEnd(Path.DirectorySeparatorChar),
                         appDirectory.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)) continue;
 
                     int processId = Convert.ToInt32(entry["ProcessId"]);

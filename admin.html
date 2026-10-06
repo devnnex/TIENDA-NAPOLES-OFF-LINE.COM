@@ -87,6 +87,7 @@
         <div class="admin-header-actions">
           <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
           <button class="ghost" id="openCashDrawer" type="button"><i data-lucide="archive-restore"></i> Abrir caja</button>
+          <button class="ghost" id="configureCashDrawer" type="button" aria-label="Configurar cajón de caja" title="Configurar cajón de caja"><i data-lucide="settings-2"></i></button>
         </div>
       </header>
 
@@ -556,6 +557,17 @@
         </aside>
       </section>
     </main>
+
+    <dialog class="modal" id="cashDrawerDialog">
+      <form class="modal-card" id="cashDrawerForm">
+        <div class="section-head"><div><span class="eyebrow">Caja registradora</span><h2>Configurar apertura</h2></div><button class="icon-btn" type="button" data-close-cash-drawer aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+        <p>Selecciona la impresora POS a la que está conectado el cajón. Windows administra el puerto USB, de red o serie.</p>
+        <label>Impresora de recibos<select name="printer" id="cashDrawerPrinter" required></select></label>
+        <label>Salida del cajón<select name="pin"><option value="0">Pin 2 (habitual)</option><option value="1">Pin 5</option></select></label>
+        <small>Compatible con impresoras que aceptan el comando ESC/POS de apertura. Si tu cajón usa un controlador USB/OPOS propio, consulta el modelo.</small>
+        <div class="modal-actions"><button class="ghost" type="button" data-close-cash-drawer>Cancelar</button><button class="primary" type="submit">Probar y guardar</button></div>
+      </form>
+    </dialog>
 
     <dialog class="modal" id="consumptionDialog">
       <form class="modal-card" id="consumptionForm">

@@ -34,6 +34,16 @@ function Send-Text($response, [int]$statusCode, [string]$text) {
   $response.OutputStream.Write($bytes, 0, $bytes.Length)
 }
 
+function Send-Json($response, [int]$statusCode, $value) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes(($value | ConvertTo-Json -Compress -Depth 4))
+  $response.StatusCode = $statusCode
+  $response.ContentType = "application/json; charset=utf-8"
+  $response.ContentLength64 = $bytes.Length
+  $response.OutputStream.Write($bytes, 0, $bytes.Length)
+}
+
+$drawerBridgeLoaded = $false
+
 try {
   $listener.Start()
 } catch {
@@ -52,6 +62,55 @@ try {
 
       if ($request.Url.AbsolutePath -eq "/__tienda_napoles_health") {
         Send-Text $response 200 "OK"
+        continue
+      }
+
+      if ($request.Url.AbsolutePath -eq "/__tienda_napoles_drawer_health") {
+        Send-Text $response 200 "OK"
+        continue
+      }
+
+      if ($request.Url.AbsolutePath -eq "/__tienda_napoles_drawer") {
+        $sameOrigin = $request.Headers["Origin"] -eq "http://127.0.0.1:$Port" -or
+          ($request.HttpMethod -eq "GET" -and (
+            $request.Headers["Sec-Fetch-Site"] -eq "same-origin" -or
+            ($request.UrlReferrer -and $request.UrlReferrer.GetLeftPart([System.UriPartial]::Authority) -eq "http://127.0.0.1:$Port")
+          ))
+        $fromApp = $request.Headers["X-Tienda-Napoles-Drawer"] -eq "1"
+        if (-not $sameOrigin -or -not $fromApp -or -not [System.Net.IPAddress]::IsLoopback($request.RemoteEndPoint.Address)) {
+          Send-Json $response 403 @{ error = "Solicitud local no autorizada." }
+          continue
+        }
+        if ($request.HttpMethod -ne "GET" -and $request.HttpMethod -ne "POST") {
+          Send-Json $response 405 @{ error = "Metodo no permitido." }
+          continue
+        }
+        try {
+          if (-not $drawerBridgeLoaded) {
+            Add-Type -Path (Join-Path $root "cash-drawer-printer.cs") -ReferencedAssemblies "System.Drawing.dll" -ErrorAction Stop
+            $drawerBridgeLoaded = $true
+          }
+          if ($request.HttpMethod -eq "GET") {
+            Send-Json $response 200 @{ printers = @([CashDrawerPrinter]::InstalledPrinters()) }
+          } else {
+            if ($request.ContentLength64 -lt 1 -or $request.ContentLength64 -gt 1024) {
+              Send-Json $response 400 @{ error = "Configuracion de impresora no valida." }
+              continue
+            }
+            $reader = New-Object System.IO.StreamReader($request.InputStream, [System.Text.Encoding]::UTF8)
+            $settings = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
+            $name = [string]$settings.printer
+            $pin = [int]$settings.pin
+            if ([string]::IsNullOrWhiteSpace($name) -or $null -eq $settings.pin -or ($pin -ne 0 -and $pin -ne 1)) {
+              Send-Json $response 400 @{ error = "Selecciona una impresora y el pin del cajon." }
+              continue
+            }
+            [CashDrawerPrinter]::Open($name, $pin)
+            Send-Json $response 200 @{ accepted = $true; printer = $name }
+          }
+        } catch {
+          Send-Json $response 503 @{ error = "No se pudo enviar la orden al cajon. Verifica la impresora POS, su conexion y el pin seleccionado." }
+        }
         continue
       }
 

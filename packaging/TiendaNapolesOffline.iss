@@ -1,5 +1,5 @@
 #define AppName "Tienda Nápoles Offline"
-#define AppVersion "1.0.1"
+#define AppVersion "1.0.2"
 
 [Setup]
 AppId={{1B759C3D-EEAC-42F1-8C91-A400775027C1}
@@ -26,6 +26,7 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Source: "build\TiendaNapolesOffline.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "tienda-napoles-installed.marker"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\offline-server.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\cash-drawer-printer.cs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\admin.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\index.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\app.js"; DestDir: "{app}"; Flags: ignoreversion

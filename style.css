@@ -4187,18 +4187,23 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
   border-top: 1px solid rgba(255, 255, 255, .1);
 }
 
-#consumptionDialog { width: min(calc(100vw - 1.5rem), 1020px); max-width: none; }
+#consumptionDialog { width: min(calc(100vw - 1.5rem), 1020px); max-width: none; overflow: hidden; }
 #consumptionDialog .modal-card {
   width: 100%;
   max-width: none;
+  min-height: min(88dvh, 760px);
   max-height: min(96dvh, 940px);
   padding-bottom: 1.2rem;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
+  scrollbar-gutter: auto;
 }
-#consumptionDialog .product-combobox-options { max-height: min(330px, 36dvh); }
+#consumptionDialog .product-combobox.is-open .product-combobox-options {
+  position: static;
+  max-height: min(330px, 36dvh);
+  margin-top: .35rem;
+}
 #consumptionDialog .consumption-selection-lines {
   max-height: clamp(220px, 30dvh, 310px);
   padding-right: .2rem;
@@ -4206,14 +4211,16 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
   scrollbar-gutter: stable;
 }
 #consumptionDialog .modal-actions {
-  position: sticky;
-  z-index: 100;
-  bottom: 0;
-  margin: .65rem 0 0;
+  position: static;
+  margin: auto 0 0;
   padding: .9rem 0 .1rem;
   border-top: 1px solid rgba(18, 24, 31, .08);
   background: #fff;
 }
+#cashDrawerDialog .modal-card { background: #fff; }
+#cashDrawerDialog .modal-card > p,
+#cashDrawerDialog .modal-card > small { margin: 0; color: #667085; line-height: 1.5; }
+#cashDrawerDialog .modal-card label { display: grid; gap: .4rem; }
 .table-session-actions { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; padding: .7rem; border: 1px solid rgba(18, 24, 31, .08); border-radius: 15px; background: #f6f8fb; }
 .table-session-actions.is-single { grid-template-columns: minmax(0, 1fr); }
 .table-session-actions[hidden], .table-consumption-preview[hidden], .consumption-selection[hidden], .cash-received[hidden] { display: none; }

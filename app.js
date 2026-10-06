@@ -2193,25 +2193,78 @@ const App = (() => {
     mixed: "Pago mixto"
   }[method] || "Pago");
 
-  const openCashDrawer = async () => {
-    const bridge = window.posCashDrawer;
-    const status = $("#cashDrawerStatus");
-    if (!bridge || typeof bridge.open !== "function") {
-      if (status) status.textContent = "No se detecto un puente local compatible con el cajon.";
-      toast("El cajón no está configurado en este equipo. Revisa la conexión del cajón con el punto de venta.", "error", "cash-drawer-unavailable");
-      return false;
-    }
+  const CASH_DRAWER_SETTINGS_KEY = "tienda-napoles-cash-drawer-printer-v1";
+  const cashDrawerRequest = async (method, body) => {
+    const response = await fetch("/__tienda_napoles_drawer", {
+      method,
+      cache: "no-store",
+      headers: { "X-Tienda-Napoles-Drawer": "1", ...(body ? { "Content-Type": "application/json" } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {})
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "No se pudo conectar con el controlador local de caja.");
+    return data;
+  };
+
+  const configureCashDrawer = async () => {
+    const dialog = $("#cashDrawerDialog");
+    const form = $("#cashDrawerForm");
+    if (!dialog || !form) return;
     try {
-      const result = await bridge.open({ source: "tienda-napoles-pos", requestedAt: new Date().toISOString() });
-      if (result === false) throw new Error("El controlador rechazo la apertura.");
-      if (status) status.textContent = "Orden de apertura enviada correctamente.";
-      toast("Orden de apertura enviada al cajon.", "ok", "cash-drawer-opened");
+      const data = await cashDrawerRequest("GET");
+      const printers = Array.isArray(data.printers) ? data.printers : [];
+      if (!printers.length) throw new Error("Windows no tiene impresoras instaladas. Instala primero el controlador de la impresora POS.");
+      const printerField = form.elements.namedItem("printer");
+      const pinField = form.elements.namedItem("pin");
+      printerField.innerHTML = printers.map((name) => `<option value="${escapeHTML(name)}">${escapeHTML(name)}</option>`).join("");
+      const saved = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null");
+      if (saved && printers.includes(saved.printer)) printerField.value = saved.printer;
+      pinField.value = saved?.pin === 1 ? "1" : "0";
+      dialog.showModal();
+    } catch (error) {
+      toast(String(error.message || error), "error", "cash-drawer-setup-failed");
+    }
+  };
+
+  const sendCashDrawerPulse = async (settings, save = false) => {
+    const button = $("#openCashDrawer");
+    if (button) button.disabled = true;
+    try {
+      await cashDrawerRequest("POST", settings);
+      if (save) localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(settings));
+      $("#cashDrawerDialog")?.close();
+      toast("Orden de apertura enviada a la impresora POS.", "ok", "cash-drawer-opened");
       return true;
     } catch (error) {
-      if (status) status.textContent = "El controlador no pudo abrir el cajon.";
-      toast(String(error?.message || "No se pudo abrir el cajon."), "error", "cash-drawer-failed");
+      toast(String(error.message || error), "error", "cash-drawer-failed");
+      return false;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  };
+
+  const openCashDrawer = async () => {
+    const bridge = window.posCashDrawer;
+    if (bridge && typeof bridge.open === "function") {
+      try {
+        const result = await bridge.open({ source: "tienda-napoles-pos", requestedAt: new Date().toISOString() });
+        if (result === false) throw new Error("El controlador rechazó la apertura.");
+        toast("Orden de apertura enviada al cajón.", "ok", "cash-drawer-opened");
+        return true;
+      } catch (error) {
+        toast(String(error?.message || "No se pudo abrir el cajón."), "error", "cash-drawer-failed");
+        return false;
+      }
+    }
+    let settings = null;
+    try { settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {}
+    if (!settings?.printer) {
+      await configureCashDrawer();
       return false;
     }
+    const opened = await sendCashDrawerPulse(settings);
+    if (!opened) await configureCashDrawer();
+    return opened;
   };
 
   const getAppsScriptUrl = () => String(APPS_SCRIPT_CONFIG.webAppUrl || "").trim();
@@ -8898,6 +8951,20 @@ const App = (() => {
       else queueConsumptionDraft();
     });
     $("#consumptionQueueButton")?.addEventListener("click", queueConsumptionDraft);
+    $("#cashDrawerForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const submit = form.querySelector('[type="submit"]');
+      if (submit) submit.disabled = true;
+      try {
+        await sendCashDrawerPulse({
+          printer: form.elements.namedItem("printer").value,
+          pin: Number(form.elements.namedItem("pin").value)
+        }, true);
+      } finally {
+        if (submit) submit.disabled = false;
+      }
+    });
     $("#consumptionSelectionLines")?.addEventListener("dblclick", (event) => {
       const price = event.target.closest("[data-edit-consumption-draft]");
       if (price) editConsumptionDraftPrice(price);
@@ -9293,6 +9360,8 @@ const App = (() => {
         renderServicePoints();
       }
       if (target.id === "openCashDrawer" || target.dataset.openCashDrawer !== undefined) await openCashDrawer();
+      if (target.id === "configureCashDrawer") await configureCashDrawer();
+      if (target.dataset.closeCashDrawer !== undefined) $("#cashDrawerDialog")?.close();
       if (target.id === "receiptPrintButton") printLastPaidReceipt();
       if (target.dataset.closeReceiptResult !== undefined) $("#receiptResultDialog")?.close();
       if (target.id === "viewTableConsumption") {

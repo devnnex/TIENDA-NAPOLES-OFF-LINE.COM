@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20260920-offline-shared-refresh-zones-1">
+    <link rel="stylesheet" href="style.css?v=20261005-sync-badge-pin-v11">
     <script src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="admin">
@@ -19,6 +19,7 @@
 
     <section class="admin-login" id="adminLogin">
       <form class="admin-login-card" id="loginForm">
+        <img class="admin-login-logo" src="tienda-napoles.ico" alt="Tienda Nápoles">
         <i data-lucide="shield-check"></i>
         <span class="eyebrow">Acceso operativo</span>
         <h1>Iniciar sesion</h1>
@@ -52,7 +53,7 @@
         <a href="#tips" class="tips-nav-link" data-tip-feature hidden><i data-lucide="hand-coins"></i> Propinas</a>
         <a href="#inventory" data-admin-only><i data-lucide="boxes"></i> Inventario</a>
         <a href="#movements" data-admin-only><i data-lucide="arrow-left-right"></i> Movimientos</a>
-        <a href="#income" data-admin-only><i data-lucide="circle-dollar-sign"></i> Ingresos</a>
+        <a href="#income" data-admin-only><i data-lucide="circle-dollar-sign"></i> Ventas</a>
         <a href="#assistant" data-admin-only><i data-lucide="sparkles"></i> Asistente IA</a>
         <a href="#menu" data-admin-only><i data-lucide="layout-grid"></i> Mesas</a>
         <a href="#users" data-admin-only><i data-lucide="users"></i> Usuarios</a>
@@ -81,6 +82,7 @@
           <h1 class="js-business-name">Restaurante</h1>
           <p class="js-business-subtitle">Gestiona solicitudes, mesas, menu y cuentas.</p>
           <span class="live-status" id="realtimeStatus"><i data-lucide="wifi"></i> Conectando en vivo</span>
+          <span class="live-status sync-status is-offline" id="globalSyncStatus" role="status" aria-live="polite" hidden></span>
         </div>
         <div class="admin-header-actions">
           <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
@@ -291,6 +293,7 @@
           </div>
           <div class="inventory-heading-actions">
             <span class="inventory-sync-status is-local" id="inventorySyncStatus"><i data-lucide="hard-drive"></i> Respaldo local</span>
+            <button class="inventory-purchases-button" id="openPurchases" type="button"><i data-lucide="shopping-cart"></i> Compras</button>
             <button class="primary" id="newInventoryProduct" type="button"><i data-lucide="package-plus"></i> Nuevo producto</button>
             <button class="ghost danger-text section-reset-button" type="button" data-reset-section="inventory"><i data-lucide="trash-2"></i> Eliminar todo</button>
           </div>
@@ -367,7 +370,7 @@
         <div class="section-head income-heading">
           <div>
             <span class="eyebrow">Contabilidad inteligente</span>
-            <h2>Ingresos y ventas cerradas</h2>
+            <h2>Ventas cerradas</h2>
             <p>Analiza lo facturado, la utilidad estimada y la distribución por medios de pago.</p>
           </div>
           <div class="income-heading-actions">
@@ -402,7 +405,7 @@
             </label>
             <label>Desde<input id="incomeDateFrom" name="date_from" type="date" required></label>
             <label>Hasta<input id="incomeDateTo" name="date_to" type="date" required></label>
-            <button class="primary" type="submit"><i data-lucide="sliders-horizontal"></i> Aplicar filtros</button>
+            <button class="primary" type="submit"><i data-lucide="sliders-horizontal"></i> Aplicar cambios</button>
           </form>
           <div class="income-filter-summary" id="incomeFilterSummary" aria-live="polite"></div>
         </div>
@@ -415,7 +418,7 @@
           <div class="section-head income-results-head">
             <div>
               <span class="eyebrow">Movimientos facturados</span>
-              <h2>Detalle de ingresos</h2>
+              <h2>Detalle de ventas</h2>
             </div>
             <span class="income-report-status" id="incomeReportStatus"><i data-lucide="loader-circle"></i> Preparando informe</span>
           </div>
@@ -529,8 +532,8 @@
           <div class="user-form-fields">
             <label class="user-field user-field-name"><span><i data-lucide="contact"></i> Nombre completo</span><input name="full_name" type="text" autocomplete="name" placeholder="Nombre del integrante" required></label>
             <label class="user-field user-field-username"><span><i data-lucide="at-sign"></i> Usuario</span><input name="username" type="text" autocomplete="off" placeholder="Ej. mesero.juan" required></label>
-            <label class="user-field user-field-pin"><span><i data-lucide="key-round"></i> PIN</span><input name="pin" type="password" inputmode="numeric" minlength="4" maxlength="12" pattern="[0-9]{4,12}" autocomplete="new-password" placeholder="4 a 12 dígitos"></label>
-            <label class="user-field user-field-role"><span><i data-lucide="shield-check"></i> Rol</span><select name="role"><option value="waiter">Mesero</option><option value="admin">Administrador</option></select></label>
+            <label class="user-field user-field-pin"><span><i data-lucide="key-round"></i> PIN</span><span class="user-pin-control"><input name="pin" type="password" inputmode="numeric" minlength="4" maxlength="12" pattern="[0-9]{4,12}" autocomplete="new-password" placeholder="4 a 12 dígitos"><button class="icon-btn user-pin-toggle" type="button" data-toggle-user-pin aria-label="Mostrar PIN" title="Mostrar PIN"><i data-lucide="eye-off"></i></button></span></label>
+            <label class="user-field user-field-role"><span><i data-lucide="shield-check"></i> Rol</span><select name="role"><option value="waiter">Mesero</option><option value="admin">Administrador</option><option value="boss">Jefe</option></select></label>
           </div>
           <div class="user-form-footer">
             <div class="check user-active-check"><input name="is_active" type="checkbox" checked aria-label="Usuario activo"><span>Activo al guardar</span></div>
@@ -538,6 +541,19 @@
           </div>
         </form>
         <div class="users-list" id="usersList"></div>
+        <aside class="role-guide" data-boss-only role="note" aria-labelledby="roleGuideTitle">
+          <div class="role-guide-heading">
+            <span class="role-guide-icon"><i data-lucide="shield-question"></i></span>
+            <div><span class="eyebrow">Guía sencilla</span><h3 id="roleGuideTitle">¿Qué puede hacer cada rol?</h3><p>Elige el rol según lo que la persona necesita hacer dentro del sistema.</p></div>
+          </div>
+          <div class="role-guide-grid">
+            <article><span class="role-guide-role is-boss"><i data-lucide="crown"></i> Jefe</span><strong>Puede hacer todo</strong><p>Ve todas las secciones, crea usuarios, cambia permisos, edita y elimina información.</p></article>
+            <article><span class="role-guide-role is-admin"><i data-lucide="shield-check"></i> Administrador</span><strong>Solo entra donde el Jefe decida</strong><p>Al elegir Administrador, marca abajo las secciones permitidas. Puede trabajar en ellas, pero no puede eliminar datos ni modificar ventas cerradas.</p></article>
+            <article><span class="role-guide-role is-waiter"><i data-lucide="user-round"></i> Mesero</span><strong>Solo atiende mesas</strong><p>Puede agregar consumos, editar el producto o el precio con doble clic y confirmar la selección. No puede cobrar, cerrar cuentas ni eliminar.</p></article>
+          </div>
+          <div class="role-guide-steps"><strong>Para cambiar permisos:</strong><span>1. Pulsa el lápiz del usuario.</span><span>2. Elige Administrador.</span><span>3. Marca o desmarca sus secciones.</span><span>4. Guarda el usuario.</span></div>
+          <p class="role-guide-access"><i data-lucide="toggle-right"></i><span>El interruptor <strong>Acceso</strong> de cada tarjeta permite activar o bloquear su entrada al sistema.</span></p>
+        </aside>
       </section>
     </main>
 
@@ -551,6 +567,7 @@
           <div>
             <span class="eyebrow" id="consumptionEyebrow">Consumo</span>
             <h2 id="consumptionDialogTitle">Agregar a la cuenta</h2>
+            <small class="consumption-last-added" id="consumptionLastAdded" hidden></small>
           </div>
           <button class="icon-btn" type="button" data-cancel-consumption aria-label="Cerrar">
             <i data-lucide="x"></i>
@@ -747,6 +764,29 @@
       </form>
     </dialog>
 
+    <dialog class="modal purchase-history-modal" id="purchaseHistoryDialog">
+      <div class="modal-card purchase-history-card">
+        <div class="section-head purchase-history-head">
+          <div><span class="eyebrow">Inversi&oacute;n en inventario</span><h2>Compras</h2><p>Consulta cu&aacute;ntas unidades agregaste, su costo y el total invertido en cada registro.</p></div>
+          <div class="purchase-history-head-actions"><button class="ghost danger-text" id="clearPurchaseHistory" type="button"><i data-lucide="trash-2"></i> Eliminar todo</button><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar compras"><i data-lucide="x"></i></button></div>
+        </div>
+        <form class="purchase-filters" id="purchaseFilters">
+          <label class="purchase-search">Buscar
+            <span class="inventory-search-control"><i data-lucide="search"></i><input id="purchaseSearch" type="search" autocomplete="off" placeholder="Producto, siglas o responsable"></span>
+          </label>
+          <label>Producto
+            <select id="purchaseProductFilter"><option value="all">Todos los productos</option></select>
+          </label>
+          <label>Desde<input id="purchaseDateFrom" type="date"></label>
+          <label>Hasta<input id="purchaseDateTo" type="date"></label>
+          <button class="ghost purchase-clear-filters" id="clearPurchaseFilters" type="button"><i data-lucide="rotate-ccw"></i> Limpiar</button>
+        </form>
+        <p class="purchase-filter-feedback" id="purchaseFilterFeedback" aria-live="polite"></p>
+        <div class="purchase-summary" id="purchaseSummary" aria-live="polite"></div>
+        <div class="purchase-history-list" id="purchaseHistoryList"></div>
+      </div>
+    </dialog>
+
     <dialog class="modal zero-profit-modal" id="zeroProfitDialog">
       <form class="modal-card zero-profit-card" method="dialog">
         <span class="zero-profit-icon"><i data-lucide="circle-alert"></i></span>
@@ -800,6 +840,6 @@
     <script src="vendor/lucide.min.js"></script>
     <script src="vendor/qrcode.min.js"></script>
     <script src="vendor/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20260920-offline-session-merge-1"></script>
+    <script src="app.js?v=20261005-sync-badge-pin-v12"></script>
   </body>
 </html>

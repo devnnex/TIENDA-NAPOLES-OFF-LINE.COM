@@ -1,8 +1,11 @@
 const SYNC_INTERVAL_MS = 1500;
 const CHAT_SYNC_INTERVAL_MS = 1200;
 const OFFLINE_SYNC_PULSE_MS = 2500;
-const REMOTE_STORAGE_POLL_MS = 4000;
+const REMOTE_STORAGE_POLL_MS = 60000;
 const REMOTE_CONFIRMATION_HOLD_MS = 15000;
+const LOCAL_DATA_DB = "tienda-napoles-local-data-v1";
+const LOCAL_DATA_STORE = "records";
+const LOCAL_DATA_DB_VERSION = 1;
 
 const SUPABASE_CONFIG = {
   url: "https://izvcbkwgtciuoampunba.supabase.co",
@@ -13,26 +16,9 @@ try { SUPABASE_CONFIG.url = new URL(String(SUPABASE_CONFIG.url || "").trim()).or
 
 const APPS_SCRIPT_CONFIG = {
   // Tambien puede configurarse desde Inventario > Respaldo remoto del negocio.
-  webAppUrl: "https://script.google.com/macros/s/AKfycbz9uUz_Gp2-0Y27aZsHjMLYTth_KpYHLfQRuqfmS21oLfseITwwLd5V4Mz4HU1KUxxbMA/exec"
+  webAppUrl: "https://script.google.com/macros/s/AKfycbz0kMO6luyS5kt4LJz9qhFHpCaKNqC3ho_1ngHVYqQLj4kObkcWEkdmvF3Ya9JHWy_F/exec"
 };
-const APPS_SCRIPT_REQUIRED_VERSION = "2.7.0";
 const APPS_SCRIPT_TIMEOUT_MS = 45000;
-
-const isAppsScriptVersionCompatible = (version) => {
-  const current = String(version || "").trim();
-  if (!current) return true;
-  const parse = (value) => value.split(".").map((part) => Number(part));
-  const installed = parse(current);
-  const required = parse(APPS_SCRIPT_REQUIRED_VERSION);
-  if (installed.some((part) => !Number.isFinite(part)) || required.some((part) => !Number.isFinite(part))) {
-    return current === APPS_SCRIPT_REQUIRED_VERSION;
-  }
-  for (let index = 0; index < Math.max(installed.length, required.length); index += 1) {
-    const difference = Number(installed[index] || 0) - Number(required[index] || 0);
-    if (difference !== 0) return difference > 0;
-  }
-  return true;
-};
 
 const transientAppsScriptError = (message) => {
   const error = new Error(message);
@@ -115,6 +101,8 @@ const App = (() => {
   const INVENTORY_STORAGE_KEY = "tienda_napoles_inventory_v1";
   const INVOICE_STORAGE_KEY = "tienda_napoles_invoices_v1";
   const INVENTORY_MOVEMENTS_STORAGE_KEY = "tienda_napoles_inventory_movements_v1";
+  const PURCHASE_HISTORY_CUTOFF_KEY = "tienda_napoles_purchase_history_cutoff_v1";
+  const HIDDEN_PURCHASE_MOVEMENTS_KEY = "tienda_napoles_hidden_purchase_movements_v1";
   const APPS_SCRIPT_OUTBOX_KEY = "tienda_napoles_appscript_outbox_v1";
   const WALK_IN_DRAFTS_STORAGE_KEY = "tienda_napoles_walk_in_drafts_v1";
   const SERVICE_ZONE_STORAGE_KEY = "tienda_napoles_service_zone_v1";
@@ -123,6 +111,9 @@ const App = (() => {
   const TIP_RESET_STORAGE_KEY = "tienda_napoles_tip_reset_invoices_v1";
   const OFFLINE_ADMIN_SNAPSHOT_KEY = "tienda_napoles_offline_admin_snapshot_v1";
   const USER_LIST_CACHE_KEY = "tienda_napoles_users_v1";
+  const USER_CREDENTIALS_CACHE_KEY = "tienda_napoles_user_credentials_v1";
+  const SYNC_JOURNAL_KEY = "tienda_napoles_sync_journal_v1";
+  const INCOME_REPORT_CACHE_KEY = "tienda_napoles_income_report_cache_v1";
   const PWA_BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
   const CATEGORY_PRESETS = ["Snack", "Bebidas", "Medicina", "Otros"];
   const REQUEST_IMAGES = {
@@ -277,6 +268,136 @@ const App = (() => {
     nueve: 9,
     diez: 10
   };
+  const DURABLE_LOCAL_KEYS = [
+    INVENTORY_STORAGE_KEY,
+    INVOICE_STORAGE_KEY,
+    INVENTORY_MOVEMENTS_STORAGE_KEY,
+    APPS_SCRIPT_OUTBOX_KEY,
+    WALK_IN_DRAFTS_STORAGE_KEY,
+    OFFLINE_ADMIN_SNAPSHOT_KEY,
+    USER_LIST_CACHE_KEY,
+    INCOME_REPORT_CACHE_KEY,
+    SYNC_JOURNAL_KEY
+  ];
+  let localDataDbPromise = null;
+  let durableWriteChain = Promise.resolve();
+  let durableRevisionOffset = 0;
+  const durableMemory = new Map();
+  const durableIndexedStatus = new Map();
+
+  const localRevisionKey = (key) => `${key}__durable_revision`;
+
+  const openLocalDataDb = () => {
+    if (!window.indexedDB) return Promise.resolve(null);
+    if (localDataDbPromise) return localDataDbPromise;
+    localDataDbPromise = new Promise((resolve) => {
+      const request = indexedDB.open(LOCAL_DATA_DB, LOCAL_DATA_DB_VERSION);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(LOCAL_DATA_STORE)) {
+          request.result.createObjectStore(LOCAL_DATA_STORE, { keyPath: "key" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+      request.onblocked = () => resolve(null);
+    });
+    return localDataDbPromise;
+  };
+
+  const localDataRecord = async (key) => {
+    const database = await openLocalDataDb();
+    if (!database) return null;
+    return new Promise((resolve) => {
+      const transaction = database.transaction(LOCAL_DATA_STORE, "readonly");
+      const request = transaction.objectStore(LOCAL_DATA_STORE).get(key);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => resolve(null);
+      transaction.onabort = () => resolve(null);
+    });
+  };
+
+  const putLocalDataRecord = async (record) => {
+    const database = await openLocalDataDb();
+    if (!database) return false;
+    return new Promise((resolve) => {
+      try {
+        const transaction = database.transaction(LOCAL_DATA_STORE, "readwrite");
+        transaction.objectStore(LOCAL_DATA_STORE).put(record);
+        transaction.oncomplete = () => resolve(true);
+        transaction.onerror = () => resolve(false);
+        transaction.onabort = () => resolve(false);
+      } catch (_) {
+        resolve(false);
+      }
+    });
+  };
+
+  const nextDurableRevision = () => (Date.now() * 1000) + (++durableRevisionOffset % 1000);
+
+  const persistDurableJson = (key, value) => {
+    const revision = nextDurableRevision();
+    const serialized = JSON.stringify(value);
+    const snapshot = JSON.parse(serialized);
+    durableMemory.set(key, snapshot);
+    let localSaved = false;
+    try {
+      // localStorage queda como proyeccion sincrona para compatibilidad; IndexedDB
+      // es la copia durable que permite recuperar colas y datos criticos.
+      localStorage.setItem(key, serialized);
+      localStorage.setItem(localRevisionKey(key), String(revision));
+      localSaved = true;
+    } catch (_) { /* IndexedDB sigue siendo la persistencia principal. */ }
+    durableWriteChain = durableWriteChain
+      .catch(() => undefined)
+      .then(async () => {
+        const indexedSaved = await putLocalDataRecord({ key, value: snapshot, revision, updatedAt: new Date().toISOString() });
+        const saved = indexedSaved || localSaved;
+        durableIndexedStatus.set(key, indexedSaved);
+        return saved;
+      });
+    return durableWriteChain;
+  };
+
+  const hydrateDurableKey = async (key) => {
+    const record = await localDataRecord(key);
+    let localValue = null;
+    let localRevision = 0;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw !== null) localValue = JSON.parse(raw);
+      localRevision = Number(localStorage.getItem(localRevisionKey(key)) || 0);
+    } catch (_) {
+      localValue = null;
+      localRevision = 0;
+    }
+    if (localValue !== null && (!record || localRevision >= Number(record.revision || 0))) {
+      if (!record || localRevision > Number(record.revision || 0)) {
+        await persistDurableJson(key, localValue);
+      }
+      durableMemory.set(key, localValue);
+      return localValue;
+    }
+    if (record) {
+      try {
+        localStorage.setItem(key, JSON.stringify(record.value));
+        localStorage.setItem(localRevisionKey(key), String(record.revision || 0));
+      } catch (_) { /* El estado se conserva en IndexedDB. */ }
+      durableMemory.set(key, record.value);
+      return record.value;
+    }
+    return null;
+  };
+
+  const hydrateDurableLocalState = async () => {
+    await Promise.all(DURABLE_LOCAL_KEYS.map(hydrateDurableKey));
+    await durableWriteChain.catch(() => undefined);
+  };
+
+  const flushDurableWrites = async (requiredKeys = []) => {
+    await durableWriteChain.catch(() => undefined);
+    return requiredKeys.every((key) => durableIndexedStatus.get(key) === true);
+  };
+
   const state = {
     sb: null,
     page: "",
@@ -299,6 +420,7 @@ const App = (() => {
     authToken: "",
     currentUser: null,
     users: [],
+    userCredentialPins: {},
     inventoryMeta: {},
     inventoryMovements: [],
     movementSearch: "",
@@ -307,8 +429,20 @@ const App = (() => {
     inventorySearch: "",
     inventoryStatusFilter: "all",
     inventoryCategoryFilter: "all",
+    purchaseSearch: "",
+    purchaseProductFilter: "all",
+    purchaseDateFrom: "",
+    purchaseDateTo: "",
     incomeReport: null,
+    incomeRevision: "",
+    movementRevision: "",
+    inventoryRevision: "",
+    incomeFetchedAt: 0,
     incomeLoading: false,
+    incomeReloadRequested: false,
+    offlineSalesProbeBusy: false,
+    incomeVisibleCount: 60,
+    usersRenderSignature: "",
     incomeRequestId: 0,
     incomeRangePreset: "today",
     incomeSearchTimer: null,
@@ -350,7 +484,11 @@ const App = (() => {
     alarmStopTimer: null,
     adminPollTimer: null,
     adminSyncBusy: false,
+    backgroundReportSyncBusy: false,
+    backgroundReportForcePending: false,
+    backgroundReportCheckedAt: 0,
     coreSyncBusy: false,
+    coreDirectReadSucceeded: false,
     localSupabaseWrites: 0,
     offlineSyncTimer: null,
     remoteStoragePollTimer: null,
@@ -365,10 +503,16 @@ const App = (() => {
     pwaManifestObjectUrl: "",
     pwaIconObjectUrls: [],
     pwaRegistrationPromise: null,
+    startupSyncComplete: false,
+    syncFresh: { core: false, operational: false, inventory: false, movements: false, sales: false, users: false },
     qrCache: new Map(),
     selectedTableQrIds: new Set(),
     activeServiceZone: localStorage.getItem(SERVICE_ZONE_STORAGE_KEY) === "planter" ? "planter" : "bar",
     tableRenderSignature: "",
+    tableManagerRenderSignature: "",
+    menuManagerRenderSignature: "",
+    inventoryRenderSignature: "",
+    movementRenderSignature: "",
     assistantMessages: [],
     assistantThreads: { bar: [], song: [] },
     assistantMode: "bar",
@@ -405,6 +549,24 @@ const App = (() => {
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+  const ADMIN_SECTION_KEYS = ["dashboard", "service", "accounts", "tips", "inventory", "movements", "income", "assistant", "menu", "brand"];
+  const isBoss = (user = state.currentUser) => user?.role === "boss";
+  const isManager = (user = state.currentUser) => ["boss", "admin"].includes(user?.role);
+  const roleLabel = (role) => ({ boss: "Jefe", admin: "Administrador", waiter: "Mesero" }[role] || "Usuario");
+  const allowedAdminSections = (user = state.currentUser) => {
+    if (isBoss(user)) return [...ADMIN_SECTION_KEYS, "users"];
+    if (user?.role === "waiter") return ["service", "accounts", "tips"];
+    if (Array.isArray(user?.permissions)) return user.permissions.filter((section) => ADMIN_SECTION_KEYS.includes(section));
+    return isManager(user) ? [...ADMIN_SECTION_KEYS] : [];
+  };
+  const canAccessAdminSection = (section, user = state.currentUser) => allowedAdminSections(user).includes(section);
+  const requiredSyncDomains = () => state.page !== "admin" ? ["core"] : [
+    "core", "operational",
+    ...(canAccessAdminSection("inventory") ? ["inventory"] : []),
+    ...(canAccessAdminSection("movements") ? ["movements"] : []),
+    ...(canAccessAdminSection("income") ? ["sales"] : []),
+    ...(isBoss() ? ["users"] : [])
+  ];
 
   const icon = (name, size = 18) => `<i data-lucide="${name}" style="width:${size}px;height:${size}px"></i>`;
 
@@ -499,8 +661,14 @@ const App = (() => {
   const uid = () =>
     crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+  let iconRefreshScheduled = false;
   const refreshIcons = () => {
-    if (window.lucide) window.lucide.createIcons();
+    if (!window.lucide || iconRefreshScheduled) return;
+    iconRefreshScheduled = true;
+    window.requestAnimationFrame(() => {
+      iconRefreshScheduled = false;
+      window.lucide?.createIcons();
+    });
   };
 
   const setLoading = (isLoading) => {
@@ -564,12 +732,11 @@ const App = (() => {
     if (Array.isArray(tables)) state.tables = tables;
     if (Array.isArray(categories)) state.categories = categories;
     if (Array.isArray(items)) state.items = items;
-    loadInventoryStore();
     return Array.isArray(tables) && Array.isArray(categories) && Array.isArray(items);
   };
 
   const ensurePresetCategories = async () => {
-    if (state.currentUser?.role !== "admin") return;
+    if (!isManager()) return;
     const existing = new Set(state.categories.map((category) => normalizeText(category.name)));
     const missing = CATEGORY_PRESETS.filter((name) => !existing.has(normalizeText(name)));
     if (!missing.length) return;
@@ -693,23 +860,17 @@ const App = (() => {
   };
 
   const showAdminSection = (section = "dashboard") => {
-    if (section === "tips" && !tipsEnabled()) section = state.currentUser?.role === "waiter" ? "service" : "accounts";
-    if (state.currentUser?.role === "waiter" && !["service", "accounts", "tips"].includes(section)) section = "service";
+    if (section === "tips" && !tipsEnabled()) section = canAccessAdminSection("accounts") ? "accounts" : "service";
+    if (!canAccessAdminSection(section)) section = allowedAdminSections()[0] || "service";
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
     });
     $$(".admin-sidebar nav a").forEach((link) => {
       const target = link.getAttribute("href")?.replace("#", "");
+      link.hidden = !canAccessAdminSection(target) || (link.hasAttribute("data-tip-feature") && !tipsEnabled());
       link.classList.toggle("active", target === section);
     });
-    if (section === "movements" && navigator.onLine && isAppsScriptConfigured()) {
-      const list = $("#inventoryMovementList");
-      const summary = $("#movementSummary");
-      if (list) list.innerHTML = emptyState("Actualizando movimientos", "Consultando el historial oficial...", "refresh-cw");
-      if (summary) summary.innerHTML = "";
-      refreshIcons();
-    }
     clearTimeout(state.sectionRenderTimer);
     state.sectionRenderTimer = window.setTimeout(() => {
       if (state.activeAdminSection !== section) return;
@@ -726,14 +887,16 @@ const App = (() => {
       }
       if (section === "inventory") renderInventory();
       if (section === "movements") {
-        if (!navigator.onLine || !isAppsScriptConfigured()) renderInventoryMovements();
-        void loadInventoryMovements();
+        renderInventoryMovements();
+        if (!state.syncFresh.movements) void loadInventoryMovements();
       }
       if (section === "income") {
         initializeIncomeFilters();
         renderIncomeReport();
-        void loadIncomeReport();
+        if (!state.incomeReport) void loadIncomeReport();
+        else void refreshBackgroundReports();
       }
+      if (section === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
       if (section === "users") renderUsers();
       if (section === "assistant") renderAdminAi();
       refreshIcons();
@@ -886,18 +1049,15 @@ const App = (() => {
     const params = new URLSearchParams(location.search);
     return params.get("mesa") || params.get("table") || params.get("t") || params.get("qr") || "";
   };
-  const persistBootstrapCache = () => {
-    try {
-      localStorage.setItem(bootstrapCacheKey(), JSON.stringify({
-        business: state.business,
-        tables: state.tables,
-        categories: state.categories,
-        items: state.items
-      }));
-    } catch (error) { /* cache opcional */ }
-  };
+  const persistBootstrapCache = () => persistDurableJson(bootstrapCacheKey(), {
+    business: state.business,
+    tables: state.tables,
+    categories: state.categories,
+    items: state.items
+  });
   const loadBootstrap = async () => {
     if (bootstrapPromise) return bootstrapPromise;
+    await hydrateDurableKey(bootstrapCacheKey());
     const applyBootstrap = (data) => {
       if (!data) return false;
       state.business = data.business || {
@@ -909,13 +1069,12 @@ const App = (() => {
       state.tables = data.tables || [];
       state.categories = data.categories || [];
       state.items = data.items || [];
-      loadInventoryStore();
       document.documentElement.style.setProperty("--accent", state.business.accent_color || "#f05a28");
       return true;
     };
     let hasCachedBootstrap = false;
     try {
-      hasCachedBootstrap = applyBootstrap(JSON.parse(localStorage.getItem(bootstrapCacheKey()) || "null"));
+      hasCachedBootstrap = applyBootstrap(readLocalJson(bootstrapCacheKey(), null));
     } catch (error) {
       hasCachedBootstrap = false;
     }
@@ -926,9 +1085,12 @@ const App = (() => {
         auth_token: state.authToken || "",
         table_access_code: accessCode
       }), null);
-      if (data) {
+      if (data && !state.syncFresh.core && !state.coreDirectReadSucceeded) {
         applyBootstrap(data);
         persistBootstrapCache();
+        if (data.business && Array.isArray(data.tables) && Array.isArray(data.categories) && Array.isArray(data.items)) {
+          state.syncFresh.core = true;
+        }
       } else if (!hasCachedBootstrap) {
         await Promise.all([loadBusiness(), loadCore()]);
       }
@@ -1001,7 +1163,7 @@ const App = (() => {
 
   const readOfflineAdminSnapshot = () => {
     try {
-      const snapshot = JSON.parse(localStorage.getItem(OFFLINE_ADMIN_SNAPSHOT_KEY) || "null");
+      const snapshot = readLocalJson(OFFLINE_ADMIN_SNAPSHOT_KEY, null);
       return Array.isArray(snapshot?.sessions) && Array.isArray(snapshot?.requests) ? snapshot : null;
     } catch (_) {
       return null;
@@ -1009,24 +1171,20 @@ const App = (() => {
   };
 
   const persistOfflineAdminSnapshot = () => {
-    try {
-      localStorage.setItem(OFFLINE_ADMIN_SNAPSHOT_KEY, JSON.stringify({
-        sessions: state.sessions,
-        requests: state.requests,
-        removedSessions: Array.from(state.optimisticSessionStates.entries())
-          .filter(([, overlay]) => overlay.mode === "remove" && Date.now() < Number(overlay.retainUntil || 0))
-          .map(([id, overlay]) => ({ id, retainUntil: overlay.retainUntil })),
-        updatedAt: new Date().toISOString()
-      }));
-    } catch (_) {
-      // La aplicación sigue operativa; la cola del service worker conserva escrituras pendientes.
-    }
+    void persistDurableJson(OFFLINE_ADMIN_SNAPSHOT_KEY, {
+      sessions: state.sessions,
+      requests: state.requests,
+      removedSessions: Array.from(state.optimisticSessionStates.entries())
+        .filter(([, overlay]) => overlay.mode === "remove" && Date.now() < Number(overlay.retainUntil || 0))
+        .map(([id, overlay]) => ({ id, retainUntil: overlay.retainUntil })),
+      updatedAt: new Date().toISOString()
+    });
   };
 
   const flushOfflineQueue = (force = false, timeoutMs = 30000) => new Promise((resolve) => {
     const controller = navigator.serviceWorker?.controller;
     if (!controller) {
-      resolve({ ok: false, counts: { pending: 1, syncing: 0, confirmed: 0, failed: 0, conflict: 0 } });
+      resolve({ ok: false, controllerAvailable: false, counts: { pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0 } });
       return;
     }
     const channel = new MessageChannel();
@@ -1040,19 +1198,17 @@ const App = (() => {
     };
     const timer = window.setTimeout(() => finish({ ok: false, counts: { pending: 1 } }), timeoutMs);
     channel.port1.onmessage = (event) => finish(event.data || { ok: false, counts: { pending: 1 } });
-    controller.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force }, [channel.port2]);
+    controller.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force, authToken: state.authToken || "" }, [channel.port2]);
   });
 
   const reportNetworkStatus = (online = navigator.onLine) => {
     navigator.serviceWorker?.controller?.postMessage({ type: "SET_NETWORK_STATUS", online: Boolean(online) });
   };
 
-  const getOfflineSyncStatus = (timeoutMs = 800) => new Promise((resolve) => {
+  const getOfflineSyncStatus = (timeoutMs = 1500) => new Promise((resolve) => {
     const controller = navigator.serviceWorker?.controller;
     if (!controller) {
-      // Sin un worker controlador no es seguro adelantar Apps Script a una
-      // escritura de Supabase que todavia puede estar viajando por la red.
-      resolve({ pending: 1, syncing: 0, confirmed: 0, failed: 0, conflict: 0 });
+      resolve({ pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0, controllerAvailable: false });
       return;
     }
     const channel = new MessageChannel();
@@ -1062,23 +1218,148 @@ const App = (() => {
       finished = true;
       window.clearTimeout(timer);
       channel.port1.close();
-      resolve({ pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0, ...counts });
+      resolve({ pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0, controllerAvailable: true, ...counts });
     };
     const timer = window.setTimeout(() => finish({ pending: 1 }), timeoutMs);
-    channel.port1.onmessage = (event) => finish(event.data?.counts || {});
+    channel.port1.onmessage = (event) => finish({
+      ...(event.data?.counts || {}),
+      blockingEntities: event.data?.blockingEntities || [],
+      blockingRecords: Array.isArray(event.data?.blockingRecords) ? event.data.blockingRecords : null,
+      issues: event.data?.issues || []
+    });
     controller.postMessage({ type: "GET_OFFLINE_SYNC_STATUS" }, [channel.port2]);
   });
 
-  const hasPendingSupabaseWrites = async () => {
-    if (state.localSupabaseWrites > 0) return true;
-    const counts = await getOfflineSyncStatus();
-    return ["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0);
+  const setGlobalSyncStatus = (message, tone = "pending", iconName = "refresh-cw") => {
+    const badge = $("#globalSyncStatus");
+    if (!badge) return;
+    badge.hidden = false;
+    if (badge.dataset.syncMessage === message && badge.dataset.syncTone === tone) return;
+    badge.dataset.syncMessage = message;
+    badge.dataset.syncTone = tone;
+    badge.className = `live-status sync-status is-${tone}`;
+    badge.innerHTML = `${icon(iconName, 15)} ${escapeHTML(message)}`;
+    refreshIcons();
+  };
+
+  let syncBadgeWasOffline = !navigator.onLine;
+  let syncBadgeReconnectedAt = 0;
+  let syncBadgeReconnectTimer = null;
+  const syncBadgeDisplayPhase = (online, now = Date.now()) => {
+    if (!online) {
+      syncBadgeWasOffline = true;
+      syncBadgeReconnectedAt = 0;
+      window.clearTimeout(syncBadgeReconnectTimer);
+      syncBadgeReconnectTimer = null;
+      return "offline";
+    }
+    if (syncBadgeWasOffline) {
+      syncBadgeWasOffline = false;
+      syncBadgeReconnectedAt = now;
+      window.clearTimeout(syncBadgeReconnectTimer);
+      syncBadgeReconnectTimer = window.setTimeout(() => void updateGlobalSyncStatus(), 60_000);
+    }
+    if (!syncBadgeReconnectedAt) return "hidden";
+    return now - syncBadgeReconnectedAt >= 60_000 ? "synced" : "reconnecting";
+  };
+
+  const updateGlobalSyncStatus = async () => {
+    if (!$("#globalSyncStatus")) return;
+    const [counts] = await Promise.all([getOfflineSyncStatus(), flushDurableWrites()]);
+    const jobs = readAppsScriptOutbox();
+    const issues = Number(counts.failed || 0) + Number(counts.conflict || 0)
+      + jobs.filter((job) => ["failed", "conflict"].includes(job.status)).length;
+    const issueNames = {
+      business_settings: "marca y colores",
+      restaurant_tables: "mesas",
+      table_sessions: "cuentas de mesa",
+      session_items: "consumos",
+      service_requests: "pedidos",
+      menu_categories: "categorías",
+      menu_items: "productos",
+      record_sale: "ventas",
+      edit_sale: "ventas",
+      delete_sale: "ventas",
+      adjust_inventory: "inventario",
+      upsert_inventory: "inventario"
+    };
+    const issueDetails = [
+      ...(counts.issues || []).map((entry) => `${issueNames[entry.entity] || entry.entity}: ${entry.status}${entry.error ? ` (${entry.error})` : ""}${entry.operationId ? ` [${entry.operationId}]` : ""}`),
+      ...jobs.filter((job) => ["failed", "conflict"].includes(job.status))
+        .map((job) => `${issueNames[job.action] || job.action}: ${job.status}${job.lastError ? ` (${String(job.lastError).slice(0, 160)})` : ""}`)
+    ];
+    $("#globalSyncStatus").title = issueDetails.join("\n");
+    const firstIssue = counts.issues?.[0]?.entity || jobs.find((job) => ["failed", "conflict"].includes(job.status))?.action || "";
+    const displayPhase = syncBadgeDisplayPhase(navigator.onLine);
+    if (!counts.controllerAvailable) {
+      setGlobalSyncStatus("Sin protección offline; recarga la aplicación", "error", "triangle-alert");
+    } else if (issues) {
+      const subject = issueNames[firstIssue] || firstIssue;
+      setGlobalSyncStatus(`Error de sincronización · ${issues} operación${issues === 1 ? "" : "es"} por revisar${subject ? ` (${subject})` : ""}`, "error", "triangle-alert");
+    } else if (displayPhase === "offline") {
+      setGlobalSyncStatus("Sin conexión · listo para sincronizar", "offline", "cloud-off");
+    } else if (displayPhase === "reconnecting") {
+      setGlobalSyncStatus("Conexión restablecida", "offline", "wifi");
+    } else if (displayPhase === "synced") {
+      setGlobalSyncStatus("Sincronizado", "synced", "cloud-check");
+    } else {
+      $("#globalSyncStatus").hidden = true;
+    }
+  };
+
+  const isSupabaseWriteBlockingJob = (job, counts) => {
+    const hasBlockingStatus = ["pending", "syncing", "failed", "conflict"]
+      .some((status) => Number(counts[status] || 0) > 0);
+    if (!hasBlockingStatus) return false;
+    const entities = job.action === "record_sale"
+      ? ["table_sessions", "session_items", "service_requests", "menu_items"]
+      : ["menu_items", "menu_categories"];
+    if (!Array.isArray(counts.blockingRecords)) {
+      return entities.some((entity) => (counts.blockingEntities || []).includes(entity))
+        || !Array.isArray(counts.blockingEntities) || !counts.blockingEntities.length;
+    }
+    const sessionId = String(job.payload?.invoice?.sessionId || "");
+    const productIds = new Set((job.payload?.invoice?.items || [])
+      .map((item) => String(item.menu_item_id || "")).filter(Boolean));
+    return counts.blockingRecords.some((record) => {
+      if (!entities.includes(record.entity)) return false;
+      if (job.action !== "record_sale") return true;
+      if (["table_sessions", "session_items", "service_requests"].includes(record.entity)) {
+        const ids = record.entity === "table_sessions" ? record.recordIds : record.sessionIds;
+        return !sessionId || !Array.isArray(ids) || !ids.length || ids.map(String).includes(sessionId);
+      }
+      if (record.entity === "menu_items") {
+        return !Array.isArray(record.recordIds) || !record.recordIds.length
+          || record.recordIds.some((id) => productIds.has(String(id)));
+      }
+      return true;
+    });
+  };
+
+  const nextReadyAppsScriptJob = (jobs, counts, force, now = Date.now()) => {
+    let skippedSale = false;
+    for (const job of jobs) {
+      if (job.status !== "pending" || (!force && Number(job.nextAttemptAt || 0) > now)) continue;
+      if (state.localSupabaseWrites > 0 || isSupabaseWriteBlockingJob(job, counts)) {
+        if (job.action !== "record_sale") return null;
+        skippedSale = true;
+        continue;
+      }
+      if (skippedSale && job.action !== "record_sale") return null;
+      return job;
+    }
+    return null;
   };
 
   const startOfflineSyncPulse = () => {
     window.clearInterval(state.offlineSyncTimer);
-    state.offlineSyncTimer = window.setInterval(flushOfflineQueue, OFFLINE_SYNC_PULSE_MS);
-    flushOfflineQueue();
+    const pulse = async () => {
+      await flushOfflineQueue();
+      if (state.page === "admin" && state.currentUser) await flushAppsScriptOutbox();
+      await updateGlobalSyncStatus();
+    };
+    state.offlineSyncTimer = window.setInterval(() => void pulse(), OFFLINE_SYNC_PULSE_MS);
+    void pulse();
   };
 
   const waitForPwaController = async () => {
@@ -1236,6 +1517,19 @@ const App = (() => {
     });
     $$(".js-brand-logo").forEach((el) => {
       el.innerHTML = logo;
+      const image = $("img.brand-logo", el);
+      if (image) {
+        image.addEventListener("error", () => {
+          image.src = pwaAssetUrl("tienda-napoles.ico");
+          image.addEventListener("error", () => {
+            const fallback = document.createElement("div");
+            fallback.className = "brand-mark";
+            fallback.innerHTML = icon("utensils", 24);
+            image.replaceWith(fallback);
+            refreshIcons();
+          }, { once: true });
+        }, { once: true });
+      }
     });
     const cover = $(".client-hero");
     if (cover && state.business?.cover_url) {
@@ -1728,11 +2022,12 @@ const App = (() => {
 
   const readLocalJson = (key, fallback) => {
     try {
-      const value = JSON.parse(localStorage.getItem(key) || "null");
-      return value ?? fallback;
+      const raw = localStorage.getItem(key);
+      if (raw !== null) return JSON.parse(raw) ?? fallback;
     } catch (error) {
-      return fallback;
+      // La replica en memoria se hidrata desde IndexedDB al iniciar.
     }
+    return durableMemory.has(key) ? durableMemory.get(key) : fallback;
   };
 
   function applyBusinessTipSettings() {
@@ -1793,28 +2088,12 @@ const App = (() => {
     const drafts = state.sessions
       .filter((session) => isLocalWalkInSession(session) && session.status === "open")
       .slice(0, 50);
-    try {
-      localStorage.setItem(WALK_IN_DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
-    } catch (error) {
-      toast("No se pudo conservar el borrador de la venta individual en este equipo.", "error", "walk-in-storage-failed");
-    }
+    void persistDurableJson(WALK_IN_DRAFTS_STORAGE_KEY, drafts);
   };
 
-  const persistInventoryStore = () => {
-    try {
-      localStorage.setItem(INVENTORY_STORAGE_KEY, JSON.stringify(state.inventoryMeta));
-    } catch (error) {
-      toast("No se pudo guardar el inventario en este dispositivo.", "error", "inventory-storage-failed");
-    }
-  };
+  const persistInventoryStore = () => persistDurableJson(INVENTORY_STORAGE_KEY, state.inventoryMeta);
 
-  const persistInvoiceHistory = () => {
-    try {
-      localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(state.invoiceHistory.slice(-1000)));
-    } catch (error) {
-      toast("La venta se cerro, pero no se pudo guardar el historial local.", "error", "invoice-storage-failed");
-    }
-  };
+  const persistInvoiceHistory = () => persistDurableJson(INVOICE_STORAGE_KEY, state.invoiceHistory.slice(-1000));
 
   const persistTipSettings = () => {
     try {
@@ -1834,13 +2113,9 @@ const App = (() => {
     }
   };
 
-  const persistInventoryMovements = () => {
-    try {
-      localStorage.setItem(INVENTORY_MOVEMENTS_STORAGE_KEY, JSON.stringify(state.inventoryMovements.slice(-3000)));
-    } catch (error) { /* Historial remoto y memoria siguen disponibles. */ }
-  };
+  const persistInventoryMovements = () => persistDurableJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements.slice(-3000));
 
-  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "" }) => {
+  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "", unitCost }) => {
     const numericDelta = Number(delta || 0);
     const isNewProduct = String(type || "").toUpperCase() === "NUEVO_PRODUCTO";
     if (!item || !Number.isFinite(numericDelta) || (!numericDelta && !isNewProduct) || state.inventoryMovements.some((movement) => movement.movementId === eventId)) return null;
@@ -1853,6 +2128,7 @@ const App = (() => {
       delta: numericDelta,
       before: Number(before || 0),
       after: Number(after || 0),
+      unitCost: Number.isFinite(Number(unitCost)) ? Math.max(0, Number(unitCost)) : inventoryFor(item).costPrice,
       reference,
       date: occurredAt,
       user: user || state.currentUser?.full_name || state.currentUser?.username || "Sistema"
@@ -1952,11 +2228,45 @@ const App = (() => {
 
   const readAppsScriptOutbox = () => {
     const stored = readLocalJson(APPS_SCRIPT_OUTBOX_KEY, []);
-    return Array.isArray(stored) ? stored : [];
+    return (Array.isArray(stored) ? stored : []).map((job) => ({
+      ...job,
+      operationId: job.operationId || job.id,
+      destination: "apps-script",
+      status: job.status || "pending",
+      attempts: Number(job.attempts || 0),
+      nextAttemptAt: Number(job.nextAttemptAt || 0),
+      lastError: job.lastError || ""
+    }));
   };
 
-  const writeAppsScriptOutbox = (jobs) => {
-    try { localStorage.setItem(APPS_SCRIPT_OUTBOX_KEY, JSON.stringify(jobs.slice(-2000))); } catch (error) { /* Cache operativa. */ }
+  const writeAppsScriptOutbox = (jobs) => persistDurableJson(APPS_SCRIPT_OUTBOX_KEY, jobs.slice(-2000));
+
+  const recoverInterruptedAppsScriptJobs = async () => {
+    const jobs = readAppsScriptOutbox();
+    let changed = false;
+    const recovered = jobs.map((job) => {
+      if (job.status !== "syncing") return job;
+      changed = true;
+      return { ...job, status: "pending", nextAttemptAt: 0, updatedAt: new Date().toISOString() };
+    });
+    if (changed) await writeAppsScriptOutbox(recovered);
+  };
+
+  const recordSyncEvent = (event, detail = {}) => {
+    const journal = readLocalJson(SYNC_JOURNAL_KEY, []);
+    const safeDetail = {
+      operationId: detail.operationId || "",
+      destination: detail.destination || "",
+      action: detail.action || "",
+      attempts: Number(detail.attempts || 0),
+      status: detail.status || "",
+      durationMs: Number(detail.durationMs || 0),
+      error: String(detail.error || "").slice(0, 300)
+    };
+    void persistDurableJson(SYNC_JOURNAL_KEY, [
+      ...(Array.isArray(journal) ? journal : []),
+      { event, at: new Date().toISOString(), ...safeDetail }
+    ].slice(-250));
   };
 
   const initRemoteStorage = () => {
@@ -1964,11 +2274,19 @@ const App = (() => {
       setInventorySyncStatus("Configura el respaldo remoto", "local", "hard-drive");
       return false;
     }
+    if (!state.currentUser) {
+      setInventorySyncStatus("Respaldo remoto disponible al iniciar sesión", "local", "cloud-off");
+      return false;
+    }
     setInventorySyncStatus("Conectando respaldo remoto", "pending", "refresh-cw");
     void bootstrapRemoteStorage();
     return true;
   };
 
+  let appsScriptStatusAt = 0;
+  let appsScriptStatusResult = null;
+  let appsScriptStatusPromise = null;
+  let appsScriptStatusEpoch = 0;
   const appsScriptRequest = async (action, payload = {}, timeoutMs = APPS_SCRIPT_TIMEOUT_MS, operationId = "") => {
     if (!isAppsScriptConfigured()) throw new Error("El respaldo remoto no esta configurado.");
     const controller = new AbortController();
@@ -1993,6 +2311,14 @@ const App = (() => {
       try { result = JSON.parse(text); } catch (error) {
         throw transientAppsScriptError("La respuesta del respaldo remoto todavía se está confirmando.");
       }
+      if (result?.ok && action !== "status" && !action.startsWith("get_")) {
+        appsScriptStatusAt = 0;
+        appsScriptStatusEpoch += 1;
+        appsScriptStatusPromise = null;
+      }
+      if (result?.ok && ["record_sale", "edit_sale", "delete_sale", "clear_income"].includes(action)) {
+        window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+      }
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
     } catch (error) {
       if (error?.name === "AbortError") throw transientAppsScriptError("La sincronización remota continúa en segundo plano.");
@@ -2000,6 +2326,26 @@ const App = (() => {
     } finally {
       clearTimeout(timer);
     }
+  };
+
+  const readAppsScriptStatus = (force = false) => {
+    if (!force && appsScriptStatusResult && Date.now() - appsScriptStatusAt < 5000) {
+      return Promise.resolve(appsScriptStatusResult);
+    }
+    if (appsScriptStatusPromise) return appsScriptStatusPromise;
+    const epoch = appsScriptStatusEpoch;
+    const request = appsScriptRequest("status", {}, 12000)
+      .then((result) => {
+        if (epoch !== appsScriptStatusEpoch) return { ok: false, stale: true };
+        if (result?.ok) {
+          appsScriptStatusResult = result;
+          appsScriptStatusAt = Date.now();
+        }
+        return result;
+      })
+      .finally(() => { if (appsScriptStatusPromise === request) appsScriptStatusPromise = null; });
+    appsScriptStatusPromise = request;
+    return request;
   };
 
   const inventoryPayload = (item) => {
@@ -2020,15 +2366,29 @@ const App = (() => {
     };
   };
 
-  const applyRemoteInventoryItems = (items = [], { replace = false } = {}) => {
+  const pendingInventoryProductIds = () => {
+    const ids = new Set();
+    readAppsScriptOutbox().forEach((job) => {
+      if (["upsert_inventory", "set_inventory_stock", "delete_inventory"].includes(job.action)) {
+        ids.add(String(job.payload?.item?.productId || job.payload?.productId || ""));
+      }
+      if (job.action === "adjust_inventory") ids.add(String(job.payload?.adjustment?.productId || ""));
+      if (job.action === "record_sale") (job.payload?.invoice?.items || []).forEach((line) => ids.add(String(line.menu_item_id || "")));
+    });
+    ids.delete("");
+    return ids;
+  };
+
+  const applyRemoteInventoryItems = (items = [], { replace = false, preserveProductIds = new Set() } = {}) => {
     if (!Array.isArray(items)) return;
     if (replace) {
       const remoteIds = new Set(items.map((item) => String(item?.productId || "")).filter(Boolean));
       Object.keys(state.inventoryMeta).forEach((productId) => {
-        if (!remoteIds.has(String(productId))) delete state.inventoryMeta[productId];
+        if (!remoteIds.has(String(productId)) && !preserveProductIds.has(String(productId))) delete state.inventoryMeta[productId];
       });
     }
     items.forEach((remote) => {
+      if (preserveProductIds.has(String(remote.productId || ""))) return;
       const item = state.items.find((entry) => entry.id === remote.productId);
       if (!item) return;
       state.inventoryMeta[item.id] = {
@@ -2051,37 +2411,69 @@ const App = (() => {
 
   const enqueueAppsScriptJob = (action, payload, dedupeKey = uid()) => {
     const jobs = readAppsScriptOutbox();
+    const operationId = uid();
     const job = {
-      id: uid(),
+      id: operationId,
+      operationId,
+      destination: "apps-script",
       action,
       payload,
       dedupeKey,
       attempts: 0,
-      createdAt: new Date().toISOString()
+      status: "pending",
+      nextAttemptAt: 0,
+      lastError: "",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
     };
     const existingIndex = jobs.findIndex((entry) => entry.dedupeKey === dedupeKey);
-    if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock"].includes(action)) jobs[existingIndex] = job;
+    if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock", "update_inventory_movement_cost"].includes(action)) jobs[existingIndex] = job;
     else if (existingIndex < 0) jobs.push(job);
-    writeAppsScriptOutbox(jobs);
+    const persisted = writeAppsScriptOutbox(jobs);
+    recordSyncEvent("queued", job);
     if (isAppsScriptConfigured()) void flushAppsScriptOutbox();
     else setInventorySyncStatus(`${jobs.length} cambio${jobs.length === 1 ? "" : "s"} en cola local`, "local", "hard-drive");
+    void updateGlobalSyncStatus();
+    return persisted;
   };
 
-  const scheduleAppsScriptRetry = () => {
+  const appsScriptRetryDelay = (attempts) => {
+    const base = Math.min(60_000, 1000 * Math.pow(2, Math.min(Number(attempts || 0), 6)));
+    return Math.round(base * (.75 + Math.random() * .5));
+  };
+
+  const scheduleAppsScriptRetry = (delayMs = 30_000) => {
     clearTimeout(state.appsScriptOutboxTimer);
-    state.appsScriptOutboxTimer = window.setTimeout(flushAppsScriptOutbox, 30000);
+    state.appsScriptOutboxTimer = window.setTimeout(flushAppsScriptOutbox, Math.max(500, delayMs));
   };
 
-  const flushAppsScriptOutbox = async () => {
+  const runAppsScriptOutbox = async (force = false) => {
     if (state.appsScriptOutboxBusy || !isAppsScriptConfigured()) return false;
-    if (await hasPendingSupabaseWrites()) return false;
+    await flushDurableWrites();
+    const supabaseStatus = await getOfflineSyncStatus();
     state.appsScriptOutboxBusy = true;
+    let activeJob = null;
     try {
       let jobs = readAppsScriptOutbox();
-      while (jobs.length) {
-        const job = jobs[0];
-        setInventorySyncStatus(`Sincronizando ${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}`, "pending", "refresh-cw");
-        const result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.id);
+      while (true) {
+        const now = Date.now();
+        const job = nextReadyAppsScriptJob(jobs, supabaseStatus, force, now);
+        if (!job) {
+          if (jobs.some((entry) => entry.status === "pending" && (force || Number(entry.nextAttemptAt || 0) <= now))) {
+            scheduleAppsScriptRetry(2500);
+            return false;
+          }
+          break;
+        }
+        activeJob = job;
+        const startedAt = performance.now();
+        job.status = "syncing";
+        job.updatedAt = new Date().toISOString();
+        await writeAppsScriptOutbox(jobs);
+        const pendingCount = jobs.filter((entry) => ["pending", "syncing"].includes(entry.status)).length;
+        setInventorySyncStatus(`Sincronizando ${pendingCount} pendiente${pendingCount === 1 ? "" : "s"}`, "pending", "refresh-cw");
+        recordSyncEvent("sending", job);
+        const result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.operationId || job.id);
         const queuedAfterRequest = readAppsScriptOutbox();
         const pendingAfterCurrent = queuedAfterRequest.filter((entry) => entry.id !== job.id);
         const pendingProductIds = new Set(pendingAfterCurrent.map((entry) =>
@@ -2105,11 +2497,23 @@ const App = (() => {
             && /accion no permitida:\s*adjust_inventory/i.test(normalizeText(result?.error || ""));
           if (result?.retryable === false || legacyInventoryService) {
             if (result.item) applyFreshRemoteInventory();
-            jobs = pendingAfterCurrent;
-            writeAppsScriptOutbox(jobs);
+            if (legacyInventoryService) {
+              jobs = pendingAfterCurrent;
+            } else {
+              job.status = result?.conflict ? "conflict" : "failed";
+              job.lastError = result?.error || "Operacion rechazada";
+              job.updatedAt = new Date().toISOString();
+              jobs = [...pendingAfterCurrent, job];
+            }
+            await writeAppsScriptOutbox(jobs);
+            recordSyncEvent(legacyInventoryService ? "superseded" : job.status, {
+              ...job,
+              durationMs: performance.now() - startedAt,
+              error: result?.error || ""
+            });
             toast(
               legacyInventoryService
-                ? `El inventario se conciliara al cerrar la mesa. Publica la actualizacion ${APPS_SCRIPT_REQUIRED_VERSION} para sincronizar cada consumo de inmediato.`
+                ? "El servicio remoto no acepta movimientos individuales; el inventario se conciliara al cerrar la mesa."
                 : (result.error || "No se pudo aplicar un movimiento de inventario."),
               "error",
               legacyInventoryService ? "inventory-service-update-required" : `inventory-job-rejected:${job.id}`
@@ -2124,48 +2528,102 @@ const App = (() => {
           job.attempts = Number(job.attempts || 0) + 1;
           job.lastError = result?.error || "El respaldo remoto no respondio";
           job.lastAttemptAt = new Date().toISOString();
+          job.updatedAt = job.lastAttemptAt;
+          job.status = "pending";
+          job.nextAttemptAt = Date.now() + appsScriptRetryDelay(job.attempts);
           jobs = queuedAfterRequest;
           jobs[currentIndex] = job;
-          writeAppsScriptOutbox(jobs);
+          await writeAppsScriptOutbox(jobs);
+          recordSyncEvent("retry", { ...job, durationMs: performance.now() - startedAt, error: job.lastError });
           setInventorySyncStatus(`${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}; reintento automatico`, "error", "cloud-off");
-          scheduleAppsScriptRetry();
+          scheduleAppsScriptRetry(job.nextAttemptAt - Date.now());
           return false;
         }
         applyFreshRemoteInventory();
         jobs = pendingAfterCurrent;
-        writeAppsScriptOutbox(jobs);
+        await writeAppsScriptOutbox(jobs);
+        recordSyncEvent("confirmed", { ...job, status: "synced", durationMs: performance.now() - startedAt });
+        activeJob = null;
+      }
+      const unresolved = jobs.filter((job) => ["failed", "conflict"].includes(job.status));
+      const delayed = jobs.filter((job) => job.status === "pending");
+      if (unresolved.length) {
+        setInventorySyncStatus(`${unresolved.length} cambio${unresolved.length === 1 ? "" : "s"} requiere${unresolved.length === 1 ? "" : "n"} revisión`, "error", "triangle-alert");
+        return false;
+      }
+      if (delayed.length) {
+        const nextAt = Math.min(...delayed.map((job) => Number(job.nextAttemptAt || Date.now())));
+        scheduleAppsScriptRetry(nextAt - Date.now());
+        return false;
       }
       setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
       return true;
     } catch (error) {
+      if (activeJob) {
+        const jobs = readAppsScriptOutbox();
+        const index = jobs.findIndex((job) => job.id === activeJob.id);
+        if (index >= 0) {
+          const attempts = Number(activeJob.attempts || 0) + 1;
+          activeJob = {
+            ...activeJob,
+            status: "pending",
+            attempts,
+            lastAttemptAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            lastError: String(error?.message || error || "Error de red"),
+            nextAttemptAt: Date.now() + appsScriptRetryDelay(attempts)
+          };
+          jobs[index] = activeJob;
+          await writeAppsScriptOutbox(jobs);
+          recordSyncEvent("retry", { ...activeJob, error: activeJob.lastError });
+          scheduleAppsScriptRetry(activeJob.nextAttemptAt - Date.now());
+        }
+      }
       setInventorySyncStatus("Sin conexion; cambios protegidos localmente", "error", "cloud-off");
-      scheduleAppsScriptRetry();
       return false;
     } finally {
       state.appsScriptOutboxBusy = false;
+      void updateGlobalSyncStatus();
     }
   };
 
+  const flushAppsScriptOutbox = (force = false) => {
+    if (!navigator.locks?.request) return runAppsScriptOutbox(force);
+    return navigator.locks.request("tienda-napoles-appscript-sync", { ifAvailable: true }, (lock) =>
+      lock ? runAppsScriptOutbox(force) : false);
+  };
+
   const bootstrapRemoteStorage = async () => {
-    if (!isAppsScriptConfigured() || !state.currentUser) return false;
-    if (state.currentUser.role !== "admin") {
-      void syncInventoryWithAppsScript();
-      void flushAppsScriptOutbox();
+    if (!isAppsScriptConfigured()) {
+      setInventorySyncStatus("Respaldo remoto no configurado", "local", "cloud-off");
+      return false;
+    }
+    if (!state.currentUser) {
+      setInventorySyncStatus("Respaldo remoto disponible al iniciar sesión", "local", "cloud-off");
+      return false;
+    }
+    if (!isManager()) {
+      setInventorySyncStatus("Consultando inventario remoto", "pending", "refresh-cw");
+      void flushAppsScriptOutbox(true).then(() => syncInventoryWithAppsScript());
       return true;
     }
     setInventorySyncStatus("Preparando respaldo remoto", "pending", "refresh-cw");
     try {
+      const status = await readAppsScriptStatus();
+      if (status?.ok && status.configured) {
+        setInventorySyncStatus("Respaldo remoto listo", "synced", "cloud-check");
+        await flushAppsScriptOutbox(true);
+        await syncInventoryWithAppsScript();
+        return true;
+      }
       const result = await appsScriptRequest("bootstrap", {
         supabaseUrl: SUPABASE_CONFIG.url,
         supabaseAnonKey: SUPABASE_CONFIG.anonKey
       });
       if (!result?.ok) throw new Error(result?.error || "No fue posible inicializar el respaldo remoto.");
-      if (!isAppsScriptVersionCompatible(result.version)) {
-        toast(`Publica Code.gs ${APPS_SCRIPT_REQUIRED_VERSION} para activar movimientos, correcciones y reinicios completos.`, "error", "appscript-version-required");
-      }
       setInventorySyncStatus("Respaldo remoto listo", "synced", "cloud-check");
+      await flushAppsScriptOutbox(true);
       await syncInventoryWithAppsScript();
-      await flushAppsScriptOutbox();
       return true;
     } catch (error) {
       if (isTransientAppsScriptError(error)) {
@@ -2178,62 +2636,107 @@ const App = (() => {
     }
   };
 
-  const syncInventoryWithAppsScript = async () => {
+  let inventoryReadPromise = null;
+  const syncInventoryWithAppsScript = () => {
+    if (inventoryReadPromise) return inventoryReadPromise;
+    inventoryReadPromise = (async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
-    if (readAppsScriptOutbox().length || await hasPendingSupabaseWrites()) return false;
+    if (readAppsScriptOutbox().some((job) => ["clear_inventory", "sync_inventory"].includes(job.action))) {
+      setInventorySyncStatus("Esperando cambios de inventario pendientes", "pending", "refresh-cw");
+      return false;
+    }
     try {
       const result = await appsScriptRequest("get_inventory");
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
       if (!Array.isArray(result.items)) throw new Error("El inventario remoto devolvió una respuesta inválida.");
-      applyRemoteInventoryItems(result.items, { replace: true });
-      setInventorySyncStatus("Inventario sincronizado", "synced", "cloud-check");
+      applyRemoteInventoryItems(result.items, { replace: true, preserveProductIds: pendingInventoryProductIds() });
+      state.syncFresh.inventory = true;
+      const pending = readAppsScriptOutbox().length;
+      setInventorySyncStatus(pending ? `${pending} cambio${pending === 1 ? "" : "s"} pendiente${pending === 1 ? "" : "s"}` : "Inventario sincronizado", pending ? "pending" : "synced", pending ? "refresh-cw" : "cloud-check");
+      void updateGlobalSyncStatus();
       return true;
     } catch (error) {
+      state.syncFresh.inventory = false;
       setInventorySyncStatus("Usando respaldo local", "error", "cloud-off");
       return false;
     }
+    })().finally(() => { inventoryReadPromise = null; });
+    return inventoryReadPromise;
   };
 
   const refreshRemoteStorageNow = async () => {
     if (state.appsScriptOutboxBusy || state.remoteStorageSyncBusy || !isAppsScriptConfigured() || !state.currentUser) return false;
     state.remoteStorageSyncBusy = true;
     try {
-      if (readAppsScriptOutbox().length) return flushAppsScriptOutbox();
+      if (readAppsScriptOutbox().length) {
+        await flushAppsScriptOutbox();
+      }
       const synced = await syncInventoryWithAppsScript();
-      if (!synced) return false;
-      if (state.activeAdminSection === "movements") await loadInventoryMovements();
-      if (state.activeAdminSection === "income") await loadIncomeReport();
-      return true;
+      const purchasesOpen = Boolean($("#purchaseHistoryDialog")?.open);
+      if (state.activeAdminSection === "movements" || purchasesOpen) await loadInventoryMovements();
+      if (purchasesOpen) {
+        renderPurchaseProductOptions();
+        renderPurchaseHistory();
+      }
+      return synced;
     } finally {
       state.remoteStorageSyncBusy = false;
     }
   };
 
-  const flushPendingOfflineWrites = async () => {
-    const result = await flushOfflineQueue(true);
-    const counts = result?.counts || await getOfflineSyncStatus();
-    return !navigator.onLine || !["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0);
-  };
-
-  const refreshOperationalDataNow = async () => {
-    const flushed = await flushPendingOfflineWrites();
-    if (!flushed) return false;
-    await refreshAdminNow();
-    return true;
-  };
-
   let reconnectSyncPromise = null;
-  const synchronizeAfterReconnect = () => {
+  const synchronizeAfterReconnect = (reason = "reconnect") => {
     if (reconnectSyncPromise) return reconnectSyncPromise;
     reconnectSyncPromise = (async () => {
-      const result = await flushOfflineQueue(true);
-      const counts = result?.counts || await getOfflineSyncStatus();
-      if (["pending", "syncing", "failed", "conflict"].some((status) => Number(counts[status] || 0) > 0)) return false;
-      await refreshCoreNow();
-      if (state.page === "admin") await refreshAdminNow();
+      const startedAt = performance.now();
+      recordSyncEvent("sync-cycle-started", { destination: "all", action: reason });
+      // Las lecturas independientes comienzan de inmediato. Una operación
+      // pendiente de una entidad no debe congelar toda la aplicación.
+      const coreRefresh = refreshCoreNow();
+      const initialCounts = await getOfflineSyncStatus();
+      await flushOfflineQueue(true);
+      await coreRefresh;
+      const hadPendingSupabaseWrites = ["pending", "syncing", "failed", "conflict"]
+        .some((status) => Number(initialCounts[status] || 0) > 0);
+      if (navigator.onLine && hadPendingSupabaseWrites) await refreshCoreNow();
+      if (state.page === "admin") {
+        await refreshAdminNow();
+        if (navigator.onLine) {
+          await flushAppsScriptOutbox(true);
+          await Promise.all([
+            syncInventoryWithAppsScript(),
+            isManager() ? loadInventoryMovements() : Promise.resolve(false),
+            canAccessAdminSection("income")
+              ? loadIncomeReport({ background: true, force: true })
+              : Promise.resolve(false)
+          ]);
+          await refreshBackgroundReports({ force: true });
+        }
+        if (isBoss()) await loadUsers();
+        showAdminSection(state.activeAdminSection || "dashboard");
+      }
       if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
-      return true;
-    })().finally(() => { reconnectSyncPromise = null; });
+      const finalCounts = await getOfflineSyncStatus();
+      const requiredFresh = requiredSyncDomains();
+      const cleanQueue = finalCounts.controllerAvailable
+        && !["pending", "syncing", "failed", "conflict"].some((status) => Number(finalCounts[status] || 0) > 0)
+        && !readAppsScriptOutbox().some((job) => ["pending", "syncing", "failed", "conflict"].includes(job.status))
+        && requiredFresh.every((name) => state.syncFresh[name]);
+      recordSyncEvent("sync-cycle-completed", {
+        destination: "all",
+        action: reason,
+        status: cleanQueue ? "synced" : "pending",
+        durationMs: performance.now() - startedAt
+      });
+      return cleanQueue;
+    })().catch((error) => {
+      recordSyncEvent("sync-cycle-failed", { destination: "all", action: reason, status: "pending", error: error?.message || error });
+      return false;
+    }).finally(() => {
+      state.startupSyncComplete = true;
+      reconnectSyncPromise = null;
+      void updateGlobalSyncStatus();
+    });
     return reconnectSyncPromise;
   };
 
@@ -3244,7 +3747,7 @@ const App = (() => {
   const initClient = async () => {
     setLoading(true);
     const nativeScanValue = tableValueFromUrl();
-    if (nativeScanValue && localStorage.getItem("la_licorera_17_admin_token")) {
+    if (nativeScanValue && sessionStorage.getItem("la_licorera_17_admin_token")) {
       const adminUrl = new URL("admin.html", location.href);
       adminUrl.searchParams.set("scan", nativeScanValue);
       adminUrl.hash = "service";
@@ -3650,6 +4153,7 @@ const App = (() => {
     try {
       const changed = await loadAdminData();
       if (changed) renderAdminLive();
+      void refreshBackgroundReports();
       return changed;
     } finally {
       state.adminSyncBusy = false;
@@ -3671,27 +4175,31 @@ const App = (() => {
     const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
     if (!snapshot) {
       const [requests, sessions] = await Promise.all([
-        db(
+        dbQuiet(
           state.sb.from("service_requests").select("*, restaurant_tables(table_number, table_name)")
             .in("status", ["pending", "acknowledged"]).order("created_at", { ascending: false }),
-          []
+          null
         ),
-        db(
+        dbQuiet(
           state.sb.from("table_sessions").select("*, restaurant_tables(table_number, table_name), session_items(*)")
             .eq("status", "open").order("opened_at", { ascending: false }),
-          []
+          null
         )
       ]);
-      if (cachedSnapshot && (!navigator.onLine || (!(requests || []).length && !(sessions || []).length))) {
+      if (!Array.isArray(requests) || !Array.isArray(sessions)) {
+        state.syncFresh.operational = false;
+        if (!cachedSnapshot) return false;
         state.requests = mergeOptimisticRequests(cachedSnapshot.requests);
         state.sessions = mergeOptimisticSessions(cachedSnapshot.sessions);
         return false;
       }
+      state.syncFresh.operational = true;
       state.requests = mergeOptimisticRequests(requests || []);
       state.sessions = mergeOptimisticSessions(sessions || []);
       persistOfflineAdminSnapshot();
       return true;
     }
+    state.syncFresh.operational = true;
     const requests = mergeOptimisticRequests(snapshot.requests || []);
     const sessions = mergeOptimisticSessions(snapshot.sessions || []);
     const signature = JSON.stringify([
@@ -3711,14 +4219,17 @@ const App = (() => {
     return true;
   };
 
-  const refreshCoreNow = async () => {
-    if (state.coreSyncBusy || await hasPendingSupabaseWrites()) return false;
+  let coreRefreshPromise = null;
+  const refreshCoreNow = () => {
+    if (coreRefreshPromise) return coreRefreshPromise;
     state.coreSyncBusy = true;
-    try {
+    coreRefreshPromise = (async () => {
       const [businessLoaded, coreLoaded] = await Promise.all([loadBusiness(), loadCore()]);
+      if (businessLoaded || coreLoaded) state.coreDirectReadSucceeded = true;
+      state.syncFresh.core = Boolean(businessLoaded && coreLoaded);
       applyBusinessTipSettings();
       if (!state.outdoorTableDraftDirty) state.outdoorTableDraftIds = null;
-      persistBootstrapCache();
+      if (businessLoaded || coreLoaded) persistBootstrapCache();
       if (state.page === "admin") {
         renderBrand();
         syncTipFeatureVisibility();
@@ -3734,9 +4245,12 @@ const App = (() => {
         renderMenu();
       }
       return businessLoaded || coreLoaded;
-    } finally {
+    })().finally(() => {
       state.coreSyncBusy = false;
-    }
+      coreRefreshPromise = null;
+      void updateGlobalSyncStatus();
+    });
+    return coreRefreshPromise;
   };
 
   const updateNavRequestBadge = () => {
@@ -3963,7 +4477,7 @@ const App = (() => {
           ${icon(state.activeServiceZone === "bar" ? "wine" : "flower-2", 22)}
           <span><strong>${escapeHTML(tableLabel(table))}</strong><small>${occupied ? money(sessionTotal(session)) : "Libre"}</small></span>
         </button>
-        ${state.currentUser?.role === "admin" ? `<button class="icon-btn danger" type="button" data-delete-service-point="${escapeHTML(table.id)}" aria-label="Eliminar ${escapeHTML(tableLabel(table))}">${icon("trash-2", 15)}</button>` : ""}
+        ${isManager() ? `<button class="icon-btn danger" type="button" data-delete-service-point="${escapeHTML(table.id)}" aria-label="Eliminar ${escapeHTML(tableLabel(table))}">${icon("trash-2", 15)}</button>` : ""}
       </article>`;
     }).join("") : emptyState(`Sin ${kindLabel}s`, `Agrega un puesto de ${kindLabel} para atender clientes aquí.`, state.activeServiceZone === "bar" ? "wine" : "flower-2");
     const addButton = $("#addServicePoint");
@@ -3972,7 +4486,7 @@ const App = (() => {
   };
 
   const addServicePoint = () => {
-    if (state.currentUser?.role !== "admin") return;
+    if (!isManager()) return;
     const kind = state.activeServiceZone;
     const sameKind = state.tables.filter((table) => servicePointKind(table) === kind);
     const sequence = sameKind.reduce((largest, table) => {
@@ -4100,6 +4614,9 @@ const App = (() => {
       [...state.selectedTableQrIds].filter((id) => validIds.has(String(id)))
     );
     const query = normalizeText($("#tableManagerSearch")?.value || "");
+    const signature = JSON.stringify([qrTables, query, [...state.selectedTableQrIds]]);
+    if (signature === state.tableManagerRenderSignature && list.firstElementChild) return;
+    state.tableManagerRenderSignature = signature;
     const visibleTables = qrTables.filter((table) => !query || normalizeText(`${table.table_number} ${table.table_name || ""}`).includes(query));
     list.innerHTML = visibleTables.length
       ? visibleTables
@@ -4408,6 +4925,9 @@ const App = (() => {
   };
 
   const renderMenuManager = () => {
+    const signature = JSON.stringify([state.categories, state.items, state.inventoryMeta]);
+    if (signature === state.menuManagerRenderSignature && $("#itemList")?.firstElementChild) return;
+    state.menuManagerRenderSignature = signature;
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
       const selectedValue = select.value;
@@ -4536,6 +5056,10 @@ const App = (() => {
     const metrics = $("#inventoryMetrics");
     const list = $("#inventoryList");
     if (!metrics || !list) return;
+    const signature = JSON.stringify([state.items, state.categories, state.inventoryMeta,
+      state.inventorySearch, state.inventoryStatusFilter, state.inventoryCategoryFilter]);
+    if (signature === state.inventoryRenderSignature && list.firstElementChild) return;
+    state.inventoryRenderSignature = signature;
     const summary = inventorySummary();
     metrics.innerHTML = `
       <article><span>${icon("package-check", 19)} Unidades</span><strong>${summary.units.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><small>Existencia total registrada</small></article>
@@ -4586,10 +5110,185 @@ const App = (() => {
 
   const movementKind = (movement) => Number(movement.delta ?? movement.quantityChange ?? 0) >= 0 ? "entry" : "exit";
 
+  const isPurchaseMovement = (movement) => {
+    const type = String(movement?.type || "").trim().toUpperCase();
+    return Number(movement?.delta ?? movement?.quantityChange ?? 0) > 0
+      && (type === "NUEVO_PRODUCTO" || type.startsWith("ENTRADA"));
+  };
+
+  const purchaseDateKey = (value) => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Bogota",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(date).reduce((result, part) => ({ ...result, [part.type]: part.value }), {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  };
+
+  const purchaseUnitCost = (movement) => {
+    const storedCost = Number(movement?.unitCost);
+    if (Number.isFinite(storedCost) && storedCost >= 0) return storedCost;
+    const item = state.items.find((entry) => String(entry.id) === String(movement?.productId));
+    return item ? inventoryFor(item).costPrice : 0;
+  };
+
+  const purchaseHistoryCutoff = () => {
+    try {
+      return Date.parse(localStorage.getItem(PURCHASE_HISTORY_CUTOFF_KEY) || "");
+    } catch {
+      return Number.NaN;
+    }
+  };
+
+  const hiddenPurchaseMovementIds = () => {
+    try {
+      const ids = JSON.parse(localStorage.getItem(HIDDEN_PURCHASE_MOVEMENTS_KEY) || "[]");
+      return new Set(Array.isArray(ids) ? ids.map(String) : []);
+    } catch {
+      return new Set();
+    }
+  };
+
+  const purchaseMovements = () => {
+    const query = normalizeText(state.purchaseSearch);
+    const cutoff = purchaseHistoryCutoff();
+    const hiddenIds = hiddenPurchaseMovementIds();
+    return state.inventoryMovements
+      .filter(isPurchaseMovement)
+      .filter((movement) => !hiddenIds.has(String(movement.movementId || "")))
+      .filter((movement) => {
+        if (!Number.isFinite(cutoff)) return true;
+        const movementTime = Date.parse(movement.date || "");
+        return Number.isFinite(movementTime) && movementTime > cutoff;
+      })
+      .filter((movement) => state.purchaseProductFilter === "all" || String(movement.productId) === state.purchaseProductFilter)
+      .filter((movement) => {
+        const dateKey = purchaseDateKey(movement.date);
+        return (!state.purchaseDateFrom || dateKey >= state.purchaseDateFrom)
+          && (!state.purchaseDateTo || dateKey <= state.purchaseDateTo);
+      })
+      .filter((movement) => !query || normalizeText([
+        movement.product,
+        movement.code,
+        movement.reference,
+        movement.user
+      ].join(" ")).includes(query))
+      .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")) || String(right.movementId || "").localeCompare(String(left.movementId || "")));
+  };
+
+  const renderPurchaseProductOptions = () => {
+    const select = $("#purchaseProductFilter");
+    if (!select) return;
+    const selected = state.purchaseProductFilter;
+    const products = new Map();
+    state.items.forEach((item) => products.set(String(item.id), { id: String(item.id), name: item.name || "Producto", code: inventoryFor(item).code }));
+    state.inventoryMovements.filter(isPurchaseMovement).forEach((movement) => {
+      const id = String(movement.productId || "");
+      if (id && !products.has(id)) products.set(id, { id, name: movement.product || "Producto", code: movement.code || "" });
+    });
+    const options = Array.from(products.values()).sort((left, right) => left.name.localeCompare(right.name, "es"));
+    select.innerHTML = `<option value="all">Todos los productos</option>${options.map((product) => `<option value="${escapeHTML(product.id)}">${escapeHTML(product.name)}${product.code ? ` (${escapeHTML(product.code)})` : ""}</option>`).join("")}`;
+    select.value = options.some((product) => product.id === selected) ? selected : "all";
+    state.purchaseProductFilter = select.value;
+  };
+
+  const savePurchaseUnitCost = (button) => {
+    const record = button?.closest(".purchase-record");
+    const input = record?.querySelector("[data-purchase-unit-cost]");
+    const movementId = String(button?.dataset.savePurchaseCost || "");
+    const movement = state.inventoryMovements.find((entry) => String(entry.movementId) === movementId);
+    if (!movement || !input) return;
+    const unitCost = currencyInputNumber(input);
+    if (!Number.isFinite(unitCost) || unitCost < 0) {
+      toast("Escribe un costo unitario válido.", "error", `purchase-cost-invalid:${movementId}`);
+      input.focus({ preventScroll: true });
+      return;
+    }
+    if (purchaseUnitCost(movement) === unitCost && Number.isFinite(Number(movement.unitCost))) {
+      toast("Ese costo ya está guardado.", "ok", `purchase-cost-unchanged:${movementId}`);
+      return;
+    }
+    movement.unitCost = unitCost;
+    persistInventoryMovements();
+    enqueueAppsScriptJob(
+      "update_inventory_movement_cost",
+      { movementId, unitCost },
+      `purchase-cost:${movementId}`
+    );
+    renderPurchaseHistory();
+    toast(navigator.onLine ? "Costo de la compra actualizado." : "Costo guardado; se sincronizará al volver la conexión.", "ok", `purchase-cost-saved:${movementId}:${unitCost}`);
+  };
+
+  const renderPurchaseHistory = () => {
+    const summary = $("#purchaseSummary");
+    const list = $("#purchaseHistoryList");
+    const feedback = $("#purchaseFilterFeedback");
+    if (!summary || !list || !feedback) return;
+    const invalidRange = state.purchaseDateFrom && state.purchaseDateTo && state.purchaseDateFrom > state.purchaseDateTo;
+    const purchases = invalidRange ? [] : purchaseMovements();
+    const totalUnits = purchases.reduce((sum, movement) => sum + Number(movement.delta || 0), 0);
+    const totalSpent = purchases.reduce((sum, movement) => sum + Number(movement.delta || 0) * purchaseUnitCost(movement), 0);
+    const productCount = new Set(purchases.map((movement) => String(movement.productId || movement.product))).size;
+    summary.innerHTML = `
+      <article><span>${icon("wallet-cards", 20)} Total invertido</span><strong>${money(totalSpent)}</strong><small>Seg&uacute;n los filtros actuales</small></article>
+      <article><span>${icon("package-plus", 20)} Unidades compradas</span><strong>${totalUnits.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><small>En ${purchases.length} ${purchases.length === 1 ? "registro" : "registros"}</small></article>
+      <article><span>${icon("boxes", 20)} Productos</span><strong>${productCount}</strong><small>Productos distintos</small></article>`;
+    feedback.textContent = invalidRange
+      ? "La fecha inicial no puede ser posterior a la fecha final."
+      : `${purchases.length} ${purchases.length === 1 ? "compra encontrada" : "compras encontradas"}.`;
+    feedback.classList.toggle("is-error", Boolean(invalidRange));
+    list.innerHTML = purchases.length
+      ? purchases.map((movement) => {
+          const quantity = Number(movement.delta || 0);
+          const unitCost = purchaseUnitCost(movement);
+          const total = quantity * unitCost;
+          const exactCost = Number.isFinite(Number(movement.unitCost));
+          const movementId = String(movement.movementId || "");
+          const productName = movement.product || "Producto";
+          return `<article class="purchase-record" data-purchase-record="${escapeHTML(String(movement.movementId || ""))}">
+            <span class="purchase-record-icon">${icon("shopping-basket", 20)}</span>
+            <div class="purchase-record-main"><strong>${escapeHTML(productName)}</strong><small>${escapeHTML(movement.code || "Sin siglas")} &middot; ${escapeHTML(formatIncomeDate(movement.date))}</small></div>
+            <div class="purchase-record-calculation">
+              <span>Agregaste <strong>${quantity.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong> ${quantity === 1 ? "unidad" : "unidades"}</span>
+              <small>${exactCost ? "Costo unitario registrado" : "Calculado con el costo actual"}${movement.user ? ` &middot; ${escapeHTML(movement.user)}` : ""}</small>
+              <div class="purchase-cost-editor">
+                <label>Costo real por unidad<input type="text" inputmode="numeric" autocomplete="off" value="${formattedCurrencyInput(unitCost)}" data-currency-input data-purchase-unit-cost data-purchase-quantity="${quantity}"></label>
+                <button class="primary small" type="button" data-save-purchase-cost="${escapeHTML(String(movement.movementId || ""))}">${icon("save", 15)} Guardar</button>
+              </div>
+            </div>
+            <div class="purchase-record-actions"><strong class="purchase-record-total" data-purchase-total>${money(total)}</strong>${movementId ? `<button class="icon-btn danger-text purchase-record-remove" type="button" data-hide-purchase="${escapeHTML(movementId)}" aria-label="Quitar compra de ${escapeHTML(productName)} de la lista" title="Quitar de la lista">${icon("trash-2", 16)}</button>` : ""}</div>
+          </article>`;
+        }).join("")
+      : emptyState(invalidRange ? "Revisa las fechas" : "Sin compras", invalidRange ? "Corrige el rango para consultar el historial." : "No hay entradas de unidades que coincidan con estos filtros.", invalidRange ? "calendar-x" : "shopping-cart");
+    bindCurrencyInputs(list);
+    refreshIcons();
+  };
+
+  const openPurchaseHistory = async () => {
+    const dialog = $("#purchaseHistoryDialog");
+    if (!dialog) return;
+    renderPurchaseProductOptions();
+    renderPurchaseHistory();
+    if (!dialog.open) dialog.showModal();
+    refreshIcons();
+    window.requestAnimationFrame(() => $("#purchaseSearch")?.focus({ preventScroll: true }));
+    if (navigator.onLine && isAppsScriptConfigured() && state.currentUser) {
+      await loadInventoryMovements();
+      renderPurchaseProductOptions();
+      renderPurchaseHistory();
+    }
+  };
+
   const renderInventoryMovements = () => {
     const list = $("#inventoryMovementList");
     const summary = $("#movementSummary");
     if (!list || !summary) return;
+    const signature = JSON.stringify([state.inventoryMovements, state.movementSearch, state.movementTypeFilter]);
+    if (signature === state.movementRenderSignature && list.firstElementChild) return;
+    state.movementRenderSignature = signature;
     const query = normalizeText(state.movementSearch);
     const movements = [...state.inventoryMovements]
       .filter((movement) => state.movementTypeFilter === "all" || movementKind(movement) === state.movementTypeFilter)
@@ -4615,6 +5314,9 @@ const App = (() => {
       if (job.action === "upsert_inventory" && job.payload?.item?.movementEventId) {
         ids.add(String(job.payload.item.movementEventId));
       }
+      if (job.action === "update_inventory_movement_cost" && job.payload?.movementId) {
+        ids.add(String(job.payload.movementId));
+      }
       if (job.action === "record_sale" && job.payload?.invoice) {
         const invoice = job.payload.invoice;
         const saleId = String(invoice.id || invoice.sessionId || "");
@@ -4626,11 +5328,15 @@ const App = (() => {
     return ids;
   };
 
-  const loadInventoryMovements = async () => {
+  let movementLoadPromise = null;
+  const loadInventoryMovements = () => {
+    if (movementLoadPromise) return movementLoadPromise;
+    movementLoadPromise = (async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
     if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) {
+      state.syncFresh.movements = false;
       renderInventoryMovements();
-      return true;
+      return false;
     }
     try {
       const result = await appsScriptRequest("get_inventory_movements", { limit: 800 });
@@ -4641,13 +5347,24 @@ const App = (() => {
         .map((movement) => [movement.movementId, movement]));
       result.movements.forEach((movement) => merged.set(movement.movementId, movement));
       state.inventoryMovements = Array.from(merged.values()).slice(-3000);
+      state.movementRevision = String(result.revision || "");
       persistInventoryMovements();
+      state.syncFresh.movements = true;
       renderInventoryMovements();
+      if ($("#purchaseHistoryDialog")?.open) {
+        renderPurchaseProductOptions();
+        renderPurchaseHistory();
+      }
+      void updateGlobalSyncStatus();
       return true;
     } catch (error) {
+      state.syncFresh.movements = false;
       renderInventoryMovements();
+      void updateGlobalSyncStatus();
       return false;
     }
+    })().finally(() => { movementLoadPromise = null; });
+    return movementLoadPromise;
   };
 
   const resetInventoryForm = ({ open = false } = {}) => {
@@ -5068,7 +5785,7 @@ const App = (() => {
     if (!chat || !suggestions) return;
     suggestions.innerHTML = ["¿Cuanto se vendio hoy?", "¿Que producto se vendio mas?", "¿Quien realizo las ventas?", "¿Que productos tienen stock bajo?"]
       .map((question) => `<button class="chip" type="button" data-admin-ai-question="${escapeHTML(question)}">${escapeHTML(question)}</button>`).join("");
-    const messages = state.adminAiMessages.length ? state.adminAiMessages : [{ role: "bot", text: "Puedo cruzar el informe de ingresos, el inventario y los movimientos visibles. Preguntame por productos, cantidades, responsables, ventas o existencias." }];
+    const messages = state.adminAiMessages.length ? state.adminAiMessages : [{ role: "bot", text: "Puedo cruzar el informe de ventas, el inventario y los movimientos visibles. Preguntame por productos, cantidades, responsables, ventas o existencias." }];
     chat.innerHTML = messages.map((message) => `<div class="admin-ai-message ${message.role}">${message.role === "bot" ? icon("sparkles", 17) : ""}<p>${escapeHTML(message.text)}</p></div>`).join("");
     chat.scrollTop = chat.scrollHeight;
     refreshIcons();
@@ -5151,13 +5868,15 @@ const App = (() => {
       kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
       payments.innerHTML = "";
       recordsTarget.innerHTML = emptyState("Preparando contabilidad", "Estamos consultando las ventas cerradas.", "loader-circle");
-      setIncomeReportStatus("Consultando ingresos", "loading", "loader-circle");
+      setIncomeReportStatus("Consultando ventas", "loading", "loader-circle");
       return;
     }
     const totals = report.totals || {};
+    const allRecords = Array.isArray(report.records) ? report.records : [];
+    const visibleRecords = allRecords.slice(0, state.incomeVisibleCount);
     const margin = Number(totals.income || 0) > 0 ? Number(totals.profit || 0) / Number(totals.income) * 100 : 0;
     const infoButton = (label, explanation) => `<button class="income-kpi-info" type="button" aria-label="Qué significa ${escapeHTML(label)}" data-tooltip="${escapeHTML(explanation)}">${icon("info", 15)}</button>`;
-    kpis.innerHTML = state.incomeLoading
+    kpis.innerHTML = state.incomeLoading && !report
       ? Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("")
       : `
         <article class="income-kpi is-primary">${infoButton("Dinero vendido", "Todo el dinero cobrado en las ventas de este periodo.")}<span>${icon("circle-dollar-sign", 19)} Dinero vendido</span><strong>${money(totals.income)}</strong><small>Total vendido en el periodo seleccionado</small></article>
@@ -5173,8 +5892,8 @@ const App = (() => {
       const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
       summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}`;
     }
-    recordsTarget.innerHTML = report.records?.length
-      ? report.records.map((record) => {
+    recordsTarget.innerHTML = allRecords.length
+      ? visibleRecords.map((record) => {
           const paymentBadges = (record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
@@ -5193,17 +5912,23 @@ const App = (() => {
               </div>
             </details>
           </article>`;
-        }).join("")
-      : emptyState("Sin ingresos en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
+        }).join("") + (allRecords.length > visibleRecords.length
+        ? `<button class="ghost" type="button" data-show-more-income>Mostrar ${Math.min(60, allRecords.length - visibleRecords.length)} ventas más</button>`
+        : "")
+      : emptyState("Sin ventas en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
     const pendingText = report.pendingCount ? ` · ${report.pendingCount} pendiente${report.pendingCount === 1 ? "" : "s"} de respaldo` : "";
-    const limitedText = report.truncated ? " · mostrando los 300 más recientes" : "";
-    setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${pendingText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
+    const limitedText = report.truncated ? " · mostrando las 300 más recientes" : "";
+    const visibleText = allRecords.length > visibleRecords.length ? ` · ${visibleRecords.length} visibles` : "";
+    setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${pendingText}${visibleText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
     refreshIcons();
   };
 
-  const loadIncomeReport = async () => {
-    if (!$("#income") || state.currentUser?.role !== "admin") return false;
-    if (state.incomeLoading) return false;
+  const loadIncomeReport = async ({ background = false, force = false, verifiedConnection = false } = {}) => {
+    if (!$("#income") || !canAccessAdminSection("income")) return false;
+    if (state.incomeLoading) {
+      if (!background) state.incomeReloadRequested = true;
+      return false;
+    }
     const filters = incomeFiltersFromForm();
     if (filters.dateFrom > filters.dateTo) {
       toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
@@ -5215,39 +5940,155 @@ const App = (() => {
       setIncomeReportStatus("Reinicio pendiente de sincronización", "warning", "hard-drive");
       return true;
     }
+    if (!navigator.onLine && !verifiedConnection) {
+      const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
+      const matchesCache = cached?.filters && JSON.stringify(cached.filters) === JSON.stringify(filters)
+        && Array.isArray(cached.report?.records);
+      state.incomeReport = matchesCache
+        ? { ...mergeIncomeReport(cached.report, filters), localOnly: true }
+        : localIncomeReport(filters);
+      state.syncFresh.sales = false;
+      renderIncomeReport();
+      if (!state.offlineSalesProbeBusy) {
+        state.offlineSalesProbeBusy = true;
+        void readAppsScriptStatus(true)
+          .then((status) => status?.ok
+            ? loadIncomeReport({ background: true, force: true, verifiedConnection: true })
+            : false)
+          .catch(() => false)
+          .finally(() => { state.offlineSalesProbeBusy = false; });
+      }
+      return true;
+    }
     const requestId = ++state.incomeRequestId;
+    const previousReport = state.incomeReport;
+    const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
+    const matchesCache = cached?.filters && JSON.stringify(cached.filters) === JSON.stringify(filters)
+      && Array.isArray(cached.report?.records);
+    const filtersChanged = JSON.stringify(previousReport?.filters || null) !== JSON.stringify(filters);
+    state.syncFresh.sales = false;
     state.incomeLoading = true;
-    state.incomeReport = localIncomeReport(filters);
-    renderIncomeReport();
-    setIncomeReportStatus("Actualizando informe", "loading", "loader-circle");
+    if (!background || !previousReport || filtersChanged) {
+      if (filtersChanged) state.incomeVisibleCount = 60;
+      state.incomeReport = matchesCache
+        ? { ...mergeIncomeReport(cached.report, filters), localOnly: true }
+        : localIncomeReport(filters);
+      renderIncomeReport();
+      setIncomeReportStatus(matchesCache ? "Mostrando última copia; consultando ventas actuales" : "Consultando ventas actuales", "loading", "loader-circle");
+    }
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
+      if (!force && matchesCache && typeof cached.report.revision === "string") {
+        try {
+          const status = await readAppsScriptStatus();
+          if (status?.ok && Object.prototype.hasOwnProperty.call(status, "historyRevision")
+            && String(status.historyRevision || "") === cached.report.revision) {
+            state.incomeReport = mergeIncomeReport(cached.report, filters);
+            state.incomeRevision = cached.report.revision;
+            state.incomeFetchedAt = Date.now();
+            state.syncFresh.sales = true;
+            if (state.activeAdminSection === "income") renderIncomeReport();
+            void updateGlobalSyncStatus();
+            return true;
+          }
+        } catch (_) { /* Si no hay revision verificable, consultar el informe completo. */ }
+      }
       const result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
+      if (requestId !== state.incomeRequestId) return false;
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
+      if (result.stale || !Array.isArray(result.records) || !result.totals) throw new Error("El historial remoto no quedó confirmado; se reintentará.");
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
       state.incomeReport = mergeIncomeReport(result, filters);
-      renderIncomeReport();
+      state.incomeRevision = result.revision || "";
+      state.incomeFetchedAt = Date.now();
+      state.syncFresh.sales = true;
+      void persistDurableJson(INCOME_REPORT_CACHE_KEY, { filters, report: result, fetchedAt: new Date().toISOString() });
+      if (state.activeAdminSection === "income") renderIncomeReport();
+      void updateGlobalSyncStatus();
       return true;
     } catch (error) {
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
-      state.incomeReport = localIncomeReport(filters, String(error?.message || error));
+      state.syncFresh.sales = false;
+      if (background && previousReport) {
+        state.incomeReport = previousReport;
+        if (state.activeAdminSection === "income") setIncomeReportStatus("Ventas locales; actualización remota pendiente", "warning", "hard-drive");
+        return false;
+      }
+      state.incomeReport = state.incomeReport?.records?.length
+        ? { ...state.incomeReport, localOnly: true, error: String(error?.message || error) }
+        : localIncomeReport(filters, String(error?.message || error));
+      state.incomeFetchedAt = Date.now();
       renderIncomeReport();
       setIncomeReportStatus("Mostrando ventas disponibles en esta caja", "warning", "hard-drive");
       return false;
     } finally {
-      if (requestId === state.incomeRequestId) state.incomeLoading = false;
+      if (requestId === state.incomeRequestId) {
+        state.incomeLoading = false;
+        if (state.incomeReloadRequested) {
+          state.incomeReloadRequested = false;
+          window.setTimeout(() => void loadIncomeReport(), 0);
+        }
+      }
+    }
+  };
+
+  const refreshBackgroundReports = async ({ force = false } = {}) => {
+    const canCheckIncome = canAccessAdminSection("income");
+    const canCheckInventory = canAccessAdminSection("inventory");
+    const canCheckMovements = canAccessAdminSection("movements");
+    if ((!canCheckIncome && !canCheckInventory && !canCheckMovements) || !isAppsScriptConfigured() || !navigator.onLine) return false;
+    const now = Date.now();
+    if (state.backgroundReportSyncBusy) {
+      if (force) state.backgroundReportForcePending = true;
+      return false;
+    }
+    if (!force && now - state.backgroundReportCheckedAt < 5000) return false;
+    state.backgroundReportSyncBusy = true;
+    state.backgroundReportCheckedAt = now;
+    try {
+      const status = await readAppsScriptStatus(force);
+      if (!status?.ok) return false;
+      const hasIncomeRevision = Object.prototype.hasOwnProperty.call(status, "historyRevision");
+      const historyRevision = String(status.historyRevision || "");
+      const hasMovementRevision = Object.prototype.hasOwnProperty.call(status, "movementRevision");
+      const movementRevision = String(status.movementRevision || "");
+      const hasPendingReset = readAppsScriptOutbox().some((job) => job.action === "clear_income");
+      const needsAgeRefresh = !hasIncomeRevision && now - state.incomeFetchedAt >= 30000;
+      const refreshes = [];
+      if (canCheckIncome && !hasPendingReset && !state.incomeLoading
+        && (!state.incomeReport || needsAgeRefresh || (hasIncomeRevision && state.incomeRevision !== historyRevision))) {
+        refreshes.push(loadIncomeReport({ background: Boolean(state.incomeReport), force: true }));
+      }
+      if (hasMovementRevision && canCheckInventory && state.inventoryRevision !== movementRevision) {
+        refreshes.push(syncInventoryWithAppsScript().then((synced) => {
+          if (synced) state.inventoryRevision = movementRevision;
+          return synced;
+        }));
+      }
+      if (hasMovementRevision && canCheckMovements && state.movementRevision !== movementRevision) {
+        refreshes.push(loadInventoryMovements());
+      }
+      return (await Promise.all(refreshes)).some(Boolean);
+    } catch (error) {
+      return false;
+    } finally {
+      state.backgroundReportSyncBusy = false;
+      if (state.backgroundReportForcePending) {
+        state.backgroundReportForcePending = false;
+        window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+      }
     }
   };
 
   const resetSectionData = async (section) => {
-    if (state.currentUser?.role !== "admin") return;
+    if (!isManager()) return;
     const settings = {
       inventory: {
         eyebrow: "Reiniciar inventario",
         title: "¿Eliminar todo el inventario?",
-        message: "Se eliminarán todos los productos y sus existencias. Ingresos y movimientos conservarán su información.",
+        message: "Se eliminarán todos los productos y sus existencias. Ventas y movimientos conservarán su información.",
         action: "clear_inventory",
         success: "Inventario eliminado. Ya puedes empezar desde cero."
       },
@@ -5259,11 +6100,11 @@ const App = (() => {
         success: "Movimientos eliminados. El historial quedó en cero."
       },
       income: {
-        eyebrow: "Reiniciar ingresos",
-        title: "¿Eliminar todos los ingresos?",
+        eyebrow: "Reiniciar ventas",
+        title: "¿Eliminar todas las ventas?",
         message: "Se borrarán todas las ventas, pagos y totales históricos. El inventario actual no cambiará.",
         action: "clear_income",
-        success: "Ingresos eliminados. Todos los valores quedaron en cero."
+        success: "Ventas eliminadas. Todos los valores quedaron en cero."
       }
     }[section];
     if (!settings) return;
@@ -5325,6 +6166,7 @@ const App = (() => {
       if (section === "income") {
         state.incomeRequestId += 1;
         state.incomeLoading = false;
+        state.incomeRevision = "";
         state.invoiceHistory = [];
         state.lastPaidReceipt = null;
         persistInvoiceHistory();
@@ -5548,7 +6390,7 @@ const App = (() => {
   const exportIncomeCsv = () => {
     const records = state.incomeReport?.records || [];
     if (!records.length) {
-      toast("No hay ingresos para exportar con estos filtros.", "error", "empty-income-export");
+      toast("No hay ventas para exportar con estos filtros.", "error", "empty-income-export");
       return;
     }
     const safeCsv = (value) => {
@@ -5566,7 +6408,7 @@ const App = (() => {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `ingresos-${state.incomeReport.filters?.dateFrom || "inicio"}-${state.incomeReport.filters?.dateTo || "hoy"}.csv`;
+    link.download = `ventas-${state.incomeReport.filters?.dateFrom || "inicio"}-${state.incomeReport.filters?.dateTo || "hoy"}.csv`;
     link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
@@ -5723,7 +6565,7 @@ const App = (() => {
     const splitResult = $("#tipSplitResult");
     const resetButton = $("#resetTips");
     if (!kpis || !recordsBox || !peopleInput || !splitResult) return;
-    if (resetButton) resetButton.hidden = state.currentUser?.role !== "admin";
+    if (resetButton) resetButton.hidden = !isManager();
     const tipInvoices = state.invoiceHistory
       .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0 && !state.clearedTipInvoiceKeys.has(tipInvoiceKey(invoice)))
       .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
@@ -5755,7 +6597,7 @@ const App = (() => {
   };
 
   const resetTips = () => {
-    if (state.currentUser?.role !== "admin") return;
+    if (!isManager()) return;
     state.invoiceHistory
       .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0)
       .forEach((invoice) => state.clearedTipInvoiceKeys.add(tipInvoiceKey(invoice)));
@@ -6802,9 +7644,26 @@ const App = (() => {
     // Desde aqui todo lo visible cambia en el mismo click. La confirmacion de
     // Supabase sigue en segundo plano y Apps Script espera esa escritura.
     state.localSupabaseWrites += 1;
-    const closePromise = closeSession(session.id);
     applyPaidInventoryLocally(invoice, inventoryPlan);
     applyInvoiceToInventory(invoice);
+    // La venta, el inventario, los movimientos y la operacion remota deben
+    // quedar confirmados en IndexedDB antes de informar exito al usuario.
+    const savedLocally = await flushDurableWrites([
+      INVENTORY_STORAGE_KEY,
+      INVOICE_STORAGE_KEY,
+      INVENTORY_MOVEMENTS_STORAGE_KEY,
+      APPS_SCRIPT_OUTBOX_KEY
+    ]);
+    if (!savedLocally) {
+      rollbackLocalPayment({ invoice, inventoryBefore, incomeReportBefore });
+      state.localSupabaseWrites = Math.max(0, state.localSupabaseWrites - 1);
+      receiptWindow?.close();
+      buttons.forEach((button) => { button.disabled = false; });
+      state.paymentProcessing = false;
+      toast("No se pudo guardar el cobro en este equipo. Intenta de nuevo sin cerrar la aplicación.", "error", `payment-storage:${session.id}`);
+      return;
+    }
+    const closePromise = closeSession(session.id);
     $("#paymentDialog")?.close();
     renderInventory();
     renderInventoryMovements();
@@ -6957,6 +7816,34 @@ const App = (() => {
     refreshIcons();
   };
 
+  const formatConsumptionTimestamp = (value) => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const dateParts = new Intl.DateTimeFormat("es-CO", {
+      timeZone: "America/Bogota",
+      day: "numeric",
+      month: "short",
+      year: "numeric"
+    }).formatToParts(date).reduce((parts, part) => ({ ...parts, [part.type]: part.value }), {});
+    const dateText = `${dateParts.day} ${String(dateParts.month || "").replace(/\./g, "")} ${dateParts.year}`;
+    const timeText = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Bogota",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true
+    }).format(date).toLowerCase();
+    return `${dateText} · ${timeText}`;
+  };
+
+  const renderLastConsumptionTime = (session) => {
+    const target = $("#consumptionLastAdded");
+    if (!target) return;
+    const latest = newestSessionItems(session).find((item) => formatConsumptionTimestamp(item.created_at));
+    const formatted = formatConsumptionTimestamp(latest?.created_at || "");
+    target.hidden = !formatted;
+    target.textContent = formatted ? `Último consumo agregado: ${formatted}` : "";
+  };
+
   const renderTableConsumptionPreview = (session) => {
     const preview = $("#tableConsumptionPreview");
     const actions = $("#tableSessionActions");
@@ -6976,7 +7863,8 @@ const App = (() => {
       preview.innerHTML = "";
       return;
     }
-    preview.innerHTML = `<div class="table-consumption-preview-head"><span>Consumo actual</span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => `<div><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
+    const productCount = items.reduce((total, item) => total + Number(item.quantity || 0), 0);
+    preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
     setTableConsumptionPreviewVisible(false);
   };
 
@@ -7047,6 +7935,8 @@ const App = (() => {
     state.accountsRenderSignature = "";
     persistOfflineAdminSnapshot();
     renderAdminLive();
+    renderTableConsumptionPreview(optimisticSession);
+    renderLastConsumptionTime(optimisticSession);
     toast(`${drafts.length} ${drafts.length === 1 ? "producto agregado" : "productos agregados"} a la cuenta.`, "ok", `consumption-batch-optimistic:${optimisticSessionId}`);
 
     if (isLocalWalkInSession(session)) {
@@ -7191,29 +8081,74 @@ const App = (() => {
     }
     const drafts = [...state.consumptionDrafts];
     const quickCheckout = form.quick_checkout.value === "1";
+    const dialog = $("#consumptionDialog");
     form.dataset.localSubmitInProgress = "1";
+    dialog?.close();
+    let confirmed = false;
     try {
       const result = await addConsumptionBatch(form, drafts);
       if (!result) {
         state.consumptionDrafts = drafts;
         clearConsumptionEntry(form);
         renderConsumptionSelection();
+        dialog?.showModal();
         return null;
       }
+      confirmed = true;
       state.consumptionDrafts = [];
       renderConsumptionSelection();
       const sessionId = result.sessionId;
       clearConsumptionEntry(form);
       if (quickCheckout) {
-        $("#consumptionDialog")?.close();
         openPaymentDialog(sessionId);
-      } else {
-        $("#consumptionProductSearch")?.focus({ preventScroll: true });
       }
       return sessionId;
+    } catch (error) {
+      if (!confirmed) {
+        state.consumptionDrafts = drafts;
+        renderConsumptionSelection();
+        if (dialog && !dialog.open) dialog.showModal();
+      }
+      throw error;
     } finally {
       delete form.dataset.localSubmitInProgress;
     }
+  };
+
+  const bindConsumptionConfirmShortcut = () => {
+    const dialog = $("#consumptionDialog");
+    const form = $("#consumptionForm");
+    const submit = $("#consumptionSubmitButton");
+    if (!dialog || !form || !submit) return;
+    let lastSpaceAt = 0;
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== " " || event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) {
+        lastSpaceAt = 0;
+        return;
+      }
+      if (!dialog.open || form.session_item_id.value || submit.disabled) {
+        lastSpaceAt = 0;
+        return;
+      }
+      const target = event.target;
+      if (target !== document.body && target !== document && !dialog.contains(target)) {
+        lastSpaceAt = 0;
+        return;
+      }
+      const emptySearch = target === $("#consumptionProductSearch") && !target.value.trim();
+      const quantity = target === form.quantity;
+      const neutralFocus = !target?.closest?.('input, textarea, select, button, a[href], summary, [contenteditable], [role="button"]');
+      if ((!emptySearch && !quantity && !neutralFocus) || (!state.consumptionDrafts.length && !currentConsumptionDraft(form, { quiet: true }))) {
+        lastSpaceAt = 0;
+        return;
+      }
+      const now = Date.now();
+      const doubleSpace = now - lastSpaceAt <= 500;
+      event.preventDefault();
+      lastSpaceAt = doubleSpace ? 0 : now;
+      if (doubleSpace) submit.click();
+    });
+    dialog.addEventListener("close", () => { lastSpaceAt = 0; });
   };
 
   const openConsumptionDialog = (sessionId = "", { pendingTableId = "", quickCheckout = false } = {}) => {
@@ -7244,6 +8179,7 @@ const App = (() => {
     if ($("#consumptionQueueButton")) $("#consumptionQueueButton").hidden = false;
     renderConsumptionSelection();
     renderTableConsumptionPreview(session);
+    renderLastConsumptionTime(session);
     closeConsumptionProductOptions();
     dialog.showModal();
     window.setTimeout(() => {
@@ -7891,7 +8827,7 @@ const App = (() => {
     });
     $("#incomeSearch")?.addEventListener("input", () => {
       clearTimeout(state.incomeSearchTimer);
-      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 120);
+      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 400);
     });
     $("#incomePaymentMethod")?.addEventListener("change", () => void loadIncomeReport());
     [$("#incomeDateFrom"), $("#incomeDateTo")].filter(Boolean).forEach((input) => input.addEventListener("change", () => {
@@ -7927,10 +8863,34 @@ const App = (() => {
       state.movementTypeFilter = event.currentTarget.value || "all";
       renderInventoryMovements();
     });
+    $("#purchaseFilters")?.addEventListener("submit", (event) => event.preventDefault());
+    $("#purchaseSearch")?.addEventListener("input", (event) => {
+      state.purchaseSearch = event.currentTarget.value;
+      renderPurchaseHistory();
+    });
+    $("#purchaseProductFilter")?.addEventListener("change", (event) => {
+      state.purchaseProductFilter = event.currentTarget.value || "all";
+      renderPurchaseHistory();
+    });
+    $("#purchaseDateFrom")?.addEventListener("change", (event) => {
+      state.purchaseDateFrom = event.currentTarget.value;
+      renderPurchaseHistory();
+    });
+    $("#purchaseDateTo")?.addEventListener("change", (event) => {
+      state.purchaseDateTo = event.currentTarget.value;
+      renderPurchaseHistory();
+    });
+    $("#purchaseHistoryList")?.addEventListener("input", (event) => {
+      const input = event.target.closest("[data-purchase-unit-cost]");
+      if (!input) return;
+      const total = input.closest(".purchase-record")?.querySelector("[data-purchase-total]");
+      if (total) total.textContent = money(currencyInputNumber(input) * Number(input.dataset.purchaseQuantity || 0));
+    });
     $("#consumptionForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
       await confirmConsumptionSelection(event.currentTarget);
     });
+    bindConsumptionConfirmShortcut();
     $("#consumptionForm")?.elements.quantity?.addEventListener("keydown", (event) => {
       if (event.key !== "Enter") return;
       event.preventDefault();
@@ -8160,7 +9120,7 @@ const App = (() => {
         const section = navLink.getAttribute("href")?.replace("#", "") || "dashboard";
         history.replaceState(null, "", `#${section}`);
         showAdminSection(section);
-        if (section === "users" && state.currentUser?.role === "admin") {
+        if (section === "users" && isBoss()) {
           void loadUsers().then(renderUsers);
         }
         document.documentElement.scrollTop = 0;
@@ -8184,6 +9144,14 @@ const App = (() => {
 
       const target = event.target.closest("button");
       if (!target) return;
+      if (target.dataset.toggleUserPin !== undefined) {
+        toggleUserPinVisibility(target);
+        return;
+      }
+      if (target.dataset.shareUser) {
+        await shareUserCredentials(target.dataset.shareUser);
+        return;
+      }
       if (target.id === "enableSound") {
         if (state.soundEnabled) {
           if (await confirmDisableAlarm()) disableAlarm();
@@ -8220,29 +9188,88 @@ const App = (() => {
       if (target.id === "downloadSelectedQrs") await downloadSelectedQrs();
       if (target.id === "syncAppsScriptInventory") {
         await runRefreshAction(target, async () => {
-          if (!await refreshOperationalDataNow()) return false;
-          const flushed = await flushAppsScriptOutbox();
-          if (!flushed || readAppsScriptOutbox().length) return false;
-          const coreRefreshed = await refreshCoreNow();
-          const inventoryRefreshed = await syncInventoryWithAppsScript();
-          return coreRefreshed && inventoryRefreshed;
+          await flushAppsScriptOutbox();
+          await refreshCoreNow();
+          return syncInventoryWithAppsScript();
         }, "Inventario actualizado con la información más reciente.");
       }
       if (target.dataset.incomeRange) setIncomeRange(target.dataset.incomeRange);
+      if (target.hasAttribute("data-show-more-income")) {
+        state.incomeVisibleCount += 60;
+        renderIncomeReport();
+      }
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
       if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => {
-        if (!await refreshOperationalDataNow()) return false;
-        return (await loadIncomeReport()) || !navigator.onLine;
-      }, "Ingresos actualizados.");
+        return (await loadIncomeReport({ force: true })) || !navigator.onLine;
+      }, "Ventas actualizadas.");
       if (target.id === "exportIncomeCsv") exportIncomeCsv();
+      if (target.id === "openPurchases") await openPurchaseHistory();
+      if (target.dataset.savePurchaseCost) savePurchaseUnitCost(target);
+      if (target.dataset.hidePurchase) {
+        const movementId = String(target.dataset.hidePurchase);
+        const movement = state.inventoryMovements.find((entry) => String(entry.movementId) === movementId);
+        if (!movement || !await askForConfirmation({
+          eyebrow: "Quitar compra de la lista",
+          title: "¿Quitar este registro de compras?",
+          message: "El registro solo se ocultará en este modal y en este dispositivo. El inventario, las existencias y el movimiento original no cambiarán.",
+          accept: "Sí, quitar de la lista",
+          cancel: "Conservar registro"
+        })) return;
+        try {
+          const hiddenIds = hiddenPurchaseMovementIds();
+          hiddenIds.add(movementId);
+          localStorage.setItem(HIDDEN_PURCHASE_MOVEMENTS_KEY, JSON.stringify([...hiddenIds]));
+        } catch {
+          toast("No se pudo quitar el registro de compras en este dispositivo.", "error");
+          return;
+        }
+        renderPurchaseHistory();
+        toast("Registro quitado de la lista. El inventario no cambió.");
+      }
+      if (target.id === "clearPurchaseHistory") {
+        if (!await askForConfirmation({
+          eyebrow: "Limpiar historial de compras",
+          title: "¿Eliminar todas las compras de esta lista?",
+          message: "Se ocultarán de este modal las compras registradas hasta ahora. El inventario y los movimientos no cambiarán. Las próximas unidades agregadas aparecerán aquí.",
+          accept: "Sí, limpiar lista",
+          cancel: "Conservar lista"
+        })) return;
+        try {
+          localStorage.setItem(PURCHASE_HISTORY_CUTOFF_KEY, new Date().toISOString());
+        } catch {
+          toast("No se pudo limpiar la lista de compras en este dispositivo.", "error");
+          return;
+        }
+        state.purchaseSearch = "";
+        state.purchaseProductFilter = "all";
+        state.purchaseDateFrom = "";
+        state.purchaseDateTo = "";
+        if ($("#purchaseSearch")) $("#purchaseSearch").value = "";
+        if ($("#purchaseProductFilter")) $("#purchaseProductFilter").value = "all";
+        if ($("#purchaseDateFrom")) $("#purchaseDateFrom").value = "";
+        if ($("#purchaseDateTo")) $("#purchaseDateTo").value = "";
+        renderPurchaseProductOptions();
+        renderPurchaseHistory();
+        toast("Lista de compras limpia. El inventario no cambió.");
+      }
+      if (target.id === "clearPurchaseFilters") {
+        state.purchaseSearch = "";
+        state.purchaseProductFilter = "all";
+        state.purchaseDateFrom = "";
+        state.purchaseDateTo = "";
+        if ($("#purchaseSearch")) $("#purchaseSearch").value = "";
+        if ($("#purchaseProductFilter")) $("#purchaseProductFilter").value = "all";
+        if ($("#purchaseDateFrom")) $("#purchaseDateFrom").value = "";
+        if ($("#purchaseDateTo")) $("#purchaseDateTo").value = "";
+        renderPurchaseHistory();
+      }
       if (target.id === "newInventoryProduct") resetInventoryForm({ open: true });
       if (target.id === "cancelInventoryEdit") {
         resetInventoryForm();
         $("#inventoryDialog")?.close();
       }
       if (target.id === "refreshInventoryMovements") await runRefreshAction(target, async () => {
-        if (!await refreshOperationalDataNow()) return false;
         if (!navigator.onLine) {
           renderInventoryMovements();
           return true;
@@ -8377,6 +9404,11 @@ const App = (() => {
       .on("postgres_changes", { event: "*", schema: "public", table: "restaurant_tables" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "menu_categories" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "menu_items" }, () => void refreshCoreNow())
+      .on("postgres_changes", { event: "*", schema: "public", table: "app_users" }, () => {
+        if (isBoss()) void loadUsers().then(() => {
+          if (state.activeAdminSection === "users") renderUsers();
+        });
+      })
       .subscribe((status) => {
         if (status === "SUBSCRIBED") setRealtimeStatus("En vivo", "live");
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
@@ -8742,7 +9774,7 @@ const App = (() => {
     document.body.dataset.userRole = state.currentUser?.role || "";
     const displayName = state.currentUser?.full_name || "Sin sesión";
     $("#currentUserName") && ($("#currentUserName").textContent = displayName);
-    $("#currentUserRole") && ($("#currentUserRole").textContent = state.currentUser?.role === "admin" ? "Administrador" : "Mesero");
+    $("#currentUserRole") && ($("#currentUserRole").textContent = roleLabel(state.currentUser?.role));
     $("#currentUserInitials") && ($("#currentUserInitials").textContent = state.currentUser
       ? displayName.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part.charAt(0)).join("").toUpperCase()
       : "TN");
@@ -8752,40 +9784,43 @@ const App = (() => {
   const ADMIN_USER_CACHE_KEY = "la_licorera_17_admin_user_v1";
 
   const waitForAdminLogin = async () => {
-    const storedToken = localStorage.getItem("la_licorera_17_admin_token") || "";
+    const storedToken = sessionStorage.getItem("la_licorera_17_admin_token") || "";
+    localStorage.removeItem("la_licorera_17_admin_token");
     let cachedUser = null;
     try { cachedUser = JSON.parse(localStorage.getItem(ADMIN_USER_CACHE_KEY) || "null"); } catch (error) { /* cache opcional */ }
-    if (storedToken && cachedUser?.id) {
-      state.authToken = storedToken;
-      state.currentUser = cachedUser;
-      state.sb.setAuthToken(storedToken);
-      applyCurrentUser();
-      void state.sb.rpc("getCurrentUser", { auth_token: storedToken }).then(({ data, error }) => {
-        if (data) {
-          state.currentUser = data;
-          localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(data));
-          applyCurrentUser();
-          return;
-        }
-        if (error && /sesion vencida|autenticacion requerida|usuario inactivo/i.test(String(error.message || ""))) {
-          localStorage.removeItem("la_licorera_17_admin_token");
-          localStorage.removeItem(ADMIN_USER_CACHE_KEY);
-          location.reload();
-        }
-      }).catch(() => undefined);
-      return true;
-    }
     if (storedToken) {
-      const user = await dbQuiet(state.sb.rpc("getCurrentUser", { auth_token: storedToken }), null);
+      state.authToken = storedToken;
+      state.sb.setAuthToken(storedToken);
+      if (!navigator.onLine && cachedUser?.id) {
+        state.currentUser = cachedUser;
+        applyCurrentUser();
+        return true;
+      }
+      let user = null;
+      let validationError = null;
+      try {
+        const validation = await state.sb.rpc("getCurrentUser", { auth_token: storedToken });
+        user = validation.data;
+        validationError = validation.error;
+      } catch (error) {
+        validationError = error;
+      }
       if (user) {
-        state.authToken = storedToken;
         state.currentUser = user;
-        state.sb.setAuthToken(storedToken);
         localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(user));
         applyCurrentUser();
         return true;
       }
-      localStorage.removeItem("la_licorera_17_admin_token");
+      const rejected = /sesion vencida|autenticacion requerida|usuario inactivo/i.test(String(validationError?.message || validationError || ""));
+      if (!rejected && cachedUser?.id) {
+        state.currentUser = cachedUser;
+        applyCurrentUser();
+        return true;
+      }
+      state.authToken = "";
+      state.currentUser = null;
+      state.sb.setAuthToken("");
+      sessionStorage.removeItem("la_licorera_17_admin_token");
       localStorage.removeItem(ADMIN_USER_CACHE_KEY);
     }
 
@@ -8848,7 +9883,7 @@ const App = (() => {
         state.authToken = session.token;
         state.currentUser = session.user;
         state.sb.setAuthToken(session.token);
-        localStorage.setItem("la_licorera_17_admin_token", session.token);
+        sessionStorage.setItem("la_licorera_17_admin_token", session.token);
         localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(session.user));
         applyCurrentUser();
         setLoading(true);
@@ -8858,7 +9893,8 @@ const App = (() => {
   };
 
   const sortUsers = (users) => [...users].sort((left, right) => {
-    const roleOrder = (left.role === "admin" ? 0 : 1) - (right.role === "admin" ? 0 : 1);
+    const rank = (role) => ({ boss: 0, admin: 1, waiter: 2 }[role] ?? 3);
+    const roleOrder = rank(left.role) - rank(right.role);
     return roleOrder || String(left.full_name || "").localeCompare(String(right.full_name || ""), "es");
   });
 
@@ -8868,55 +9904,131 @@ const App = (() => {
     return sortUsers([...usersById.values()]);
   };
 
-  const persistUsersCache = () => {
-    try {
-      localStorage.setItem(USER_LIST_CACHE_KEY, JSON.stringify(state.users));
-    } catch (error) { /* La lista remota sigue siendo la fuente principal. */ }
+  const persistUsersCache = () => persistDurableJson(USER_LIST_CACHE_KEY, state.users);
+
+  // Solo se conocen los PIN que fueron creados o cambiados en este dispositivo.
+  // El backend conserva hashes y no permite recuperar una clave anterior.
+  const persistUserCredentialPins = () => {
+    try { localStorage.setItem(USER_CREDENTIALS_CACHE_KEY, JSON.stringify(state.userCredentialPins)); }
+    catch (_) { /* El PIN permanece disponible durante esta sesion. */ }
   };
 
-  const loadUsers = async () => {
+  const copyTextToClipboard = async (value) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+    const field = document.createElement("textarea");
+    field.value = value;
+    field.setAttribute("readonly", "");
+    field.style.position = "fixed";
+    field.style.opacity = "0";
+    document.body.appendChild(field);
+    try {
+      field.select();
+      if (!document.execCommand("copy")) throw new Error("clipboard_unavailable");
+    } finally {
+      field.remove();
+    }
+  };
+
+  const shareUserCredentials = async (id) => {
+    if (!isBoss()) return;
+    const user = state.users.find((entry) => String(entry.id) === String(id));
+    if (!user) return;
+    const pin = String(state.userCredentialPins[user.id] || "");
+    if (!pin) {
+      editUser(user.id);
+      toast("Por seguridad el PIN anterior no se puede recuperar. Escribe uno nuevo, guarda y luego copia el acceso.", "error", `missing-user-pin:${user.id}`);
+      return;
+    }
+    const accessUrl = new URL("admin.html", location.href);
+    accessUrl.search = "";
+    accessUrl.hash = "";
+    const localOnly = ["localhost", "127.0.0.1", "::1"].includes(accessUrl.hostname) || accessUrl.protocol === "file:";
+    const message = [
+      "✨ Tu acceso a Tienda Nápoles",
+      "",
+      `Hola ${user.full_name}, estas son tus credenciales:`,
+      ...(!localOnly ? [`🔗 Enlace: ${accessUrl.href}`] : []),
+      `👤 Usuario: ${user.username}`,
+      `🔐 PIN: ${pin}`,
+      "",
+      "Guarda este mensaje en un lugar seguro."
+    ].join("\n");
+    try {
+      await copyTextToClipboard(message);
+      toast(`Acceso de ${user.full_name} copiado para compartir.`, "ok", `credentials-copied:${user.id}`);
+    } catch (_) {
+      toast("No fue posible copiar las credenciales en este dispositivo.", "error", `credentials-copy-failed:${user.id}`);
+    }
+  };
+
+  let usersLoadPromise = null;
+  const loadUsers = () => {
+    if (usersLoadPromise) return usersLoadPromise;
+    usersLoadPromise = (async () => {
     const cachedUsers = readLocalJson(USER_LIST_CACHE_KEY, []);
     const fallbackUsers = mergeUsers(Array.isArray(cachedUsers) ? cachedUsers : [], state.users, state.currentUser ? [state.currentUser] : []);
-    if (state.currentUser?.role !== "admin") {
+    if (!isBoss()) {
       state.users = mergeUsers(state.currentUser ? [state.currentUser] : []);
-      return;
+      state.syncFresh.users = false;
+      renderUsers();
+      return false;
     }
     state.users = fallbackUsers;
     renderUsers();
-    let remoteUsers = [];
     try {
       const { data, error } = await state.sb.rpc("listUsers", { auth_token: state.authToken });
       if (error) throw error;
-      remoteUsers = Array.isArray(data) ? data : Array.isArray(data?.users) ? data.users : [];
+      const remoteUsers = Array.isArray(data) ? data : Array.isArray(data?.users) ? data.users : null;
+      if (!remoteUsers?.length) throw new Error("La lista remota de usuarios no está disponible.");
+      state.users = mergeUsers(state.currentUser ? [state.currentUser] : [], remoteUsers);
+      const current = remoteUsers.find((user) => String(user.id) === String(state.currentUser?.id));
+      if (current) {
+        state.currentUser = { ...state.currentUser, ...current };
+        try { localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(state.currentUser)); } catch (_) { /* IndexedDB conserva la lista. */ }
+        applyCurrentUser();
+      }
+      state.syncFresh.users = true;
+      void persistUsersCache();
+      renderUsers();
+      void updateGlobalSyncStatus();
+      return true;
     } catch (error) {
-      remoteUsers = [];
+      state.users = fallbackUsers;
+      state.syncFresh.users = false;
+      renderUsers();
+      void updateGlobalSyncStatus();
+      return false;
     }
-    state.users = remoteUsers.length
-      ? mergeUsers(state.currentUser ? [state.currentUser] : [], remoteUsers)
-      : fallbackUsers;
-    if (remoteUsers.length) persistUsersCache();
+    })().finally(() => { usersLoadPromise = null; });
+    return usersLoadPromise;
   };
 
   const renderUsers = () => {
     const list = $("#usersList");
     if (!list) return;
+    const signature = JSON.stringify(state.users.map((user) => [user.id, user.full_name, user.username, user.role, user.is_active, user.permissions]));
+    if (signature === state.usersRenderSignature) return;
+    state.usersRenderSignature = signature;
     const badge = $("#usersCountBadge");
     if (badge) badge.innerHTML = `${icon("users-round", 16)} ${state.users.length} ${state.users.length === 1 ? "usuario" : "usuarios"}`;
     list.innerHTML = state.users.length
       ? state.users.map((user) => `
           <article class="user-card ${user.is_active === false ? "is-disabled" : ""}">
-            <div class="user-avatar">${icon(user.role === "admin" ? "shield-check" : "user-round", 20)}</div>
+            <div class="user-avatar">${icon(user.role === "boss" ? "crown" : user.role === "admin" ? "shield-check" : "user-round", 20)}</div>
             <div class="user-card-copy">
               <div class="user-card-name"><strong>${escapeHTML(user.full_name)}</strong>${String(user.id) === String(state.currentUser?.id) ? '<span class="current-user-badge">Sesión actual</span>' : ""}</div>
               <span>@${escapeHTML(user.username)}</span>
-              <div class="user-card-badges"><em>${user.role === "admin" ? "Administrador" : "Mesero"}</em><em class="${user.is_active === false ? "is-off" : "is-on"}">${user.is_active === false ? "Sin acceso" : "Acceso activo"}</em></div>
+              <div class="user-card-badges"><em>${roleLabel(user.role)}</em><em class="${user.is_active === false ? "is-off" : "is-on"}">${user.is_active === false ? "Sin acceso" : "Acceso activo"}</em></div>
             </div>
             <label class="user-access-switch" title="${user.is_active === false ? "Dar acceso" : "Quitar acceso"}">
               <span>Acceso</span>
               <input type="checkbox" data-user-access="${user.id}" ${user.is_active === false ? "" : "checked"} aria-label="${user.is_active === false ? "Dar acceso" : "Quitar acceso"} a ${escapeHTML(user.full_name)}">
               <span class="user-access-track" aria-hidden="true"></span>
             </label>
-            <div class="row-actions user-row-actions"><button class="icon-btn" data-edit-user="${user.id}" title="Editar" aria-label="Editar usuario">${icon("pencil", 16)}</button><button class="icon-btn danger" data-delete-user="${user.id}" title="Eliminar" aria-label="Eliminar usuario">${icon("trash-2", 16)}</button></div>
+            <div class="row-actions user-row-actions"><button class="icon-btn user-share-access" data-share-user="${user.id}" title="Copiar credenciales de acceso" aria-label="Copiar acceso de ${escapeHTML(user.full_name)}">${icon("copy", 16)} <span>Copiar acceso</span></button><button class="icon-btn" data-edit-user="${user.id}" title="Editar" aria-label="Editar usuario">${icon("pencil", 16)}</button><button class="icon-btn danger" data-delete-user="${user.id}" title="Eliminar" aria-label="Eliminar usuario">${icon("trash-2", 16)}</button></div>
           </article>`).join("")
       : emptyState("Sin usuarios", "Crea el equipo operativo.", "users");
     refreshIcons();
@@ -8928,9 +10040,32 @@ const App = (() => {
     if ($("#userFormTitle")) $("#userFormTitle").textContent = "Agregar integrante";
     const label = form.querySelector('.user-save-button span');
     if (label) label.textContent = "Guardar usuario";
+    resetUserPinVisibility(form);
+  };
+
+  const resetUserPinVisibility = (form) => {
+    if (form.pin) form.pin.type = "password";
+    const button = form.querySelector("[data-toggle-user-pin]");
+    if (!button) return;
+    button.title = "Mostrar PIN";
+    button.setAttribute("aria-label", "Mostrar PIN");
+    button.innerHTML = icon("eye-off", 18);
+    refreshIcons();
+  };
+
+  const toggleUserPinVisibility = (button) => {
+    const pin = button.closest("form")?.elements.pin;
+    if (!pin) return;
+    const visible = pin.type === "text";
+    pin.type = visible ? "password" : "text";
+    button.title = visible ? "Mostrar PIN" : "Ocultar PIN";
+    button.setAttribute("aria-label", button.title);
+    button.innerHTML = icon(visible ? "eye-off" : "eye", 18);
+    refreshIcons();
   };
 
   const toggleUserAccess = async (id, nextActive, control) => {
+    if (!isBoss()) return;
     const user = state.users.find((entry) => String(entry.id) === String(id));
     if (!user || (user.is_active !== false) === nextActive) return;
     if (String(user.id) === String(state.currentUser?.id) && !nextActive) {
@@ -8949,7 +10084,10 @@ const App = (() => {
         username: user.username,
         pin: "",
         role: user.role,
-        is_active: nextActive
+        is_active: nextActive,
+        permissions: user.role === "admin"
+          ? (Array.isArray(user.permissions) ? user.permissions : ADMIN_SECTION_KEYS)
+          : []
       });
       saved = result.data;
       saveError = result.error;
@@ -8971,7 +10109,9 @@ const App = (() => {
   };
 
   const saveUser = async (form) => {
+    if (!isBoss()) return;
     const isEditing = Boolean(form.user_id.value);
+    const previousUser = state.users.find((user) => String(user.id) === String(form.user_id.value));
     const fullName = form.full_name.value.trim();
     const username = form.username.value.trim().toLowerCase();
     const pin = form.pin.value.trim();
@@ -8986,7 +10126,10 @@ const App = (() => {
       username,
       pin,
       role: form.role.value,
-      is_active: form.is_active.checked
+      is_active: form.is_active.checked,
+      permissions: form.role.value === "admin"
+        ? (Array.isArray(previousUser?.permissions) ? previousUser.permissions : ADMIN_SECTION_KEYS)
+        : []
     };
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
@@ -9006,6 +10149,10 @@ const App = (() => {
       return;
     }
     state.users = mergeUsers(state.users.map((user) => String(user.id) === String(saved.id) ? saved : user), [saved]);
+    if (pin) {
+      state.userCredentialPins[saved.id] = pin;
+      persistUserCredentialPins();
+    }
     persistUsersCache();
     if (String(saved.id) === String(state.currentUser?.id)) {
       state.currentUser = saved;
@@ -9022,6 +10169,7 @@ const App = (() => {
   };
 
   const editUser = (id) => {
+    if (!isBoss()) return;
     const user = state.users.find((entry) => entry.id === id);
     const form = $("#userForm");
     if (!user || !form) return;
@@ -9029,6 +10177,7 @@ const App = (() => {
     form.full_name.value = user.full_name || "";
     form.username.value = user.username || "";
     form.pin.value = "";
+    resetUserPinVisibility(form);
     form.pin.placeholder = "Dejar vacío para conservar";
     form.role.value = user.role || "waiter";
     form.is_active.checked = user.is_active !== false;
@@ -9040,6 +10189,7 @@ const App = (() => {
   };
 
   const deleteUser = async (id) => {
+    if (!isBoss()) return;
     const user = state.users.find((entry) => entry.id === id);
     if (!user) return;
     if (String(user.id) === String(state.currentUser?.id)) {
@@ -9061,6 +10211,8 @@ const App = (() => {
       return;
     }
     state.users = state.users.filter((entry) => entry.id !== id);
+    delete state.userCredentialPins[id];
+    persistUserCredentialPins();
     persistUsersCache();
     renderUsers();
     const form = $("#userForm");
@@ -9079,7 +10231,7 @@ const App = (() => {
     state.authToken = "";
     state.currentUser = null;
     state.sb.setAuthToken("");
-    localStorage.removeItem("la_licorera_17_admin_token");
+    sessionStorage.removeItem("la_licorera_17_admin_token");
     localStorage.removeItem(ADMIN_USER_CACHE_KEY);
     applyCurrentUser();
     void dbQuiet(state.sb.rpc("logout", { auth_token: token }), null);
@@ -9088,8 +10240,16 @@ const App = (() => {
 
   const initAdmin = async () => {
     setLoading(true);
+    const launchUrl = new URL(location.href);
+    if (launchUrl.searchParams.has("forceLogin")) {
+      sessionStorage.removeItem("la_licorera_17_admin_token");
+      launchUrl.searchParams.delete("forceLogin");
+      history.replaceState(null, "", `${launchUrl.pathname}${launchUrl.search}${launchUrl.hash}`);
+    }
     const pendingScan = new URLSearchParams(location.search).get("scan") || "";
     await waitForAdminLogin();
+    const cachedPins = readLocalJson(USER_CREDENTIALS_CACHE_KEY, {});
+    state.userCredentialPins = cachedPins && typeof cachedPins === "object" && !Array.isArray(cachedPins) ? cachedPins : {};
     loadInventoryStore();
     void loadUsers().then(renderUsers);
     state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") === "1";
@@ -9110,7 +10270,10 @@ const App = (() => {
     renderTableFormQr();
     initRemoteStorage();
     startRemoteStoragePolling();
-    window.addEventListener("online", () => { void refreshRemoteStorageNow(); });
+    window.addEventListener("online", () => {
+      void refreshRemoteStorageNow();
+      void refreshBackgroundReports({ force: true });
+    });
     startAdminPolling();
     if (pendingScan) {
       const cleanUrl = new URL(location.href);
@@ -9123,16 +10286,30 @@ const App = (() => {
   };
 
   const init = async () => {
+    document.addEventListener("wheel", (event) => {
+      const input = event.target instanceof Element ? event.target.closest('input[type="number"]') : null;
+      if (!input || document.activeElement !== input) return;
+      event.preventDefault();
+      input.blur();
+    }, { capture: true, passive: false });
     state.page = document.body.dataset.page || "";
+    await hydrateDurableLocalState();
+    await recoverInterruptedAppsScriptJobs();
     await registerPwa();
     await waitForPwaController();
     reportNetworkStatus();
     navigator.serviceWorker?.ready.then(startOfflineSyncPulse).catch(() => undefined);
     window.addEventListener("online", () => {
       reportNetworkStatus(true);
-      void synchronizeAfterReconnect();
+      void synchronizeAfterReconnect("online");
     });
-    window.addEventListener("offline", () => reportNetworkStatus(false));
+    window.addEventListener("offline", () => {
+      reportNetworkStatus(false);
+      void updateGlobalSyncStatus();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) void synchronizeAfterReconnect("foreground");
+    });
     navigator.serviceWorker?.addEventListener("message", (event) => {
       if (event.data?.type === "OFFLINE_SESSION_REMAPPED") {
         applyOfflineSessionRemap(event.data);
@@ -9152,6 +10329,9 @@ const App = (() => {
         if (state.page === "admin") {
           await refreshAdminNow();
           await flushAppsScriptOutbox();
+          await refreshRemoteStorageNow();
+          if (isBoss()) await loadUsers();
+          showAdminSection(state.activeAdminSection || "dashboard");
         }
         if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
       })();
@@ -9184,6 +10364,9 @@ const App = (() => {
     }
     if (state.page === "admin") await initAdmin();
     if (state.page === "client") await initClient();
+    // El evento `online` no se dispara cuando la aplicacion ya abre con red.
+    // Esta reconciliacion inicial garantiza que se descargue el ultimo estado.
+    void synchronizeAfterReconnect("startup");
     refreshIcons();
   };
 

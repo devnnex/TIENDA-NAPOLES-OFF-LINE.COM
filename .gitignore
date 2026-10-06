@@ -1,2 +1,5 @@
 __pycache__/
 offline-icon.png
+_backups/
+packaging/build/
+dist/Tienda-Napoles-Offline-Setup-1.0.0.exe

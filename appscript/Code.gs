@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.7.0",
+  version: "2.11.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -24,8 +24,7 @@ var APP = {
     details: "Detalle_Ventas",
     payments: "Pagos",
     movements: "Movimientos_Inventario",
-    daily: "Ingresos_Diarios",
-    operations: "Operaciones_Sync"
+    daily: "Ingresos_Diarios"
   }
 };
 
@@ -55,8 +54,7 @@ var HEADERS = {
     "fecha", "numero_ventas", "ingreso_bruto", "efectivo", "transferencia", "bre_b",
     "descuentos", "impuestos", "servicio", "costo_mercancia", "utilidad_bruta", "actualizado_en",
     "ventas_procesadas"
-  ],
-  operations: ["operation_id", "accion", "estado", "creado_en"]
+  ]
 };
 
 function onOpen() {
@@ -139,66 +137,89 @@ function apiRequest(payloadText) {
     }
     validateOrigin_(request.origin);
     if (request.action === "status") {
-      return { ok: true, version: APP.version, configured: isConfigured_() };
+      var revisionProperties = PropertiesService.getScriptProperties();
+      return {
+        ok: true,
+        version: APP.version,
+        configured: isConfigured_(),
+        historyRevision: revisionProperties.getProperty("TN_HISTORY_REVISION") || "",
+        movementRevision: revisionProperties.getProperty("TN_MOVEMENT_REVISION") || ""
+      };
     }
     var user = validateSupabaseUser_(request.authToken);
     var payload = request.payload || {};
-    var operationId = String(request.operationId || "").trim();
-    if (operationId && syncOperationExists_(operationId)) {
-      return { ok: true, duplicate: true, operationId: operationId };
-    }
     var result;
     if (request.action === "get_inventory") result = getInventory_();
     else if (request.action === "get_inventory_movements") {
-      requireAdmin_(user);
-      result = getInventoryMovements_(payload.limit);
+      requireSection_(user, "movements");
+      result = getInventoryMovements_(payload.limit, payload.cursor, payload.revision);
     }
     else if (request.action === "get_income_report") {
-      requireAdmin_(user);
+      requireSection_(user, "income");
       result = getIncomeReport_(payload.filters || {});
     }
-    else if (request.action === "record_sale") result = recordSale_(payload.invoice, user, request.authToken);
+    else if (request.action === "record_sale") {
+      requireManager_(user);
+      result = recordSale_(payload.invoice, user, request.authToken);
+    }
     else if (request.action === "edit_sale") {
-      requireAdmin_(user);
-      result = editSale_(payload.invoice, user, operationId);
+      requireBoss_(user);
+      result = editSale_(payload.invoice, user);
     }
     else if (request.action === "delete_sale") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = deleteSale_(payload.saleId, user);
     }
-    else if (request.action === "adjust_inventory") result = adjustInventory_(payload.adjustment, user);
+    else if (request.action === "adjust_inventory") {
+      requireSection_(user, "inventory");
+      result = adjustInventory_(payload.adjustment, user);
+    }
+    else if (request.action === "update_inventory_movement_cost") {
+      requireSection_(user, "inventory");
+      result = updateInventoryMovementCost_(payload.movementId, payload.unitCost, user);
+    }
     else if (request.action === "set_inventory_stock") {
-      requireAdmin_(user);
+      requireSection_(user, "inventory");
       result = setInventoryStock_(payload, user);
     }
     else if (request.action === "delete_inventory") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = deleteInventory_(payload.productId, user);
     }
     else if (request.action === "clear_inventory") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = clearInventory_(user, request.authToken);
     }
     else if (request.action === "clear_inventory_movements") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = clearInventoryMovements_(user);
     }
     else if (request.action === "clear_income") {
-      requireAdmin_(user);
+      requireBoss_(user);
       result = clearIncome_(user);
     }
     else if (request.action === "upsert_inventory") {
-      requireAdmin_(user);
+      requireSection_(user, "inventory");
       result = upsertInventory_(payload.item, user);
     } else if (request.action === "sync_inventory") {
-      requireAdmin_(user);
+      requireSection_(user, "inventory");
       result = syncInventory_(payload.items || [], user);
     } else {
       throw new Error("Accion no permitida: " + request.action);
     }
     if (result && result.ok === false) return result;
+    if (["record_sale", "edit_sale", "delete_sale", "clear_income"].indexOf(request.action) >= 0
+        && !result.duplicate && result.deleted !== false) {
+      PropertiesService.getScriptProperties().setProperty("TN_HISTORY_REVISION", String(new Date().getTime()) + "-" + Math.random());
+    }
+    if (["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "record_sale", "edit_sale", "delete_sale", "clear_inventory_movements"].indexOf(request.action) >= 0
+        && !result.duplicate && result.deleted !== false) {
+      PropertiesService.getScriptProperties().setProperty("TN_MOVEMENT_REVISION", String(new Date().getTime()) + "-" + Math.random());
+    }
+    if (["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].indexOf(request.action) >= 0) {
+      PropertiesService.getScriptProperties().setProperty("TN_INVENTORY_INITIALIZED", "1");
+    }
     result.ok = true;
-    if (operationId) recordSyncOperation_(operationId, request.action);
     return result;
   } catch (error) {
     try {
@@ -231,7 +252,7 @@ function bootstrapConnection_(payload, origin, authToken) {
     throw new Error("La conexion operativa enviada por el panel esta incompleta.");
   }
   var user = validateSupabaseUserWithConfig_(authToken, candidate);
-  requireAdmin_(user);
+  requireBoss_(user);
   var properties = PropertiesService.getScriptProperties();
   var existingOrigins = String(properties.getProperty(APP.properties.allowedOrigins) || "")
     .split(",").map(function (value) { return value.trim(); }).filter(Boolean);
@@ -245,7 +266,7 @@ function bootstrapConnection_(payload, origin, authToken) {
   CacheService.getScriptCache().remove("tn_config");
   CacheService.getScriptCache().put("user_" + hash_(String(authToken || "")), JSON.stringify(user), 120);
   appendAudit_("REMOTE_BOOTSTRAP", cleanOrigin, user.full_name || user.username, "OK", "Conexion inicializada desde el panel.");
-  return { ok: true, configured: true, version: APP.version, user: { id: user.id, role: user.role } };
+  return { ok: true, configured: true, version: APP.version, timezone: getTimezone_(), user: { id: user.id, role: user.role } };
 }
 
 function updateConfigurationSheet_(candidate, origins) {
@@ -276,22 +297,6 @@ function ensureAllSheets_(spreadsheet) {
   ensureSheet_(spreadsheet, APP.sheets.payments, HEADERS.payments);
   ensureSheet_(spreadsheet, APP.sheets.movements, HEADERS.movements);
   ensureSheet_(spreadsheet, APP.sheets.daily, HEADERS.daily);
-  ensureSheet_(spreadsheet, APP.sheets.operations, HEADERS.operations);
-}
-
-function syncOperationExists_(operationId) {
-  if (!operationId) return false;
-  var sheet = getSpreadsheet_().getSheetByName(APP.sheets.operations);
-  if (!sheet || sheet.getLastRow() < 2) return false;
-  return Boolean(sheet.getRange(2, 1, sheet.getLastRow() - 1, 1)
-    .createTextFinder(operationId).matchEntireCell(true).findNext());
-}
-
-function recordSyncOperation_(operationId, action) {
-  if (!operationId) return;
-  var sheet = getSpreadsheet_().getSheetByName(APP.sheets.operations);
-  if (!sheet || syncOperationExists_(operationId)) return;
-  sheet.appendRow([operationId, String(action || ""), "confirmed", new Date().toISOString()]);
 }
 
 function seedConfiguration_(spreadsheet) {
@@ -329,15 +334,23 @@ function getInventory_() {
     if (!row[0]) continue;
     items.push(inventoryRowToObject_(row));
   }
-  return { items: items, syncedAt: new Date().toISOString() };
+  var properties = PropertiesService.getScriptProperties();
+  if (items.length && properties.getProperty("TN_INVENTORY_INITIALIZED") !== "1") properties.setProperty("TN_INVENTORY_INITIALIZED", "1");
+  return { items: items, everInitialized: properties.getProperty("TN_INVENTORY_INITIALIZED") === "1", syncedAt: new Date().toISOString() };
 }
 
-function getInventoryMovements_(requestedLimit) {
+function getInventoryMovements_(requestedLimit, requestedCursor, requestedRevision) {
   var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
-  var rows = readSheetRows_(sheet, HEADERS.movements.length);
-  var limit = Math.min(2000, Math.max(50, asNumber_(requestedLimit) || 800));
+  var revision = PropertiesService.getScriptProperties().getProperty("TN_MOVEMENT_REVISION") || "";
+  if (requestedCursor && String(requestedRevision || "") !== revision) return { stale: true, movements: [] };
+  var limit = Math.min(800, Math.max(1, asNumber_(requestedLimit) || 800));
+  var lastRow = sheet.getLastRow();
+  var cursor = requestedCursor ? Math.min(lastRow, Math.floor(asNumber_(requestedCursor))) : lastRow;
+  if (!isFinite(cursor) || cursor < 2) cursor = 1;
+  var firstRow = Math.max(2, cursor - limit + 1);
+  var rows = cursor >= 2 ? sheet.getRange(firstRow, 1, cursor - firstRow + 1, HEADERS.movements.length).getValues() : [];
   return {
-    movements: rows.slice(-limit).map(function (row) {
+    movements: rows.reverse().map(function (row) {
       return {
         movementId: String(row[0] || ""),
         productId: String(row[1] || ""),
@@ -353,13 +366,45 @@ function getInventoryMovements_(requestedLimit) {
         date: row[11] instanceof Date ? row[11].toISOString() : String(row[11] || ""),
         user: String(row[12] || "Sistema")
       };
-    })
+    }),
+    nextCursor: firstRow > 2 ? firstRow - 1 : null,
+    hasMore: firstRow > 2,
+    revision: revision
   };
+}
+
+function updateInventoryMovementCost_(movementId, unitCost, user) {
+  var id = String(movementId || "").trim();
+  var cost = asNumber_(unitCost);
+  if (!id || !isFinite(cost) || cost < 0) return { ok: false, retryable: false, error: "Costo de compra inválido." };
+  return withScriptLock_(function () {
+    var sheet = getSpreadsheet_().getSheetByName(APP.sheets.movements);
+    var rows = readSheetRows_(sheet, HEADERS.movements.length);
+    var rowIndex = -1;
+    for (var index = 0; index < rows.length; index += 1) {
+      if (String(rows[index][0] || "") === id) {
+        rowIndex = index;
+        break;
+      }
+    }
+    if (rowIndex < 0) return { ok: false, retryable: false, error: "La compra ya no existe en el historial." };
+    var row = rows[rowIndex];
+    var type = String(row[4] || "").trim().toUpperCase();
+    if (asNumber_(row[5]) <= 0 || (type !== "NUEVO_PRODUCTO" && type.indexOf("ENTRADA") !== 0)) {
+      return { ok: false, retryable: false, error: "Solo se puede cambiar el costo de una compra." };
+    }
+    sheet.getRange(rowIndex + 2, 9).setValue(cost);
+    appendAudit_("PURCHASE_COST_UPDATE", id, user.full_name || user.username, "OK", "Costo unitario " + cost);
+    return { movementId: id, unitCost: cost };
+  });
 }
 
 function getIncomeReport_(filters) {
   var spreadsheet = getSpreadsheet_();
   var timezone = getTimezone_();
+  var pageRows = Array.isArray(filters.pageRows) ? filters.pageRows.slice(0, 300) : null;
+  var revision = PropertiesService.getScriptProperties().getProperty("TN_HISTORY_REVISION") || "";
+  if (pageRows && String(filters.revision || "") !== revision) return { stale: true, records: [] };
   var today = Utilities.formatDate(new Date(), timezone, "yyyy-MM-dd");
   var dateFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(filters.dateFrom || "")) ? String(filters.dateFrom) : today;
   var dateTo = /^\d{4}-\d{2}-\d{2}$/.test(String(filters.dateTo || "")) ? String(filters.dateTo) : today;
@@ -370,15 +415,36 @@ function getIncomeReport_(filters) {
   }
   var methodFilter = String(filters.paymentMethod || "all").toLowerCase();
   var query = normalizeSearch_(filters.query || "");
-  var salesRows = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.sales), HEADERS.sales.length);
+  var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
+  var salesRows = pageRows ? [] : readSheetRows_(salesSheet, HEADERS.sales.length);
+  if (pageRows) {
+    var validRows = pageRows.map(function (entry) { return Math.floor(asNumber_(entry.row)); })
+      .filter(function (row) { return row >= 2 && row <= salesSheet.getLastRow(); }).sort(function (a, b) { return a - b; });
+    for (var position = 0; position < validRows.length;) {
+      var end = position + 1;
+      while (end < validRows.length && validRows[end] - validRows[end - 1] <= 20 && validRows[end] - validRows[position] < 600) end += 1;
+      var block = salesSheet.getRange(validRows[position], 1, validRows[end - 1] - validRows[position] + 1, HEADERS.sales.length).getValues();
+      for (var entryIndex = position; entryIndex < end; entryIndex += 1) {
+        salesRows.push({ row: block[validRows[entryIndex] - validRows[position]], sheetRow: validRows[entryIndex] });
+      }
+      position = end;
+    }
+  } else {
+    salesRows = salesRows.map(function (row, index) { return { row: row, sheetRow: index + 2 }; });
+  }
   var paymentRows = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.payments), HEADERS.payments.length);
   var detailRows = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length);
   var paymentsBySale = {};
   var detailsBySale = {};
+  var selectedSales = null;
+  if (pageRows) {
+    selectedSales = {};
+    pageRows.forEach(function (entry) { selectedSales[String(entry.saleId || "")] = true; });
+  }
 
   paymentRows.forEach(function (row) {
     var saleId = String(row[0] || "");
-    if (!saleId) return;
+    if (!saleId || selectedSales && !selectedSales[saleId]) return;
     if (!paymentsBySale[saleId]) paymentsBySale[saleId] = [];
     paymentsBySale[saleId].push({
       method: String(row[2] || "").toLowerCase(),
@@ -389,7 +455,7 @@ function getIncomeReport_(filters) {
 
   detailRows.forEach(function (row) {
     var saleId = String(row[0] || "");
-    if (!saleId) return;
+    if (!saleId || selectedSales && !selectedSales[saleId]) return;
     if (!detailsBySale[saleId]) detailsBySale[saleId] = [];
     detailsBySale[saleId].push({
       lineId: String(row[2] || ""),
@@ -419,7 +485,8 @@ function getIncomeReport_(filters) {
   };
   var records = [];
 
-  salesRows.forEach(function (row) {
+  salesRows.forEach(function (entry) {
+    var row = entry.row;
     var saleId = String(row[0] || "");
     if (!saleId) return;
     var dateKey = dateValueToKey_(row[5], timezone);
@@ -458,6 +525,7 @@ function getIncomeReport_(filters) {
       payments: payments,
       items: items
     };
+    record.sheetRow = entry.sheetRow;
     records.push(record);
     totals.income += total;
     totals.sales += 1;
@@ -475,15 +543,28 @@ function getIncomeReport_(filters) {
     });
   });
 
-  records.sort(function (left, right) { return String(right.date).localeCompare(String(left.date)); });
+  records.sort(function (left, right) { return String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId)); });
+  if ((PropertiesService.getScriptProperties().getProperty("TN_HISTORY_REVISION") || "") !== revision) return { stale: true, records: [] };
+  if (pageRows) {
+    var expectedIds = {};
+    pageRows.forEach(function (entry) { expectedIds[entry.row] = String(entry.saleId || ""); });
+    if (records.length !== pageRows.length || records.some(function (record) { return expectedIds[record.sheetRow] !== record.saleId; })) {
+      return { stale: true, records: [] };
+    }
+    records.forEach(function (record) { delete record.sheetRow; });
+    return { records: records, generatedAt: new Date().toISOString() };
+  }
   totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
   var totalRecords = records.length;
   var limit = Math.min(500, Math.max(50, asNumber_(filters.limit) || 300));
+  var recordRows = records.map(function (record) { return { row: record.sheetRow, saleId: record.saleId }; });
+  records.forEach(function (record) { delete record.sheetRow; });
   return {
     filters: { dateFrom: dateFrom, dateTo: dateTo, paymentMethod: methodFilter, query: String(filters.query || "") },
     totals: totals,
     records: records.slice(0, limit),
-    recordKeys: records.slice(0, 1200).map(function (record) { return record.saleId; }),
+    recordRows: recordRows,
+    revision: revision,
     totalRecords: totalRecords,
     truncated: totalRecords > limit,
     generatedAt: new Date().toISOString()
@@ -498,8 +579,7 @@ function readSheetRows_(sheet, width) {
 function dateValueToKey_(value, timezone) {
   if (value instanceof Date && !isNaN(value.getTime())) return Utilities.formatDate(value, timezone, "yyyy-MM-dd");
   var text = String(value || "").trim();
-  var direct = text.match(/^(\d{4}-\d{2}-\d{2})/);
-  if (direct) return direct[1];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
   var parsed = new Date(text);
   return isNaN(parsed.getTime()) ? "" : Utilities.formatDate(parsed, timezone, "yyyy-MM-dd");
 }
@@ -516,18 +596,6 @@ function upsertInventory_(item, user) {
     var table = readInventoryTable_();
     var rowIndex = findInventoryIndex_(table.rows, item.productId);
     var current = rowIndex >= 0 ? table.rows[rowIndex] : null;
-    var hasRequestedVersion = item.version !== undefined && item.version !== null && item.version !== "";
-    var requestedVersion = asNumber_(item.version);
-    var currentVersion = current ? asNumber_(current[12]) : 0;
-    if (current && hasRequestedVersion && requestedVersion < currentVersion) {
-      return {
-        ok: false,
-        retryable: false,
-        conflict: true,
-        error: "El inventario remoto tiene una versión más reciente.",
-        item: inventoryRowToObject_(current)
-      };
-    }
     var next = inventoryObjectToRow_(item, current);
     var beforeStock = current ? asNumber_(current[7]) : 0;
     var afterStock = asNumber_(next[7]);
@@ -558,8 +626,6 @@ function syncInventory_(items, user) {
       if (!item || !item.productId) return;
       var rowIndex = findInventoryIndex_(rows, item.productId);
       var current = rowIndex >= 0 ? rows[rowIndex] : null;
-      var hasRequestedVersion = item.version !== undefined && item.version !== null && item.version !== "";
-      if (current && hasRequestedVersion && asNumber_(item.version) < asNumber_(current[12])) return;
       var next = inventoryObjectToRow_(item, current);
       if (rowIndex >= 0) rows[rowIndex] = next;
       else rows.push(next);
@@ -627,16 +693,6 @@ function setInventoryStock_(payload, user) {
     var rowIndex = findInventoryIndex_(table.rows, productId);
     if (rowIndex < 0) return { ok: false, retryable: false, error: "El producto ya no existe en el inventario." };
     var row = table.rows[rowIndex];
-    var hasRequestedVersion = payload.version !== undefined && payload.version !== null && payload.version !== "";
-    if (hasRequestedVersion && asNumber_(payload.version) < asNumber_(row[12])) {
-      return {
-        ok: false,
-        retryable: false,
-        conflict: true,
-        error: "La existencia remota tiene una versión más reciente.",
-        item: inventoryRowToObject_(row)
-      };
-    }
     row[7] = stock;
     row[10] = String(payload.updatedAt || new Date().toISOString());
     row[12] = asNumber_(row[12]) + 1;
@@ -842,7 +898,7 @@ function writeDataRows_(sheet, rows, width) {
   if (previous > rows.length) sheet.getRange(rows.length + 2, 1, previous - rows.length, width).clearContent();
 }
 
-function editSale_(invoice, user, operationId) {
+function editSale_(invoice, user) {
   if (!invoice || !invoice.id || !invoice.totals || !Array.isArray(invoice.items) || !invoice.items.length) throw new Error("Correccion de venta incompleta.");
   return withScriptLock_(function () {
     var spreadsheet = getSpreadsheet_();
@@ -877,8 +933,6 @@ function editSale_(invoice, user, operationId) {
       var inventoryIndex = findInventoryIndex_(inventory.rows, productId);
       if (inventoryIndex < 0) return;
       var row = inventory.rows[inventoryIndex];
-      var operationMarker = "CORRECCION_VENTA " + safeText_(operationId || saleId);
-      if (String(row[11] || "") === operationMarker) return;
       var delta = asNumber_(oldQuantityByProduct[productId]) - asNumber_(newQuantityByProduct[productId]);
       if (!delta) return;
       var before = asNumber_(row[7]);
@@ -886,10 +940,10 @@ function editSale_(invoice, user, operationId) {
       if (after < 0) throw new Error("La correccion requiere mas existencias de " + String(row[2] || "un producto") + " de las disponibles.");
       row[7] = after;
       row[10] = new Date().toISOString();
-      row[11] = operationMarker;
+      row[11] = "CORRECCION_VENTA " + saleId;
       row[12] = asNumber_(row[12]) + 1;
       inventory.rows[inventoryIndex] = row;
-      editMovements.push(["EDIT-" + safeText_(operationId || saleId) + "-" + productId, productId, safeText_(row[1]), safeText_(row[2]), "CORRECCION_VENTA", delta, before, after, asNumber_(row[5]), safeText_(invoice.number), safeText_(invoice.sessionId), new Date().toISOString(), safeText_(user.full_name || user.username)]);
+      editMovements.push(["EDIT-" + saleId + "-" + productId + "-" + new Date().getTime(), productId, safeText_(row[1]), safeText_(row[2]), "CORRECCION_VENTA", delta, before, after, asNumber_(row[5]), safeText_(invoice.number), safeText_(invoice.sessionId), new Date().toISOString(), safeText_(user.full_name || user.username)]);
     });
     writeInventoryRows_(inventory.sheet, inventory.rows);
     appendRows_(movementsSheet, editMovements);
@@ -965,13 +1019,11 @@ function deleteSale_(saleIdValue, user) {
       var inventoryIndex = findInventoryIndex_(inventory.rows, productId);
       if (inventoryIndex < 0) return;
       var row = inventory.rows[inventoryIndex];
-      var deleteMarker = "VENTA_ELIMINADA " + saleId;
-      if (String(row[11] || "") === deleteMarker) return;
       var before = asNumber_(row[7]);
       var after = before + quantities[productId];
       row[7] = after;
       row[10] = now;
-      row[11] = deleteMarker;
+      row[11] = "VENTA_ELIMINADA " + saleId;
       row[12] = asNumber_(row[12]) + 1;
       inventory.rows[inventoryIndex] = row;
       restoredMovements.push(["DELETE-SALE-" + saleId + "-" + productId, productId, safeText_(row[1]), safeText_(row[2]), "VENTA_ELIMINADA", quantities[productId], before, after, asNumber_(row[5]), safeText_(sale[1]), safeText_(sale[2]), now, safeText_(user.full_name || user.username)]);
@@ -1204,7 +1256,22 @@ function validateSupabaseUserWithConfig_(authToken, config) {
 }
 
 function requireAdmin_(user) {
-  if (!user || user.role !== "admin") throw new Error("Esta operacion requiere un administrador.");
+  requireManager_(user);
+}
+
+function requireManager_(user) {
+  if (!user || ["boss", "admin"].indexOf(String(user.role || "")) < 0) throw new Error("Esta operacion requiere un Jefe o Administrador.");
+}
+
+function requireBoss_(user) {
+  if (!user || user.role !== "boss") throw new Error("Esta operacion es exclusiva del Jefe.");
+}
+
+function requireSection_(user, section) {
+  requireManager_(user);
+  if (user.role === "boss") return;
+  if (!Array.isArray(user.permissions)) return;
+  if (user.permissions.indexOf(section) < 0) throw new Error("No tienes acceso a esta seccion.");
 }
 
 function getConfig_() {

@@ -20,32 +20,56 @@ porque el acceso directo apunta a ella.
 ## Trabajo sin conexión
 
 Los archivos necesarios están incluidos localmente. Cada operación se guarda
-primero de forma persistente en el navegador y la interfaz responde de
-inmediato. Si no hay internet, la operación permanece en una cola FIFO; cuando
-regresa la red se envía al mismo Supabase y Apps Script de Tienda Nápoles, con
-identificadores estables para evitar duplicados.
+primero de forma persistente en IndexedDB (con una proyección compatible en
+`localStorage`) y la interfaz responde de inmediato. Si no hay internet, la
+operación permanece en una cola FIFO; cuando regresa la red se envía al mismo
+Supabase y Apps Script de Tienda Nápoles, con identificadores estables para
+evitar duplicados.
+
+Al abrir la aplicación se ejecuta siempre una reconciliación: se intentan enviar
+las operaciones pendientes respetando sus dependencias y se consultan en paralelo
+los datos independientes de marca, colores, catálogo, mesas, inventario,
+movimientos y ventas recientes. Una operación pendiente no impide actualizar
+otras secciones. Las respuestas remotas dinámicas no se sirven desde la caché
+del Service Worker; si la consulta falla, se conserva la última copia local y
+el indicador muestra qué secciones no pudieron verificarse.
+La misma comprobación se repite al recuperar internet y al volver a enfocar la
+ventana. El indicador del encabezado informa si está sincronizado, sin conexión,
+sincronizando o si existe una operación que requiere revisión.
 
 No borres los datos del navegador ni cambies el perfil de Chrome/Edge: allí se
 conservan la sesión local, las instantáneas y las operaciones pendientes.
 
-## Activación del backend de sincronización
+## Compatibilidad del backend de sincronización
 
-Antes de usar esta edición en producción se deben completar una sola vez estos
-dos pasos sobre los servicios de Tienda Nápoles:
+Antes de usar esta edición en producción, verifique que los servicios de Tienda
+Nápoles ya incluyan las siguientes capacidades:
 
 1. Ejecutar en Supabase, en orden:
    - `supabase/migrations/20260919120000_offline_sync_realtime.sql`
    - `supabase/migrations/20260920120000_shared_tips_and_table_zones.sql`
-2. Publicar `appscript/Code.gs` como una nueva versión de la aplicación web.
-   El endpoint debe informar la versión `2.7.0`.
+2. `appscript/Code.gs` está alineado con la versión `2.11.0` del repositorio
+   online de referencia. El endpoint consultado el 5 de octubre de 2026
+   también informó `2.11.0`. Esta actualización del archivo local no publica
+   nada: si el endpoint ya responde `2.11.0`, no hace falta volver a desplegarlo.
 
 La primera migración habilita Realtime para negocio, mesas, categorías y
 productos. La segunda comparte la configuración de propina y las zonas de
-mesas entre dispositivos. Apps Script 2.7.0 añade idempotencia a ventas,
-inventario, movimientos e ingresos.
+mesas entre dispositivos. La implementación de Apps Script incluida incorpora
+idempotencia para ventas, inventario y movimientos.
 
 ## Verificación técnica
 
 Desde esta carpeta ejecuta `node tests/offline-sync.test.cjs`. Deben aprobarse
-los 15 escenarios automatizados de persistencia, orden, reintentos,
+los 23 escenarios automatizados de persistencia, orden, reintentos,
 idempotencia, conflictos y eliminaciones.
+
+Ejecuta también `node tests/offline-roles.test.cjs`: valida los roles Jefe,
+Administrador y Mesero, incluida la disponibilidad de Ventas y Usuarios.
+
+`node tests/offline-sales-cache.test.cjs` comprueba que Ventas reutiliza la
+copia local cuando la revisión del servidor no cambió y descarga el informe
+completo cuando sí cambió.
+
+Para validar contra los backends reales sin alterar datos de producción, siga
+los 20 casos de `tests/MANUAL-OFFLINE-CHECKLIST.md` usando un negocio de prueba.

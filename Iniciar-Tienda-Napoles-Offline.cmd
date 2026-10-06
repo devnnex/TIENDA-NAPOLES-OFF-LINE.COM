@@ -6,7 +6,7 @@ if exist "%~dp0crear-acceso-directo.ps1" (
   powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0crear-acceso-directo.ps1" >nul 2>&1
 )
 
-set "APP_URL=http://127.0.0.1:8766/admin.html"
+set "APP_URL=http://127.0.0.1:8766/admin.html?forceLogin=%RANDOM%%RANDOM%"
 set "HEALTH_URL=http://127.0.0.1:8766/__tienda_napoles_health"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $response=Invoke-WebRequest -UseBasicParsing -Uri '%HEALTH_URL%' -TimeoutSec 2; if ($response.StatusCode -ne 200) { exit 1 }" >nul 2>&1

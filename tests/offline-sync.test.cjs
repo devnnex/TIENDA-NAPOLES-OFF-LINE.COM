@@ -84,8 +84,9 @@ const workerPath = path.join(__dirname, "..", "service-worker.js");
 const workerSource = fs.readFileSync(workerPath, "utf8");
 vm.runInContext(`${workerSource}\n;globalThis.__syncTest = {
   directSupabaseRequest, flushQueue, isQueueableRpc, isRestMutation,
-  listEntries, normalizeStoredEntry, putEntry, queuedResponse,
-  recoverInterruptedEntries, serializeRequest, verifyRestMutation
+  listEntries, networkFirst, normalizeStoredEntry, putEntry, queuedResponse,
+  recoverInterruptedEntries, refreshQueuedSessionItemAuth, serializeRequest,
+  syncStatusSnapshot, verifyRestMutation
 };`, context, { filename: workerPath });
 
 const api = context.__syncTest;
@@ -221,8 +222,8 @@ test("10 recupera operaciones syncing después de reabrir", async () => {
   assert.equal((await api.listEntries())[0].status, "pending");
 });
 
-test("11 bloquea reconciliación remota mientras hay cambios locales", async () => {
-  await api.putEntry(pendingEntry());
+test("11 bloquea reconciliación remota mientras hay cambios locales relacionados", async () => {
+  await api.putEntry(pendingEntry({ entity: "table_sessions" }));
   const rpc = new Request("https://example.supabase.co/rest/v1/rpc/get_admin_snapshot", { method: "POST", body: "{}" });
   const response = await api.directSupabaseRequest(rpc, new URL(rpc.url));
   assert.equal(response.status, 503);
@@ -378,6 +379,507 @@ test("18 no consume tiempo de red mientras el equipo esta offline", async () => 
   messageListener({ data: { type: "SET_NETWORK_STATUS", online: true }, waitUntil: () => undefined, ports: [] });
   await api.flushQueue(true);
   assert.equal(sent, 1);
+});
+
+test("19 una cola de mesas no bloquea la lectura actual de marca", async () => {
+  await api.putEntry(pendingEntry({ entity: "table_sessions" }));
+  let reads = 0;
+  remoteFetch = async () => {
+    reads += 1;
+    return new Response(JSON.stringify([{ accent_color: "#0033ff" }]), { status: 200 });
+  };
+  const response = await api.networkFirst(request("business_settings", "GET"));
+  assert.equal((await response.json())[0].accent_color, "#0033ff");
+  assert.equal(reads, 1);
+});
+
+test("20 una lectura remota fallida no devuelve datos antiguos de CacheStorage", async () => {
+  const previousMatch = cache.match;
+  cache.match = async () => new Response(JSON.stringify([{ accent_color: "#aabbcc" }]), { status: 200 });
+  remoteFetch = async () => { throw new TypeError("network_error"); };
+  try {
+    await assert.rejects(api.networkFirst(request("business_settings", "GET")), /network_error/);
+  } finally {
+    cache.match = previousMatch;
+  }
+});
+
+test("21 una escritura pendiente de marca protege su propia lectura", async () => {
+  await api.putEntry(pendingEntry({ entity: "business_settings" }));
+  let reads = 0;
+  remoteFetch = async () => {
+    reads += 1;
+    return new Response("[]", { status: 200 });
+  };
+  await assert.rejects(api.networkFirst(request("business_settings", "GET")), /pending_local_writes/);
+  assert.equal(reads, 0);
+});
+
+test("22 una cola de catálogo no bloquea el snapshot de mesas", async () => {
+  await api.putEntry(pendingEntry({ entity: "menu_categories" }));
+  const rpc = new Request("https://example.supabase.co/rest/v1/rpc/get_admin_snapshot", { method: "POST", body: "{}" });
+  let reads = 0;
+  remoteFetch = async () => {
+    reads += 1;
+    return new Response("{}", { status: 200 });
+  };
+  const response = await api.directSupabaseRequest(rpc, new URL(rpc.url));
+  assert.equal(response.status, 200);
+  assert.equal(reads, 1);
+});
+
+test("23 una cola de mesas protege el snapshot operativo", async () => {
+  await api.putEntry(pendingEntry({ entity: "table_sessions" }));
+  const rpc = new Request("https://example.supabase.co/rest/v1/rpc/get_admin_snapshot", { method: "POST", body: "{}" });
+  let reads = 0;
+  remoteFetch = async () => {
+    reads += 1;
+    return new Response("{}", { status: 200 });
+  };
+  const response = await api.directSupabaseRequest(rpc, new URL(rpc.url));
+  assert.equal(response.status, 503);
+  assert.equal(reads, 0);
+});
+
+const flushAsAuthenticatedApp = async (authToken) => {
+  let task;
+  let result;
+  listeners.get("message")({
+    data: { type: "FLUSH_OFFLINE_QUEUE", force: true, authToken },
+    waitUntil: (promise) => { task = promise; },
+    ports: [{ postMessage: (message) => { result = message; } }]
+  });
+  await task;
+  return result;
+};
+
+test("24 recupera un consumo 401 con el token nuevo sin recrear la operacion", async () => {
+  const entry = pendingEntry({
+    entity: "session_items",
+    url: endpoint("session_items"),
+    headers: [["content-type", "application/json"], ["x-app-token", "token-anterior"]],
+    status: "failed",
+    lastError: "401 Unauthorized"
+  });
+  await api.putEntry(entry);
+  let sends = 0;
+  remoteFetch = async (input) => {
+    sends += 1;
+    assert.equal(input.headers.get("x-app-token"), "token-vigente");
+    assert.equal(await input.text(), entry.body);
+    return new Response("[]", { status: 201 });
+  };
+  const response = await flushAsAuthenticatedApp("token-vigente");
+  const stored = (await api.listEntries())[0];
+  assert.equal(response.ok, true);
+  assert.equal(sends, 1);
+  assert.equal(stored.status, "confirmed");
+  assert.equal(stored.operationId, entry.operationId);
+  assert.equal(stored.id, entry.id);
+  assert.equal(stored.body, entry.body);
+});
+
+test("25 no repite un 401 con la misma credencial rechazada", async () => {
+  await api.putEntry(pendingEntry({
+    entity: "session_items",
+    url: endpoint("session_items"),
+    headers: [["x-app-token", "token-rechazado"]],
+    status: "failed",
+    lastError: "401 Unauthorized"
+  }));
+  let sends = 0;
+  remoteFetch = async () => {
+    sends += 1;
+    return new Response("[]", { status: 201 });
+  };
+  await flushAsAuthenticatedApp("token-rechazado");
+  assert.equal(sends, 0);
+  assert.equal((await api.listEntries())[0].status, "failed");
+});
+
+test("26 no altera conflictos ni consumos de clientes sin token de usuario", async () => {
+  await api.putEntry(pendingEntry({
+    id: "conflict-item",
+    entity: "session_items",
+    url: endpoint("session_items"),
+    headers: [["x-app-token", "token-anterior"]],
+    status: "conflict",
+    lastError: "409 Conflict"
+  }));
+  await api.putEntry(pendingEntry({
+    id: "table-client-item",
+    entity: "session_items",
+    url: endpoint("session_items"),
+    headers: [["x-table-code", "mesa-1"]],
+    status: "failed",
+    lastError: "401 Unauthorized"
+  }));
+  await api.refreshQueuedSessionItemAuth("token-vigente");
+  const entries = await api.listEntries();
+  assert.equal(entries.find((entry) => entry.id === "conflict-item").status, "conflict");
+  assert.equal(new Headers(entries.find((entry) => entry.id === "conflict-item").headers).get("x-app-token"), "token-anterior");
+  assert.equal(entries.find((entry) => entry.id === "table-client-item").status, "failed");
+});
+
+test("27 actualiza un consumo pendiente antes de enviarlo", async () => {
+  await api.putEntry(pendingEntry({
+    entity: "session_items",
+    url: endpoint("session_items"),
+    headers: [["x-app-token", "token-anterior"]]
+  }));
+  remoteFetch = async (input) => {
+    assert.equal(input.headers.get("x-app-token"), "token-vigente");
+    return new Response("[]", { status: 201 });
+  };
+  await flushAsAuthenticatedApp("token-vigente");
+  assert.equal((await api.listEntries())[0].status, "confirmed");
+});
+
+test("28 recupera el ciclo completo 401, nueva sesion y confirmacion", async () => {
+  const entry = pendingEntry({
+    entity: "session_items",
+    url: endpoint("session_items"),
+    headers: [["x-app-token", "token-anterior"]]
+  });
+  await api.putEntry(entry);
+  const tokensSent = [];
+  remoteFetch = async (input) => {
+    const token = input.headers.get("x-app-token");
+    tokensSent.push(token);
+    return new Response("[]", { status: token === "token-vigente" ? 201 : 401 });
+  };
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].status, "failed");
+  await flushAsAuthenticatedApp("token-anterior");
+  assert.deepEqual(tokensSent, ["token-anterior"]);
+  await flushAsAuthenticatedApp("token-vigente");
+  assert.deepEqual(tokensSent, ["token-anterior", "token-vigente"]);
+  assert.equal((await api.listEntries())[0].status, "confirmed");
+});
+
+const closedSessionEntry = (overrides = {}) => {
+  const payload = { status: "closed", closed_at: "2026-10-05T12:00:00.000Z", subtotal: 12000, total: 12000 };
+  return pendingEntry({
+    entity: "table_sessions",
+    recordId: "session-1",
+    recordIds: ["session-1"],
+    url: endpoint("table_sessions", "?id=eq.session-1&status=eq.open"),
+    method: "PATCH",
+    operationType: "PATCH",
+    headers: [["accept", "application/vnd.pgrst.object+json"], ["apikey", "test"], ["x-app-token", "valid-token"]],
+    body: JSON.stringify(payload),
+    payload,
+    status: "conflict",
+    lastError: "406 Not Acceptable",
+    ...overrides
+  });
+};
+
+test("29 confirma cierre 406 si la venta ya archivo la cuenta remota", async () => {
+  const entry = closedSessionEntry();
+  await api.putEntry(entry);
+  let patches = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET" && url.pathname.endsWith("/table_sessions")) return new Response("[]", { status: 200 });
+    if (input.method === "PATCH") patches += 1;
+    return new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  const stored = (await api.listEntries())[0];
+  assert.equal(patches, 0);
+  assert.equal(stored.status, "confirmed");
+  assert.equal(stored.id, entry.id);
+  assert.equal(stored.operationId, entry.operationId);
+});
+
+test("30 conserva el conflicto 406 si la cuenta sigue abierta", async () => {
+  await api.putEntry(closedSessionEntry());
+  let patches = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response(JSON.stringify([{ id: "session-1", status: "open" }]), { status: 200 });
+    if (input.method === "PATCH") patches += 1;
+    return new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(patches, 0);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("31 no descarta cierre 406 si la credencial ya no es valida", async () => {
+  await api.putEntry(closedSessionEntry());
+  remoteFetch = async (input) => new URL(input.url).pathname.endsWith("/rpc/get_current_user")
+    ? new Response("{}", { status: 401 })
+    : new Response("[]", { status: 200 });
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("32 reconcilia el 406 de un cierre que aun estaba pendiente", async () => {
+  await api.putEntry(closedSessionEntry({ status: "pending", lastError: "" }));
+  let patches = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response("[]", { status: 200 });
+    if (input.method === "PATCH") patches += 1;
+    return new Response("{}", { status: 406 });
+  };
+  await api.flushQueue(true);
+  assert.equal(patches, 1);
+  assert.equal((await api.listEntries())[0].status, "confirmed");
+});
+
+test("33 no resuelve un 406 de otra actualizacion de mesa", async () => {
+  const payload = { table_id: "different-table" };
+  await api.putEntry(closedSessionEntry({ payload, body: JSON.stringify(payload) }));
+  let patches = 0;
+  remoteFetch = async (input) => {
+    if (input.method === "PATCH") patches += 1;
+    return input.method === "GET"
+      ? new Response("[]", { status: 200 })
+      : new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(patches, 1);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("34 confirma un cierre 406 si la cuenta ya esta cerrada con los mismos importes", async () => {
+  await api.putEntry(closedSessionEntry());
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response(JSON.stringify([{
+      id: "session-1", status: "closed", subtotal: 12000, total: 12000
+    }]), { status: 200 });
+    throw new Error("No se debe repetir el PATCH");
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal((await api.listEntries())[0].status, "confirmed");
+});
+
+test("35 conserva el 406 si la cuenta cerrada tiene importes distintos", async () => {
+  await api.putEntry(closedSessionEntry());
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response(JSON.stringify([{
+      id: "session-1", status: "closed", subtotal: 12000, total: 11000
+    }]), { status: 200 });
+    throw new Error("No se debe repetir el PATCH");
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("36 conserva el 406 si la creacion de esa cuenta sigue pendiente", async () => {
+  const close = closedSessionEntry();
+  await api.putEntry(close);
+  await api.putEntry(pendingEntry({
+    id: "create-session-1", entity: "table_sessions", recordId: "session-1", recordIds: ["session-1"],
+    method: "POST", status: "failed", lastError: "400 Bad Request"
+  }));
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response("[]", { status: 200 });
+    return new Response("{}", { status: 400 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal((await api.listEntries()).find((entry) => entry.id === close.id).status, "conflict");
+});
+
+test("37 reintenta el cierre 406 una vez con la credencial vigente", async () => {
+  const entry = closedSessionEntry({ headers: [["apikey", "test"], ["x-app-token", "old-token"]] });
+  await api.putEntry(entry);
+  let patches = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    assert.equal(input.headers.get("x-app-token"), "valid-token");
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response("[]", { status: 200 });
+    if (input.method === "PATCH") patches += 1;
+    return new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(patches, 1);
+  assert.equal((await api.listEntries())[0].status, "confirmed");
+});
+
+test("38 recupera una apertura de mesa 401 con la sesion vigente", async () => {
+  const entry = pendingEntry({
+    entity: "table_sessions", recordId: "session-1", recordIds: ["session-1"],
+    url: endpoint("table_sessions"), method: "POST", status: "failed", lastError: "401 Unauthorized",
+    headers: [["apikey", "test"], ["x-app-token", "expired-token"]],
+    payload: { id: "session-1", status: "open" }, body: JSON.stringify({ id: "session-1", status: "open" })
+  });
+  await api.putEntry(entry);
+  let posts = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    assert.equal(input.headers.get("x-app-token"), "valid-token");
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "POST") posts += 1;
+    return new Response("[]", { status: 201 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  const saved = (await api.listEntries())[0];
+  assert.equal(posts, 1);
+  assert.equal(saved.status, "confirmed");
+  assert.equal(saved.operationId, entry.operationId);
+  assert.equal(saved.recordId, entry.recordId);
+});
+
+test("39 no reintenta mesa 401 si la nueva sesion tampoco valida", async () => {
+  await api.putEntry(pendingEntry({
+    entity: "table_sessions", url: endpoint("table_sessions"), method: "POST",
+    status: "failed", lastError: "401 Unauthorized",
+    headers: [["apikey", "test"], ["x-app-token", "expired-token"]]
+  }));
+  let posts = 0;
+  remoteFetch = async (input) => {
+    if (new URL(input.url).pathname.endsWith("/rpc/get_current_user")) return new Response("{}", { status: 400 });
+    posts += 1;
+    return new Response("[]", { status: 201 });
+  };
+  await flushAsAuthenticatedApp("another-expired-token");
+  assert.equal(posts, 0);
+  assert.equal((await api.listEntries())[0].status, "failed");
+});
+
+const metadataSessionEntry = (overrides = {}) => {
+  const payload = { payer_name: "Cliente", assigned_waiter_id: "waiter-1" };
+  return closedSessionEntry({ payload, body: JSON.stringify(payload), ...overrides });
+};
+
+test("40 concilia el 406 de nombre y responsable de una cuenta retirada", async () => {
+  const entry = metadataSessionEntry();
+  await api.putEntry(entry);
+  let patches = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response("[]", { status: 200 });
+    if (input.method === "PATCH") patches += 1;
+    return new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  const saved = (await api.listEntries())[0];
+  assert.equal(patches, 0);
+  assert.equal(saved.status, "confirmed");
+  assert.equal(saved.operationId, entry.operationId);
+});
+
+test("41 renueva la credencial del 406 de nombre antes de conciliar", async () => {
+  await api.putEntry(metadataSessionEntry({ headers: [["apikey", "test"], ["x-app-token", "expired-token"]] }));
+  let patches = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    assert.equal(input.headers.get("x-app-token"), "valid-token");
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response("[]", { status: 200 });
+    if (input.method === "PATCH") patches += 1;
+    return new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(patches, 1);
+  assert.equal((await api.listEntries())[0].status, "confirmed");
+});
+
+test("42 conserva el 406 de nombre si la cuenta aun existe con otros datos", async () => {
+  await api.putEntry(metadataSessionEntry());
+  let patches = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    if (input.method === "GET") return new Response(JSON.stringify([{
+      id: "session-1", status: "open", payer_name: "Otro"
+    }]), { status: 200 });
+    if (input.method === "PATCH") patches += 1;
+    return new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(patches, 0);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("43 no concilia nombre de mesa ausente si su creacion sigue pendiente", async () => {
+  const update = metadataSessionEntry();
+  await api.putEntry(update);
+  await api.putEntry(pendingEntry({
+    id: "create-session-1", entity: "table_sessions", recordId: "session-1", recordIds: ["session-1"],
+    method: "POST", status: "failed", lastError: "401 Unauthorized",
+    headers: [["x-app-token", "valid-token"]]
+  }));
+  remoteFetch = async (input) => new URL(input.url).pathname.endsWith("/rpc/get_current_user")
+    ? new Response(JSON.stringify({ id: "boss-1" }), { status: 200 })
+    : new Response("[]", { status: 200 });
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal((await api.listEntries()).find((entry) => entry.id === update.id).status, "conflict");
+});
+
+test("44 recupera tres aperturas 401 con una sola validacion de sesion", async () => {
+  const entries = Array.from({ length: 3 }, (_, index) => pendingEntry({
+    entity: "table_sessions", recordId: `session-${index}`, recordIds: [`session-${index}`],
+    url: endpoint("table_sessions"), method: "POST", status: "failed", lastError: "401 Unauthorized",
+    headers: [["apikey", "test"], ["x-app-token", "expired-token"]],
+    payload: { id: `session-${index}`, status: "open" },
+    body: JSON.stringify({ id: `session-${index}`, status: "open" })
+  }));
+  for (const entry of entries) await api.putEntry(entry);
+  let validations = 0;
+  let posts = 0;
+  remoteFetch = async (input) => {
+    assert.equal(input.headers.get("x-app-token"), "valid-token");
+    if (new URL(input.url).pathname.endsWith("/rpc/get_current_user")) {
+      validations += 1;
+      return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
+    }
+    posts += 1;
+    return new Response("[]", { status: 201 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(validations, 1);
+  assert.equal(posts, 3);
+  assert.equal((await api.listEntries()).filter((entry) => entry.status === "confirmed").length, 3);
+});
+
+test("45 no reutiliza una sesion administrativa para una mesa de cliente", async () => {
+  await api.putEntry(pendingEntry({
+    entity: "table_sessions", url: endpoint("table_sessions"), method: "POST",
+    status: "failed", lastError: "401 Unauthorized", headers: [["x-table-code", "mesa-1"]]
+  }));
+  let requests = 0;
+  remoteFetch = async () => { requests += 1; return new Response("[]", { status: 201 }); };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(requests, 0);
+  assert.equal((await api.listEntries())[0].status, "failed");
+});
+
+test("46 el estado de la cola identifica la mesa y el producto de cada operacion", async () => {
+  await api.putEntry(pendingEntry({
+    entity: "table_sessions", recordId: "other-session", recordIds: ["other-session"],
+    url: endpoint("table_sessions", "?id=eq.other-session"), status: "failed", lastError: "401 Unauthorized"
+  }));
+  await api.putEntry(pendingEntry({
+    entity: "session_items", recordId: "line-1", recordIds: ["line-1"],
+    payload: { id: "line-1", session_id: "sale-session" }
+  }));
+  await api.putEntry(pendingEntry({
+    entity: "menu_items", recordId: "product-1", recordIds: ["product-1"], status: "confirmed"
+  }));
+  const snapshot = await api.syncStatusSnapshot();
+  assert.equal(snapshot.counts.failed, 1);
+  assert.equal(snapshot.counts.pending, 1);
+  assert.equal(snapshot.blockingRecords.length, 2);
+  assert.deepEqual(Array.from(snapshot.blockingRecords[0].recordIds), ["other-session"]);
+  assert.deepEqual(Array.from(snapshot.blockingRecords[1].sessionIds), ["sale-session"]);
+  assert.equal(snapshot.issues.length, 1);
 });
 
 (async () => {

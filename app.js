@@ -7659,6 +7659,21 @@ const App = (() => {
     return printThermalReceipt(receipt.session, receipt.invoice);
   };
 
+  const bindPaymentConfirmShortcut = () => {
+    const dialog = $("#paymentDialog");
+    const form = $("#paymentForm");
+    const save = form?.querySelector('button[type="submit"][value="save"]');
+    if (!dialog || !form || !save) return;
+    dialog.addEventListener("keydown", (event) => {
+      if (!dialog.open || event.isComposing || event.ctrlKey || event.altKey || event.metaKey
+        || (event.key !== "Enter" && event.code !== "NumpadEnter")) return;
+      // Evita que Enter active Imprimir si ese boton conserva el foco.
+      event.preventDefault();
+      if (event.repeat || state.paymentProcessing || save.disabled) return;
+      form.requestSubmit(save);
+    }, { capture: true });
+  };
+
   const processPayment = async (form, submitter) => {
     if (state.paymentProcessing) return;
     const session = state.sessions.find((entry) => entry.id === form.session_id.value);
@@ -7784,6 +7799,9 @@ const App = (() => {
     renderIncomeReport();
     renderTips();
     buttons.forEach((button) => { button.disabled = false; });
+    // Toda venta guardada localmente abre la caja, con o sin recibo.
+    // La orden usa el controlador existente y no espera la sincronizacion.
+    void openCashDrawer();
     if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;
@@ -9064,6 +9082,7 @@ const App = (() => {
       event.preventDefault();
       await processPayment(event.currentTarget, event.submitter);
     });
+    bindPaymentConfirmShortcut();
     $("#paymentForm")?.addEventListener("change", (event) => {
       if (event.target.name === "tip_choice") updatePaymentTipChoice();
       if (event.target.name === "payment_method") {
@@ -9229,6 +9248,10 @@ const App = (() => {
     });
     document.addEventListener("pointerdown", (event) => {
       if (!event.target.closest("#waiterTableCombobox")) closeWaiterTableOptions();
+    });
+    // La lista ocupa espacio en el modal. Cerrarla en pointerdown mueve
+    // Confirmar antes de mouseup y el navegador pierde el clic.
+    document.addEventListener("click", (event) => {
       if (!event.target.closest("#consumptionProductCombobox")) closeConsumptionProductOptions();
     });
     $("#logoutButton")?.addEventListener("click", logoutAdmin);

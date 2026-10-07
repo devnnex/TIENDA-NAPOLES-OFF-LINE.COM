@@ -43,7 +43,7 @@ try {
   Pop-Location
 }
 
-$installer = Join-Path (Join-Path $projectRoot "dist") "Tienda-Napoles-Offline-Setup-1.0.4.exe"
+$installer = Join-Path (Join-Path $projectRoot "dist") "Tienda-Napoles-Offline-Setup-1.0.6.exe"
 if (-not (Test-Path -LiteralPath $installer)) { throw "El instalador no aparecio en dist." }
 Get-Item -LiteralPath $installer | Select-Object FullName, Length
 Get-FileHash -LiteralPath $installer -Algorithm SHA256 | Select-Object Algorithm, Hash

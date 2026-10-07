@@ -1,9 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Management;
 using System.Net;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
@@ -12,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Iniciador de Tienda Napoles Offline sin consola")]
 [assembly: AssemblyCompany("Tienda Napoles")]
 [assembly: AssemblyProduct("Tienda Napoles Offline")]
-[assembly: AssemblyVersion("1.0.4.0")]
-[assembly: AssemblyFileVersion("1.0.4.0")]
+[assembly: AssemblyVersion("1.0.6.0")]
+[assembly: AssemblyFileVersion("1.0.6.0")]
 
 internal static class TiendaNapolesOffline
 {
@@ -80,10 +83,12 @@ internal static class TiendaNapolesOffline
             string browser = FindBrowser();
             if (browser != null)
             {
+                HashSet<IntPtr> previousWindows = TaskbarIdentity.WindowHandles();
                 Process.Start(new ProcessStartInfo(browser, "--app=\"" + url + "\"")
                 {
                     UseShellExecute = true
                 });
+                TaskbarIdentity.AttachToNewAppWindow(browser, appDirectory, previousWindows);
             }
             else
             {
@@ -280,5 +285,112 @@ internal static class TiendaNapolesOffline
     private static void ShowError(string message)
     {
         MessageBox.Show(message, "Tienda Napoles Offline", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+}
+
+// El navegador es el anfitrion; la ventana y los accesos directos deben
+// compartir identidad y relanzar este iniciador al anclarlos en Windows.
+internal static class TaskbarIdentity
+{
+    internal const string AppId = "TiendaNapoles.Offline";
+    private static readonly Guid PropertyFormat = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+    private delegate bool EnumWindowCallback(IntPtr window, IntPtr parameter);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct PropertyKey
+    {
+        internal Guid Format;
+        internal uint Id;
+        internal PropertyKey(uint id) { Format = PropertyFormat; Id = id; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PropVariant
+    {
+        internal ushort Type;
+        private ushort reserved1, reserved2, reserved3;
+        internal IntPtr Value;
+        private IntPtr unionRemainder;
+    }
+
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out uint count);
+        [PreserveSig] int GetAt(uint index, out PropertyKey key);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+        [PreserveSig] int Commit();
+    }
+
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder value, int maxCount);
+    [DllImport("shell32.dll")] private static extern int SHGetPropertyStoreForWindow(IntPtr window, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
+    [DllImport("ole32.dll")] private static extern int PropVariantClear(ref PropVariant value);
+
+    internal static HashSet<IntPtr> WindowHandles()
+    {
+        var result = new HashSet<IntPtr>();
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) { result.Add(window); return true; }, IntPtr.Zero);
+        return result;
+    }
+
+    internal static void AttachToNewAppWindow(string browser, string directory, HashSet<IntPtr> previousWindows)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(15);
+        IntPtr attached = IntPtr.Zero;
+        while (DateTime.UtcNow < deadline)
+        {
+            EnumWindows(delegate(IntPtr window, IntPtr parameter)
+            {
+                if (previousWindows.Contains(window) || (attached != IntPtr.Zero && window != attached)) return true;
+                IPropertyStore store = null;
+                try
+                {
+                    var className = new StringBuilder(128);
+                    GetClassName(window, className, className.Capacity);
+                    if (className.ToString() != "Chrome_WidgetWin_1") return true;
+                    uint processId;
+                    GetWindowThreadProcessId(window, out processId);
+                    using (Process process = Process.GetProcessById((int)processId))
+                    {
+                        if (process.SessionId != Process.GetCurrentProcess().SessionId ||
+                            !string.Equals(process.MainModule.FileName, browser, StringComparison.OrdinalIgnoreCase)) return true;
+                    }
+                    Guid iid = typeof(IPropertyStore).GUID;
+                    if (SHGetPropertyStoreForWindow(window, ref iid, out store) < 0) return true;
+                    var key = new PropertyKey(5);
+                    PropVariant current;
+                    Marshal.ThrowExceptionForHR(store.GetValue(ref key, out current));
+                    string identity;
+                    try { identity = current.Type == 31 ? Marshal.PtrToStringUni(current.Value) : null; }
+                    finally { PropVariantClear(ref current); }
+                    // Chromium genera el nombre de --app con host + '_' + ruta.
+                    // Nunca modificar una ventana normal del navegador.
+                    const string appComponent = ".127.0.0.1_admin.html";
+                    if (identity == null || !(identity.EndsWith(appComponent, StringComparison.Ordinal) ||
+                        identity.Contains(appComponent + ".") || (window == attached && identity == AppId))) return true;
+                    SetString(store, 2, "\"" + Path.Combine(directory, "TiendaNapolesOffline.exe") + "\"");
+                    SetString(store, 4, "Tienda N\u00e1poles");
+                    SetString(store, 3, Path.Combine(directory, "tienda-napoles.ico") + ",0");
+                    SetString(store, 5, AppId);
+                    Marshal.ThrowExceptionForHR(store.Commit());
+                    if (attached == IntPtr.Zero) { attached = window; deadline = DateTime.UtcNow.AddSeconds(3); }
+                }
+                catch (Exception) { /* Un fallo del icono no impide abrir ni sincronizar la aplicacion. */ }
+                finally { if (store != null) Marshal.ReleaseComObject(store); }
+                return true;
+            }, IntPtr.Zero);
+            Thread.Sleep(250);
+        }
+    }
+
+    private static void SetString(IPropertyStore store, uint id, string text)
+    {
+        var key = new PropertyKey(id);
+        var value = new PropVariant { Type = 31, Value = Marshal.StringToCoTaskMemUni(text) };
+        try { Marshal.ThrowExceptionForHR(store.SetValue(ref key, ref value)); }
+        finally { PropVariantClear(ref value); }
     }
 }

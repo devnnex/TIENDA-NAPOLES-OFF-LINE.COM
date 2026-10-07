@@ -1,5 +1,5 @@
 #define AppName "Tienda Nápoles Offline"
-#define AppVersion "1.0.4"
+#define AppVersion "1.0.6"
 
 [Setup]
 AppId={{1B759C3D-EEAC-42F1-8C91-A400775027C1}
@@ -41,5 +41,5 @@ Source: "..\sound\*"; DestDir: "{app}\sound"; Flags: ignoreversion
 Source: "..\vendor\*"; DestDir: "{app}\vendor"; Flags: ignoreversion
 
 [Icons]
-Name: "{autodesktop}\Tienda Nápoles"; Filename: "{app}\TiendaNapolesOffline.exe"; WorkingDir: "{app}"; IconFilename: "{app}\tienda-napoles.ico"
-Name: "{autoprograms}\Tienda Nápoles Offline"; Filename: "{app}\TiendaNapolesOffline.exe"; WorkingDir: "{app}"; IconFilename: "{app}\tienda-napoles.ico"
+Name: "{autodesktop}\Tienda Nápoles"; Filename: "{app}\TiendaNapolesOffline.exe"; WorkingDir: "{app}"; IconFilename: "{app}\tienda-napoles.ico"; AppUserModelID: "TiendaNapoles.Offline"
+Name: "{autoprograms}\Tienda Nápoles Offline"; Filename: "{app}\TiendaNapolesOffline.exe"; WorkingDir: "{app}"; IconFilename: "{app}\tienda-napoles.ico"; AppUserModelID: "TiendaNapoles.Offline"

@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v16";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v18";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -204,6 +204,58 @@ const refreshQueuedTableSessionAuth = async (authToken) => {
     const updatedHeaders = new Headers(entry.headers || []);
     updatedHeaders.set("x-app-token", authToken);
     await putEntry({ ...entry, headers: [...updatedHeaders.entries()], status: "pending", nextAttemptAt: 0, lastError: "" });
+  }
+};
+
+// Las RPC guardan la credencial tambien en el cuerpo. Un 400 antiguo no
+// permite conocer el motivo: se reintenta una vez con una sesion nueva
+// validada, conservando la misma operacion idempotente y sus identificadores.
+const refreshQueuedRequestAuth = async (authToken) => {
+  if (!networkAvailable || !authToken || typeof authToken !== "string") return;
+  const candidates = (await listEntries()).filter((entry) => {
+    const headers = new Headers(entry.headers || []);
+    if (headers.has("x-table-code") || headers.has("x-table-id")) return false;
+    if (entry.entity === "rpc:acknowledge_service_requests") {
+      let payload;
+      try { payload = JSON.parse(entry.body); } catch (_) { return false; }
+      if (!payload?.auth_token || payload.auth_token === authToken) return false;
+      return entry.status === "pending" || (entry.status === "failed"
+        && /^(?:400|401)(?:\b|\s)/.test(String(entry.lastError || "")));
+    }
+    // PostgREST devuelve 406 cuando la credencial vieja deja de ver la fila
+    // solicitada como objeto. Una credencial nueva debe validarse primero.
+    return entry.entity === "session_items" && entry.status === "conflict"
+      && /^406(?:\b|\s)/.test(String(entry.lastError || ""))
+      && headers.get("x-app-token") && headers.get("x-app-token") !== authToken;
+  });
+  if (!candidates.length) return;
+  const headers = new Headers(candidates[0].headers || []);
+  headers.set("x-app-token", authToken);
+  ["content-length", "prefer", "accept-profile"].forEach((name) => headers.delete(name));
+  headers.set("Content-Type", "application/json");
+  headers.set("Accept", "application/json");
+  try {
+    const authUrl = new URL("/rest/v1/rpc/get_current_user", candidates[0].url);
+    const response = await fetchWithTimeout(new Request(authUrl.href, {
+      method: "POST", headers, body: JSON.stringify({ auth_token: authToken })
+    }), REMOTE_WRITE_TIMEOUT_MS);
+    if (!response.ok || !(await response.json())?.id) return;
+  } catch (_) { return; }
+  for (const candidate of candidates) {
+    // No sobrescribir una operacion que el envio de fondo ya haya confirmado.
+    const entry = (await listEntries()).find((saved) => saved.id === candidate.id);
+    if (!entry || entry.status !== candidate.status || entry.body !== candidate.body) continue;
+    const updatedHeaders = new Headers(entry.headers || []);
+    updatedHeaders.set("x-app-token", authToken);
+    updatedHeaders.delete("content-length");
+    let body = entry.body;
+    let payload = entry.payload;
+    if (entry.entity === "rpc:acknowledge_service_requests") {
+      payload = { ...JSON.parse(body), auth_token: authToken };
+      body = JSON.stringify(payload);
+    }
+    await putEntry({ ...entry, headers: [...updatedHeaders.entries()], body, payload,
+      status: "pending", nextAttemptAt: 0, lastError: "" });
   }
 };
 
@@ -685,7 +737,18 @@ const flushQueue = (force = false) => {
           syncLog("success", { operationId: entry.operationId, destination: "supabase", entity: entry.entity, attempts: entry.attempts, durationMs: Math.round(performance.now() - startedAt) });
           continue;
         }
-        const message = `${response.status} ${response.statusText}`.trim();
+        let message = `${response.status} ${response.statusText}`.trim();
+        try {
+          const detail = await response.clone().json();
+          const reason = [detail?.code, detail?.message, detail?.details, detail?.hint]
+            .filter((value) => typeof value === "string" && value).join(" · ");
+          if (reason) message += ` · ${reason}`;
+        } catch (_) { /* Un rechazo sin JSON conserva su codigo HTTP. */ }
+        // El diagnostico no debe guardar ni mostrar credenciales.
+        const secrets = [new Headers(entry.headers || []).get("x-app-token"),
+          entry.payload?.auth_token].filter(Boolean);
+        for (const secret of secrets) message = message.split(secret).join("[credencial]");
+        message = message.slice(0, 500);
         if (isTransientStatus(response.status)) {
           const attempts = Number(entry.attempts || 0) + 1;
           await putEntry({ ...entry, status: "pending", attempts, lastError: message, nextAttemptAt: Date.now() + retryDelay(attempts) });
@@ -866,6 +929,7 @@ self.addEventListener("message", (event) => {
   if (event.data?.type === "FLUSH_OFFLINE_QUEUE") {
     event.waitUntil(refreshQueuedSessionItemAuth(event.data?.authToken)
       .then(() => refreshQueuedTableSessionAuth(event.data?.authToken))
+      .then(() => refreshQueuedRequestAuth(event.data?.authToken))
       .then(() => reconcileTableSessionConflicts(event.data?.authToken, event.data?.force === true))
       .then(async (reconciled) => {
         const counts = await flushQueue(event.data?.force === true);

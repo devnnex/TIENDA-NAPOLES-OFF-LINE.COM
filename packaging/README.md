@@ -1,10 +1,28 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.4.exe` con Inno Setup 6. Esta versión
-agrega filtros de mesas y terrazas, selección segura de QR y control para
-habilitar su regeneración desde Marca. Conserva el acceso offline y el resto
-de la operación existente.
+`dist/Tienda-Napoles-Offline-Setup-1.0.6.exe` con Inno Setup 6. Esta versión
+abre la caja al cobrar desde Inicio, Atender mesa o Cuentas, tanto con recibo
+como sin él. Enter y Enter del teclado numérico cobran sin imprimir. La apertura
+usa la impresora POS o el puente de caja ya configurados; el recibo existente
+se imprime al pulsar Cobrar e imprimir.
+
+Conserva las correcciones de la versión 1.0.5, que
+corrige el clic de confirmar consumo cuando la lista de productos desplaza
+el botón en pantallas pequeñas, recupera solicitudes 400 y consumos 406 con
+una credencial nueva validada y define la identidad del icono anclado en Windows.
+Los rechazos que persistan conservan el mensaje real del servidor en el aviso.
+
+Para actualizar el PC del cliente, cierra las ventanas de Tienda Nápoles y
+ejecuta este instalador con el mismo usuario de Windows, en la misma carpeta.
+Abre el acceso directo del escritorio e inicia sesión con internet para validar
+la credencial y reintentar las operaciones pendientes. No desinstales ni borres
+los datos del navegador: ahí se conserva la cola. Si el aviso sigue rojo,
+copia el detalle al dejar el cursor sobre él; no significa que esté sincronizado.
+
+Para reemplazar un anclaje antiguo con el icono de Chrome, desancla esa entrada
+y ancla el acceso directo actualizado de Tienda Nápoles del menú Inicio.
+El anclaje abre el iniciador local y mantiene el icono del negocio.
 
 El instalador copia solo los archivos necesarios para ejecutar la aplicacion,
 crea el acceso directo del escritorio y una entrada del menu Inicio. Instala en

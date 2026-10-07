@@ -882,6 +882,114 @@ test("46 el estado de la cola identifica la mesa y el producto de cada operacion
   assert.equal(snapshot.issues.length, 1);
 });
 
+const acknowledgedEntry = (overrides = {}) => {
+  const payload = { auth_token: "expired-token", ids: ["request-1"], acknowledged_at: "2026-10-07T20:00:00Z", message: "Atendido" };
+  return pendingEntry({ entity: "rpc:acknowledge_service_requests", recordId: "", recordIds: [],
+    url: endpoint("rpc/acknowledge_service_requests"), method: "POST",
+    headers: [["apikey", "test"], ["content-type", "application/json"], ["x-app-token", "expired-token"]],
+    payload, body: JSON.stringify(payload), status: "failed", lastError: "400", ...overrides });
+};
+
+test("47 recupera la RPC 400 con credencial validada en cuerpo y cabecera", async () => {
+  const entry = acknowledgedEntry();
+  await api.putEntry(entry);
+  let validations = 0;
+  let sends = 0;
+  remoteFetch = async (input) => {
+    assert.equal(input.headers.get("x-app-token"), "valid-token");
+    const body = await input.json();
+    assert.equal(body.auth_token, "valid-token");
+    if (new URL(input.url).pathname.endsWith("/rpc/get_current_user")) {
+      validations += 1;
+      return new Response(JSON.stringify({ id: "staff-1" }), { status: 200 });
+    }
+    sends += 1;
+    assert.deepEqual(body.ids, entry.payload.ids);
+    assert.equal(body.acknowledged_at, entry.payload.acknowledged_at);
+    assert.equal(body.message, entry.payload.message);
+    return new Response("[]", { status: 200 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  const saved = (await api.listEntries())[0];
+  assert.equal(validations, 1);
+  assert.equal(sends, 1);
+  assert.equal(saved.status, "confirmed");
+  assert.equal(saved.operationId, entry.operationId);
+  assert.equal(saved.id, entry.id);
+});
+
+test("48 conserva la RPC rechazada si la sesion nueva no valida", async () => {
+  await api.putEntry(acknowledgedEntry());
+  let sends = 0;
+  remoteFetch = async (input) => {
+    if (!new URL(input.url).pathname.endsWith("/rpc/get_current_user")) sends += 1;
+    return new Response("{}", { status: 400 });
+  };
+  await flushAsAuthenticatedApp("invalid-token");
+  assert.equal(sends, 0);
+  assert.equal((await api.listEntries())[0].status, "failed");
+  assert.equal((await api.listEntries())[0].payload.auth_token, "expired-token");
+});
+
+test("49 no reintenta la RPC con el mismo token ni modifica otros rechazos", async () => {
+  await api.putEntry(acknowledgedEntry({ id: "same-token" }));
+  await api.putEntry(acknowledgedEntry({ id: "bad-schema", lastError: "404" }));
+  await api.putEntry(acknowledgedEntry({ id: "table-auth", headers: [["x-table-code", "mesa-1"]] }));
+  let sends = 0;
+  remoteFetch = async () => { sends += 1; return new Response("[]", { status: 200 }); };
+  await flushAsAuthenticatedApp("expired-token");
+  assert.equal(sends, 0);
+  assert.equal((await api.listEntries()).filter((entry) => entry.status === "failed").length, 3);
+});
+
+test("50 conserva el mensaje real del 400 y no oculta un rechazo persistente", async () => {
+  await api.putEntry(acknowledgedEntry());
+  let sends = 0;
+  remoteFetch = async (input) => {
+    if (new URL(input.url).pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "staff-1" }), { status: 200 });
+    sends += 1;
+    return new Response(JSON.stringify({ code: "P0001", message: "Solicitudes invalidas. valid-token", details: null }), { status: 400 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  await flushAsAuthenticatedApp("valid-token");
+  const saved = (await api.listEntries())[0];
+  assert.equal(sends, 1);
+  assert.equal(saved.status, "failed");
+  assert.match(saved.lastError, /400.*P0001.*Solicitudes invalidas/);
+  assert.doesNotMatch(saved.lastError, /valid-token/);
+});
+
+test("51 recupera un consumo 406 con sesion nueva sin duplicar su identidad", async () => {
+  const entry = pendingEntry({ entity: "session_items", method: "POST", url: endpoint("session_items"),
+    status: "conflict", lastError: "406", headers: [["x-app-token", "expired-token"]] });
+  await api.putEntry(entry);
+  let sends = 0;
+  remoteFetch = async (input) => {
+    assert.equal(input.headers.get("x-app-token"), "valid-token");
+    if (new URL(input.url).pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "staff-1" }), { status: 200 });
+    sends += 1;
+    assert.equal(await input.text(), entry.body);
+    return new Response(JSON.stringify({ id: "row-1" }), { status: 201 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal(sends, 1);
+  const saved = (await api.listEntries())[0];
+  assert.equal(saved.status, "confirmed");
+  assert.equal(saved.operationId, entry.operationId);
+  assert.equal(saved.body, entry.body);
+});
+
+test("52 no descarta un consumo 406 cuya fila sigue sin ser visible", async () => {
+  await api.putEntry(pendingEntry({ entity: "session_items", method: "PATCH", url: endpoint("session_items", "?id=eq.row-1"),
+    status: "conflict", lastError: "406", headers: [["x-app-token", "expired-token"]] }));
+  remoteFetch = async (input) => {
+    if (new URL(input.url).pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "staff-1" }), { status: 200 });
+    return input.method === "GET" ? new Response("[]", { status: 200 }) : new Response("{}", { status: 406 });
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
 (async () => {
   let passed = 0;
   for (const scenario of tests) {

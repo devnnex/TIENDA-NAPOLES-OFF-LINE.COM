@@ -1241,7 +1241,9 @@ const App = (() => {
     };
     const timer = window.setTimeout(() => finish({ ok: false, counts: { pending: 1 } }), timeoutMs);
     channel.port1.onmessage = (event) => finish(event.data || { ok: false, counts: { pending: 1 } });
-    controller.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force, authToken: state.authToken || "" }, [channel.port2]);
+    controller.postMessage({ type: "FLUSH_OFFLINE_QUEUE", force, authToken: state.authToken || "",
+      appsScriptUrl: isAppsScriptConfigured() ? getAppsScriptUrl() : "",
+      invoices: state.invoiceHistory.map(({ id, sessionId }) => ({ id, sessionId })) }, [channel.port2]);
   });
 
   const reportNetworkStatus = (online = navigator.onLine) => {

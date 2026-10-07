@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v18";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v19";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -450,6 +450,8 @@ const recoverInterruptedEntries = async () => {
   const entries = await listEntries();
   await Promise.all(entries
     .filter((entry) => entry.status === "syncing"
+      || (entry.status === "failed" && entry.entity === "rpc:acknowledge_service_requests"
+        && isAcknowledgeSqlError(entry.lastError) && Number(entry.nextAttemptAt || 0) <= Date.now())
       || (["failed", "conflict"].includes(entry.status)
         && ["table_sessions", "session_items"].includes(entry.entity)
         && !/^401(?:\b|\s)/.test(String(entry.lastError || ""))
@@ -602,6 +604,147 @@ const verifyRestMutation = async (entry) => {
   }
 };
 
+const isAcknowledgeSqlError = (message) => /\b0A000\b/.test(String(message || ""))
+  && /WITH clause containing a data-modifying statement must be at the top level/i.test(String(message || ""));
+
+const staffForEntry = async (entry) => {
+  const headers = new Headers(entry.headers || []);
+  if (headers.has("x-table-code") || headers.has("x-table-id")) return null;
+  const token = entry.payload?.auth_token || headers.get("x-app-token");
+  if (!token) return null;
+  headers.set("x-app-token", token);
+  ["content-length", "prefer", "accept-profile"].forEach((key) => headers.delete(key));
+  headers.set("Content-Type", "application/json");
+  headers.set("Accept", "application/json");
+  const response = await fetchWithTimeout(new Request(new URL("/rest/v1/rpc/get_current_user", entry.url), {
+    method: "POST", headers, body: JSON.stringify({ auth_token: token })
+  }), REMOTE_WRITE_TIMEOUT_MS);
+  if (!response.ok) return null;
+  const user = await response.json();
+  return user?.id ? { user, headers } : null;
+};
+
+const readStaffRows = async (entry, headers, table, ids) => {
+  const url = new URL(`/rest/v1/${table}`, entry.url);
+  url.searchParams.set("id", ids.length === 1 ? `eq.${ids[0]}` : `in.(${ids.join(",")})`);
+  url.searchParams.set("select", "*");
+  const readHeaders = new Headers(headers);
+  readHeaders.delete("content-type");
+  readHeaders.delete("prefer");
+  const response = await fetchWithTimeout(new Request(url, { headers: readHeaders }), REMOTE_WRITE_TIMEOUT_MS);
+  if (!response.ok) return null;
+  const rows = await response.json();
+  return Array.isArray(rows) ? rows : null;
+};
+
+const hasQueuedCreate = async (entity, ids) => (await listEntries()).some((stored) => {
+  const candidate = normalizeStoredEntry(stored);
+  if (candidate.status === "confirmed" || candidate.method !== "POST") return false;
+  if (candidate.entity === entity) return (candidate.recordIds || [candidate.recordId]).some((id) => ids.includes(id));
+  if (entity !== "service_requests") return false;
+  if (candidate.entity === "rpc:create_service_request") return ids.includes(candidate.payload?.request_id);
+  return candidate.entity === "rpc:create_service_requests_batch"
+    && (candidate.payload?.requests || []).some((request) => ids.includes(request.request_id));
+});
+
+// El worker ya respondio localmente a la RPC: el fallback REST de app.js no
+// puede ver su rechazo posterior. Reproducirlo aqui SOLO ante el error SQL
+// confirmado, con una sesion validada y comprobacion remota del resultado.
+const acknowledgeThroughRest = async (entry) => {
+  const payload = entry.payload;
+  if (entry.entity !== "rpc:acknowledge_service_requests" || !Array.isArray(payload?.ids)
+    || !payload.ids.length || payload.ids.length > 50
+    || payload.ids.some((id) => typeof id !== "string" || !/^[\w-]+$/.test(id))) return false;
+  const staff = await staffForEntry(entry);
+  if (!staff) return false;
+  const ids = [...new Set(payload.ids)];
+  const before = await readStaffRows(entry, staff.headers, "service_requests", ids);
+  if (!before) return false;
+  const missing = ids.filter((id) => !before.some((row) => row.id === id));
+  if (await hasQueuedCreate("service_requests", missing)) return false;
+  const live = before.filter((row) => ["pending", "acknowledged"].includes(row.status));
+  const update = {
+    status: "acknowledged", acknowledged_by_user_id: staff.user.id,
+    acknowledged_at: payload.acknowledged_at || new Date().toISOString(),
+    ...(payload.message == null ? {} : { message: String(payload.message).slice(0, 1000) })
+  };
+  if (live.length) {
+    const url = new URL("/rest/v1/service_requests", entry.url);
+    url.searchParams.set("id", `in.(${live.map((row) => row.id).join(",")})`);
+    // Una solicitud resuelta mientras se envia nunca debe volver a abrirse.
+    url.searchParams.set("status", "in.(pending,acknowledged)");
+    const headers = new Headers(staff.headers);
+    headers.set("Prefer", "return=representation");
+    const response = await fetchWithTimeout(new Request(url, {
+      method: "PATCH", headers, body: JSON.stringify(update)
+    }), REMOTE_WRITE_TIMEOUT_MS);
+    if (!response.ok) return false;
+  }
+  const after = await readStaffRows(entry, staff.headers, "service_requests", ids);
+  if (!after || await hasQueuedCreate("service_requests", ids.filter((id) => !after.some((row) => row.id === id)))) return false;
+  return after.every((row) => row.status === "resolved"
+    || (row.status === "acknowledged" && row.acknowledged_by_user_id === update.acknowledged_by_user_id
+      && new Date(row.acknowledged_at).getTime() === new Date(update.acknowledged_at).getTime()
+      && (payload.message == null || row.message === update.message)));
+};
+
+let archiveReadConfig = null;
+
+const verifyArchivedItem = async (entry, token) => {
+  if (!archiveReadConfig || !entry.payload?.session_id) return false;
+  // Solo lectura del historial ya existente. No registra ventas, no descuenta
+  // inventario y no considera la mera ausencia de una mesa prueba de cobro.
+  const invoice = archiveReadConfig.invoices.find((row) => row.sessionId === entry.payload.session_id);
+  const response = await fetchWithTimeout(new Request(archiveReadConfig.url, {
+    method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action: "get_income_report", authToken: token, origin: self.location.origin,
+      payload: { filters: { dateFrom: "2000-01-01", dateTo: "2100-12-31", paymentMethod: "all",
+        query: invoice?.id || "", limit: 500 } } }), redirect: "follow"
+  }), REMOTE_WRITE_TIMEOUT_MS);
+  if (!response.ok) return false;
+  const result = await response.json();
+  if (!result?.ok || result.stale || !Array.isArray(result.records)) return false;
+  const sale = result.records.find((row) => row.sessionId === entry.payload.session_id);
+  const line = sale?.items?.find((row) => row.lineId === entry.recordId);
+  return Boolean(line && line.name === entry.payload.item_name
+    && Number(line.quantity) === Number(entry.payload.quantity)
+    && Number(line.unitPrice) === Number(entry.payload.unit_price)
+    && String(line.menuItemId || "") === String(entry.payload.menu_item_id || ""));
+};
+
+// PGRST116 con cero filas no prueba que se haya guardado el consumo. Para
+// un PATCH completo en una cuenta abierta se restaura el MISMO UUID; para
+// una cuenta archivada se exige el detalle de la factura remota coincidente.
+const recoverMissingSessionItem = async (entry, response) => {
+  if (entry.entity !== "session_items" || entry.method !== "PATCH" || !entry.recordId
+    || !entry.payload || Array.isArray(entry.payload)) return "";
+  const error = await response.clone().json().catch(() => null);
+  if (error?.code !== "PGRST116" || !/\b0 rows\b/i.test(String(error.details || ""))) return "";
+  const staff = await staffForEntry(entry);
+  if (!staff) return "";
+  const rows = await readStaffRows(entry, staff.headers, "session_items", [entry.recordId]);
+  if (!rows || rows.length || await hasQueuedCreate("session_items", [entry.recordId])) return "";
+  if (entry.payload.status === "cancelled") return "already_removed";
+  const payload = entry.payload;
+  if (!payload.session_id || !payload.table_id || !payload.item_name || payload.status !== "served"
+    || !Number.isFinite(Number(payload.unit_price)) || Number(payload.unit_price) < 0
+    || !Number.isInteger(Number(payload.quantity)) || Number(payload.quantity) < 1 || Number(payload.quantity) > 100) return "";
+  const sessions = await readStaffRows(entry, staff.headers, "table_sessions", [payload.session_id]);
+  if (!sessions || await hasQueuedCreate("table_sessions", [payload.session_id])) return "";
+  if (!sessions.length || sessions[0].status === "closed") {
+    return await verifyArchivedItem(entry, staff.headers.get("x-app-token")) ? "already_in_remote_invoice" : "";
+  }
+  if (sessions.length !== 1 || sessions[0].status !== "open" || sessions[0].table_id !== payload.table_id) return "";
+  const headers = new Headers(staff.headers);
+  headers.set("Prefer", "return=representation");
+  const restored = await fetchWithTimeout(new Request(new URL("/rest/v1/session_items", entry.url), {
+    method: "POST", headers, body: JSON.stringify({ ...payload, id: entry.recordId,
+      created_by_user_id: payload.created_by_user_id || staff.user.id })
+  }), REMOTE_WRITE_TIMEOUT_MS);
+  if (!restored.ok && restored.status !== 409) return "";
+  return await verifyRestMutation(entry) ? "missing_item_restored" : "";
+};
+
 const isReconcilableTableSessionPatch = (entry) => {
   if (entry.entity !== "table_sessions" || entry.method !== "PATCH"
     || !entry.recordId || !entry.payload || Array.isArray(entry.payload)) return false;
@@ -717,6 +860,7 @@ const flushQueue = (force = false) => {
         const response = await fetchWithTimeout(queuedRequest, REMOTE_WRITE_TIMEOUT_MS);
         let confirmed = response.ok;
         let reconciledSessionPatch = false;
+        let reconciledAs = "";
         // PostgREST puede responder 200 a un PATCH/DELETE cuyo filtro no
         // encontro filas. Para operaciones con identidad estable comprobamos
         // el estado final antes de liberar la cola.
@@ -728,10 +872,22 @@ const flushQueue = (force = false) => {
         if (!confirmed && response.status === 406) {
           reconciledSessionPatch = await verifySettledTableSessionPatch(entry);
           confirmed = reconciledSessionPatch;
+          if (!confirmed) {
+            reconciledAs = await recoverMissingSessionItem(entry, response);
+            confirmed = Boolean(reconciledAs);
+          }
+        }
+        if (!confirmed && response.status === 400 && entry.entity === "rpc:acknowledge_service_requests") {
+          const detail = await response.clone().json().catch(() => null);
+          if (isAcknowledgeSqlError(`${detail?.code} ${detail?.message}`)) {
+            confirmed = await acknowledgeThroughRest(entry);
+            if (confirmed) reconciledAs = "acknowledged_through_rest";
+          }
         }
         if (confirmed) {
           await putEntry({ ...entry, status: "confirmed", confirmedAt: new Date().toISOString(), lastError: "",
-            ...(reconciledSessionPatch ? { reconciledAs: "already_closed_or_removed" } : {}) });
+            ...(reconciledSessionPatch ? { reconciledAs: "already_closed_or_removed" }
+              : reconciledAs ? { reconciledAs } : {}) });
           scheduleConfirmedCleanup();
           confirmedAny = true;
           syncLog("success", { operationId: entry.operationId, destination: "supabase", entity: entry.entity, attempts: entry.attempts, durationMs: Math.round(performance.now() - startedAt) });
@@ -763,7 +919,9 @@ const flushQueue = (force = false) => {
             break;
           }
           const status = [406, 409].includes(response.status) ? "conflict" : "failed";
-          await putEntry({ ...entry, status, attempts: Number(entry.attempts || 0) + 1, lastError: message });
+          await putEntry({ ...entry, status, attempts: Number(entry.attempts || 0) + 1, lastError: message,
+            ...(entry.entity === "rpc:acknowledge_service_requests" && isAcknowledgeSqlError(message)
+              ? { nextAttemptAt: Date.now() + 30_000 } : {}) });
           syncLog(status, { operationId: entry.operationId, destination: "supabase", attempts: Number(entry.attempts || 0) + 1, durationMs: Math.round(performance.now() - startedAt), error: message });
           await notifyClients("OFFLINE_SYNC_ISSUE", { status, operationId: entry.operationId, entity: entry.entity });
         }
@@ -927,6 +1085,15 @@ self.addEventListener("message", (event) => {
     networkAvailable = event.data.online !== false;
   }
   if (event.data?.type === "FLUSH_OFFLINE_QUEUE") {
+    archiveReadConfig = null;
+    try {
+      const url = new URL(event.data?.appsScriptUrl);
+      if (url.protocol === "https:" && url.hostname === "script.google.com"
+        && /^\/macros\/s\/[\w-]+\/exec$/.test(url.pathname)) {
+        archiveReadConfig = { url: url.href,
+          invoices: Array.isArray(event.data?.invoices) ? event.data.invoices : [] };
+      }
+    } catch (_) { /* La configuracion es opcional; sin prueba no se libera el consumo. */ }
     event.waitUntil(refreshQueuedSessionItemAuth(event.data?.authToken)
       .then(() => refreshQueuedTableSessionAuth(event.data?.authToken))
       .then(() => refreshQueuedRequestAuth(event.data?.authToken))

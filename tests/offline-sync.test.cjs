@@ -124,6 +124,7 @@ const pendingEntry = (overrides = {}) => ({
 
 const reset = () => {
   records.clear();
+  vm.runInContext("archiveReadConfig = null", context);
   remoteFetch = async () => new Response("[]", { status: 200 });
 };
 
@@ -441,11 +442,11 @@ test("23 una cola de mesas protege el snapshot operativo", async () => {
   assert.equal(reads, 0);
 });
 
-const flushAsAuthenticatedApp = async (authToken) => {
+const flushAsAuthenticatedApp = async (authToken, detail = {}) => {
   let task;
   let result;
   listeners.get("message")({
-    data: { type: "FLUSH_OFFLINE_QUEUE", force: true, authToken },
+    data: { type: "FLUSH_OFFLINE_QUEUE", force: true, authToken, ...detail },
     waitUntil: (promise) => { task = promise; },
     ports: [{ postMessage: (message) => { result = message; } }]
   });
@@ -988,6 +989,274 @@ test("52 no descarta un consumo 406 cuya fila sigue sin ser visible", async () =
   };
   await flushAsAuthenticatedApp("valid-token");
   assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+const sqlFailure = () => new Response(JSON.stringify({ code: "0A000",
+  message: "WITH clause containing a data-modifying statement must be at the top level" }), { status: 400 });
+const missingFailure = () => new Response(JSON.stringify({ code: "PGRST116",
+  message: "Cannot coerce the result to a single JSON object", details: "The result contains 0 rows" }), { status: 406 });
+const sqlRejectedEntry = (overrides = {}) => acknowledgedEntry({
+  lastError: "400 · 0A000 · WITH clause containing a data-modifying statement must be at the top level", ...overrides
+});
+const completeItemEntry = (overrides = {}) => {
+  const payload = { session_id: "session-1", table_id: "table-1", menu_item_id: "product-1",
+    item_name: "Cerveza", quantity: 2, unit_price: 4500, status: "served", notes: "",
+    updated_by_user_id: "staff-1" };
+  return pendingEntry({ entity: "session_items", recordId: "item-1", recordIds: ["item-1"],
+    url: endpoint("session_items", "?id=eq.item-1&select=*"), method: "PATCH",
+    headers: [["apikey", "test"], ["x-app-token", "expired-token"], ["accept", "application/vnd.pgrst.object+json"]],
+    status: "conflict", lastError: "406 · PGRST116 · The result contains 0 rows",
+    payload, body: JSON.stringify(payload), ...overrides });
+};
+
+test("53 reproduce tres RPC 0A000 y consumo 406 de la foto, y libera la cola completa", async () => {
+  const requests = new Map();
+  for (let index = 0; index < 3; index += 1) {
+    const payload = { ...acknowledgedEntry().payload, ids: [`request-${index}`] };
+    requests.set(payload.ids[0], { id: payload.ids[0], status: "pending" });
+    await api.putEntry(sqlRejectedEntry({ id: `rpc-${index}`, createdOrder: index + 1, payload, body: JSON.stringify(payload) }));
+  }
+  const item = completeItemEntry({ createdOrder: 4 });
+  await api.putEntry(item);
+  await api.putEntry(pendingEntry({ id: "next-write", createdOrder: 5 }));
+  let savedItem = null;
+  let inserts = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/acknowledge_service_requests")) return sqlFailure();
+    if (url.pathname.endsWith("/rpc/get_current_user")) return Response.json({ id: "staff-1" });
+    if (url.pathname.endsWith("/service_requests")) {
+      const filter = url.searchParams.get("id");
+      const rows = [...requests.values()].filter((row) => filter.includes(row.id));
+      if (input.method === "PATCH") {
+        const patch = await input.json();
+        assert.equal(input.headers.get("accept"), "application/json");
+        rows.forEach((row) => Object.assign(row, patch));
+      }
+      return Response.json(rows);
+    }
+    if (url.pathname.endsWith("/table_sessions")) return Response.json([{ id: "session-1", table_id: "table-1", status: "open" }]);
+    if (url.pathname.endsWith("/session_items")) {
+      if (input.method === "PATCH") return missingFailure();
+      if (input.method === "POST") {
+        inserts += 1;
+        savedItem = await input.json();
+        assert.equal(savedItem.id, item.recordId);
+        return Response.json([savedItem], { status: 201 });
+      }
+      return Response.json(savedItem ? [savedItem] : []);
+    }
+    return Response.json([], { status: 201 });
+  };
+  // El token NO cambia: la causa de la foto es SQL, no una sesion vencida.
+  await flushAsAuthenticatedApp("expired-token");
+  assert.equal(inserts, 1);
+  const saved = await api.listEntries();
+  assert.equal(saved.length, 5);
+  assert.equal(saved.filter((row) => row.status === "confirmed").length, 5);
+  assert.equal(saved.find((row) => row.id === item.id).reconciledAs, "missing_item_restored");
+  assert.equal(saved.find((row) => row.id === item.id).operationId, item.operationId);
+  assert.equal(savedItem.quantity * savedItem.unit_price, 9000);
+});
+
+test("54 no aplica el fallback de solicitudes a un 400 distinto de 0A000", async () => {
+  await api.putEntry(sqlRejectedEntry({ status: "pending" }));
+  let patches = 0;
+  remoteFetch = async (input) => {
+    if (input.method === "PATCH") patches += 1;
+    return Response.json({ code: "P0001", message: "Solicitudes invalidas." }, { status: 400 });
+  };
+  await api.flushQueue(true);
+  assert.equal(patches, 0);
+  assert.equal((await api.listEntries())[0].status, "failed");
+});
+
+test("55 no modifica solicitudes si la credencial no valida", async () => {
+  await api.putEntry(sqlRejectedEntry());
+  let patches = 0;
+  remoteFetch = async (input) => {
+    if (input.method === "PATCH") patches += 1;
+    return new URL(input.url).pathname.endsWith("/rpc/acknowledge_service_requests")
+      ? sqlFailure() : Response.json({}, { status: 401 });
+  };
+  await api.flushQueue(true);
+  assert.equal(patches, 0);
+  assert.equal((await api.listEntries())[0].status, "failed");
+});
+
+test("56 no confirma fallback REST 200 si el servidor no guardo el cambio", async () => {
+  await api.putEntry(sqlRejectedEntry());
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/acknowledge_service_requests")) return sqlFailure();
+    if (url.pathname.endsWith("/rpc/get_current_user")) return Response.json({ id: "staff-1" });
+    return Response.json([{ id: "request-1", status: "pending" }]);
+  };
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].status, "failed");
+});
+
+test("57 una solicitud ya resuelta no se vuelve a abrir", async () => {
+  await api.putEntry(sqlRejectedEntry());
+  let patches = 0;
+  remoteFetch = async (input) => {
+    if (input.method === "PATCH") patches += 1;
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/acknowledge_service_requests")) return sqlFailure();
+    if (url.pathname.endsWith("/rpc/get_current_user")) return Response.json({ id: "staff-1" });
+    return Response.json([{ id: "request-1", status: "resolved" }]);
+  };
+  await api.flushQueue(true);
+  assert.equal(patches, 0);
+  assert.equal((await api.listEntries())[0].status, "confirmed");
+});
+
+test("58 no da por retirada una solicitud que todavia debe crearse", async () => {
+  await api.putEntry(sqlRejectedEntry({ createdOrder: 1 }));
+  const payload = { request_id: "request-1" };
+  await api.putEntry(pendingEntry({ id: "later-create", entity: "rpc:create_service_request", payload,
+    body: JSON.stringify(payload), createdOrder: 2, status: "failed", lastError: "401" }));
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/acknowledge_service_requests")) return sqlFailure();
+    if (url.pathname.endsWith("/rpc/get_current_user")) return Response.json({ id: "staff-1" });
+    return Response.json([]);
+  };
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries()).find((row) => row.entity === "rpc:acknowledge_service_requests").status, "failed");
+});
+
+const missingItemServer = ({ parent = "open", staffValid = true, invoice = null, rejectInsert = false } = {}) => {
+  let restored = null;
+  const calls = [];
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    calls.push({ method: input.method, path: url.pathname });
+    if (url.hostname === "script.google.com") {
+      const body = await input.json();
+      assert.equal(body.action, "get_income_report");
+      return Response.json({ ok: true, records: invoice ? [invoice] : [] });
+    }
+    if (url.pathname.endsWith("/rpc/get_current_user")) return staffValid
+      ? Response.json({ id: "staff-1" }) : Response.json({}, { status: 401 });
+    if (url.pathname.endsWith("/table_sessions")) return Response.json(parent === "absent" ? []
+      : [{ id: "session-1", table_id: "table-1", status: parent }]);
+    if (input.method === "PATCH") return missingFailure();
+    if (input.method === "POST") {
+      if (rejectInsert) return Response.json({}, { status: 409 });
+      restored = await input.json();
+      return Response.json([restored], { status: 201 });
+    }
+    return Response.json(restored ? [restored] : []);
+  };
+  return calls;
+};
+
+test("59 cancelacion de un consumo ausente no crea cargos nuevos", async () => {
+  const payload = { status: "cancelled", updated_by_user_id: "staff-1" };
+  await api.putEntry(completeItemEntry({ payload, body: JSON.stringify(payload) }));
+  const calls = missingItemServer();
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].reconciledAs, "already_removed");
+  assert.equal(calls.filter((call) => call.method === "POST" && call.path.endsWith("/session_items")).length, 0);
+});
+
+test("60 un consumo oculto por credencial invalida no se considera retirado", async () => {
+  const payload = { status: "cancelled" };
+  await api.putEntry(completeItemEntry({ payload, body: JSON.stringify(payload) }));
+  const calls = missingItemServer({ staffValid: false });
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+  assert.equal(calls.filter((call) => call.path.endsWith("/table_sessions")).length, 0);
+});
+
+test("61 cuenta ausente sin factura comprobada conserva el consumo pendiente", async () => {
+  await api.putEntry(completeItemEntry());
+  const calls = missingItemServer({ parent: "absent" });
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+  assert.equal(calls.filter((call) => call.method === "POST" && call.path.endsWith("/session_items")).length, 0);
+});
+
+const remoteInvoice = { sessionId: "session-1", items: [{ lineId: "item-1", name: "Cerveza",
+  quantity: 2, unitPrice: 4500, menuItemId: "product-1" }] };
+const configureArchiveRead = () => vm.runInContext(`archiveReadConfig = {
+  url: "https://script.google.com/macros/s/test/exec", invoices: []
+}`, context);
+
+test("62 consumo facturado se verifica por UUID, precio y cantidad en el servidor", async () => {
+  await api.putEntry(completeItemEntry());
+  configureArchiveRead();
+  const calls = missingItemServer({ parent: "absent", invoice: remoteInvoice });
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].reconciledAs, "already_in_remote_invoice");
+  assert.equal(calls.filter((call) => call.path.endsWith("/exec")).length, 1);
+  assert.equal(calls.filter((call) => call.method === "POST" && call.path.endsWith("/session_items")).length, 0);
+});
+
+test("63 factura con cantidad distinta no libera el consumo", async () => {
+  await api.putEntry(completeItemEntry());
+  configureArchiveRead();
+  missingItemServer({ parent: "closed", invoice: { ...remoteInvoice,
+    items: [{ ...remoteInvoice.items[0], quantity: 1 }] } });
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("64 un INSERT de recuperacion rechazado conserva la identidad y el conflicto", async () => {
+  const entry = completeItemEntry();
+  await api.putEntry(entry);
+  missingItemServer({ rejectInsert: true });
+  await api.flushQueue(true);
+  const saved = (await api.listEntries())[0];
+  assert.equal(saved.status, "conflict");
+  assert.equal(saved.body, entry.body);
+  assert.equal(saved.operationId, entry.operationId);
+});
+
+test("65 no omite la creacion pendiente del mismo consumo", async () => {
+  await api.putEntry(completeItemEntry({ createdOrder: 1 }));
+  await api.putEntry(completeItemEntry({ id: "unsaved-create", method: "POST", status: "failed", lastError: "401",
+    createdOrder: 2 }));
+  const calls = missingItemServer();
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries()).find((row) => row.method === "PATCH").status, "conflict");
+  assert.equal(calls.filter((call) => call.method === "POST" && call.path.endsWith("/session_items")).length, 0);
+});
+
+test("66 un POST 406 o respuesta singular con varias filas no se descarta", async () => {
+  await api.putEntry(completeItemEntry({ method: "POST", status: "pending" }));
+  remoteFetch = async () => missingFailure();
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+  reset();
+  await api.putEntry(completeItemEntry());
+  remoteFetch = async (input) => input.method === "PATCH"
+    ? Response.json({ code: "PGRST116", details: "The result contains 2 rows" }, { status: 406 })
+    : Response.json([]);
+  await api.flushQueue(true);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("67 el mensaje real de la app configura solo la lectura de la factura remota", async () => {
+  await api.putEntry(completeItemEntry());
+  missingItemServer({ parent: "closed", invoice: remoteInvoice });
+  await flushAsAuthenticatedApp("expired-token", {
+    appsScriptUrl: "https://script.google.com/macros/s/test/exec",
+    invoices: [{ id: "invoice-1", sessionId: "session-1" }]
+  });
+  assert.equal((await api.listEntries())[0].reconciledAs, "already_in_remote_invoice");
+});
+
+test("68 sin configuracion valida no envia credenciales ni descarta el conflicto", async () => {
+  await api.putEntry(completeItemEntry());
+  configureArchiveRead();
+  const calls = missingItemServer({ parent: "absent", invoice: remoteInvoice });
+  await flushAsAuthenticatedApp("expired-token", {
+    appsScriptUrl: "https://otra-web.example/macros/s/test/exec", invoices: []
+  });
+  assert.equal((await api.listEntries())[0].status, "conflict");
+  assert.equal(calls.filter((call) => call.path.endsWith("/exec")).length, 0);
 });
 
 (async () => {

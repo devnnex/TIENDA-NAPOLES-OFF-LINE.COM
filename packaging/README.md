@@ -1,8 +1,25 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.6.exe` con Inno Setup 6. Esta versión
-abre la caja al cobrar desde Inicio, Atender mesa o Cuentas, tanto con recibo
+`dist/Tienda-Napoles-Offline-Setup-1.0.7.exe` con Inno Setup 6. Esta versión
+recupera las solicitudes bloqueadas por el error SQL `0A000` del servidor,
+incluso si el token no cambia. Usa el guardado REST ya previsto por la app,
+valida primero al usuario y comprueba el resultado remoto. Un consumo `406`
+no se descarta por estar ausente: se restaura el mismo UUID si su cuenta está
+abierta y el cambio conserva los datos completos; si está facturado, debe
+coincidir con la línea de la factura remota. Una cancelación ya ausente se
+concilia solo con acceso autenticado y sin una creación pendiente del consumo.
+Los casos sin evidencia suficiente conservan el conflicto y sus datos.
+
+La corrección SQL de origen está en
+`supabase/fix-acknowledge-service-requests.sql`: ejecutarla en el SQL Editor
+del mismo proyecto Supabase reemplaza únicamente esa función, conservando
+autenticación, firma y permisos. Subir el archivo a GitHub o reinstalar no
+ejecuta SQL en Supabase. La recuperación del instalador funciona mediante
+REST aunque todavía no se haya aplicado ese archivo al servidor.
+
+Conserva el comportamiento de la versión 1.0.6: abre la caja al cobrar
+desde Inicio, Atender mesa o Cuentas, tanto con recibo
 como sin él. Enter y Enter del teclado numérico cobran sin imprimir. La apertura
 usa la impresora POS o el puente de caja ya configurados; el recibo existente
 se imprime al pulsar Cobrar e imprimir.

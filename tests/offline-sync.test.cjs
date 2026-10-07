@@ -124,7 +124,7 @@ const pendingEntry = (overrides = {}) => ({
 
 const reset = () => {
   records.clear();
-  vm.runInContext("archiveReadConfig = null", context);
+  vm.runInContext("archiveReadConfig = null; scopedAdminReaders.clear()", context);
   remoteFetch = async () => new Response("[]", { status: 200 });
 };
 
@@ -595,7 +595,7 @@ test("29 confirma cierre 406 si la venta ya archivo la cuenta remota", async () 
   assert.equal(stored.operationId, entry.operationId);
 });
 
-test("30 conserva el conflicto 406 si la cuenta sigue abierta", async () => {
+test("30 reintenta el cierre original de una cuenta abierta y conserva un rechazo persistente", async () => {
   await api.putEntry(closedSessionEntry());
   let patches = 0;
   remoteFetch = async (input) => {
@@ -607,7 +607,7 @@ test("30 conserva el conflicto 406 si la cuenta sigue abierta", async () => {
   };
   await flushAsAuthenticatedApp("valid-token");
   await flushAsAuthenticatedApp("valid-token");
-  assert.equal(patches, 0);
+  assert.equal(patches, 2);
   assert.equal((await api.listEntries())[0].status, "conflict");
 });
 
@@ -635,8 +635,8 @@ test("32 reconcilia el 406 de un cierre que aun estaba pendiente", async () => {
   assert.equal((await api.listEntries())[0].status, "confirmed");
 });
 
-test("33 no resuelve un 406 de otra actualizacion de mesa", async () => {
-  const payload = { table_id: "different-table" };
+test("33 no resuelve un 406 de importes que no representan un cierre", async () => {
+  const payload = { subtotal: 12345 };
   await api.putEntry(closedSessionEntry({ payload, body: JSON.stringify(payload) }));
   let patches = 0;
   remoteFetch = async (input) => {
@@ -792,7 +792,7 @@ test("41 renueva la credencial del 406 de nombre antes de conciliar", async () =
   assert.equal((await api.listEntries())[0].status, "confirmed");
 });
 
-test("42 conserva el 406 de nombre si la cuenta aun existe con otros datos", async () => {
+test("42 reintenta el nombre de una cuenta abierta y conserva el 406 si persiste", async () => {
   await api.putEntry(metadataSessionEntry());
   let patches = 0;
   remoteFetch = async (input) => {
@@ -805,7 +805,7 @@ test("42 conserva el 406 de nombre si la cuenta aun existe con otros datos", asy
     return new Response("{}", { status: 406 });
   };
   await flushAsAuthenticatedApp("valid-token");
-  assert.equal(patches, 0);
+  assert.equal(patches, 1);
   assert.equal((await api.listEntries())[0].status, "conflict");
 });
 
@@ -1257,6 +1257,138 @@ test("68 sin configuracion valida no envia credenciales ni descarta el conflicto
   });
   assert.equal((await api.listEntries())[0].status, "conflict");
   assert.equal(calls.filter((call) => call.path.endsWith("/exec")).length, 0);
+});
+
+const zonesEntry = (overrides = {}) => {
+  const payload = { auth_token: "valid-token", outdoor_table_ids: ["table-1"] };
+  return pendingEntry({ entity: "rpc:save_table_zones", recordId: "", recordIds: [],
+    method: "POST", url: endpoint("rpc/save_table_zones"),
+    headers: [["apikey", "test"], ["x-app-token", "valid-token"]], payload, body: JSON.stringify(payload),
+    status: "failed", lastError: "400 · 21000 · UPDATE requires a WHERE clause", ...overrides });
+};
+const zonesFailure = () => Response.json({ code: "21000", message: "UPDATE requires a WHERE clause" }, { status: 400 });
+
+test("69 reproduce la foto: zonas 21000 y cierre 406 se recuperan con el mismo token", async () => {
+  await api.putEntry(zonesEntry({ createdOrder: 1 }));
+  const close = closedSessionEntry({ createdOrder: 2 });
+  await api.putEntry(close);
+  const tables = [{ id: "table-1", is_outdoor: false }, { id: "table-2", is_outdoor: true },
+    { id: "bar-1", qr_code: "interno-bar-1", is_outdoor: true }];
+  let session = { id: "session-1", status: "open" };
+  let closes = 0;
+  remoteFetch = async (input) => {
+    const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_current_user")) return Response.json({ id: "staff-1", role: "boss" });
+    if (url.pathname.endsWith("/rpc/save_table_zones")) return zonesFailure();
+    if (url.pathname.endsWith("/restaurant_tables")) {
+      if (input.method === "PATCH") {
+        assert.ok(url.searchParams.get("id"));
+        const patch = await input.json();
+        assert.deepEqual(Object.keys(patch), ["is_outdoor"]);
+        tables.filter((row) => url.searchParams.get("id").includes(row.id)).forEach((row) => Object.assign(row, patch));
+      }
+      return Response.json(tables);
+    }
+    if (url.pathname.endsWith("/table_sessions")) {
+      if (input.method === "PATCH") {
+        closes += 1;
+        assert.equal(url.searchParams.get("id"), "eq.session-1");
+        assert.equal(url.searchParams.get("status"), "eq.open");
+        session = { ...session, ...await input.json() };
+      }
+      return Response.json([session]);
+    }
+    throw Error('Destino no previsto');
+  };
+  await flushAsAuthenticatedApp("valid-token");
+  const saved = await api.listEntries();
+  assert.equal(saved.filter((row) => row.status === "confirmed").length, 2);
+  assert.equal(closes, 1);
+  assert.equal(session.total, 12000);
+  assert.deepEqual(tables.map((row) => row.is_outdoor), [true, false, true]);
+  assert.equal(saved.find((row) => row.id === close.id).operationId, close.operationId);
+});
+
+test("70 un rechazo de una cuenta no bloquea otra, pero conserva el orden de su propia cuenta", async () => {
+  const rowA = closedSessionEntry({ id: "a", status: "pending", lastError: "", createdOrder: 1 });
+  const rowB = closedSessionEntry({ id: "b", recordId: "session-2", recordIds: ["session-2"],
+    url: endpoint("table_sessions", "?id=eq.session-2"), status: "pending", lastError: "", createdOrder: 2 });
+  const rowC = closedSessionEntry({ id: "c", status: "pending", lastError: "", createdOrder: 3 });
+  for (const row of [rowA, rowB, rowC]) await api.putEntry(row);
+  const sent = [];
+  remoteFetch = async (input) => {
+    const id = new URL(input.url).searchParams.get("id");
+    if (input.method === "GET") return Response.json([{ id: "session-2", ...rowB.payload }]);
+    sent.push(id);
+    return id === "eq.session-1" ? Response.json({ message: "Rechazo real" }, { status: 400 }) : Response.json([]);
+  };
+  await api.flushQueue(true);
+  assert.deepEqual(sent, ["eq.session-1", "eq.session-2"]);
+  const saved = await api.listEntries();
+  assert.equal(saved.find((row) => row.id === "a").status, "failed");
+  assert.equal(saved.find((row) => row.id === "b").status, "confirmed");
+  assert.equal(saved.find((row) => row.id === "c").status, "pending");
+});
+
+test("71 no adelanta un cambio a la creacion del mismo producto en espera", async () => {
+  await api.putEntry(pendingEntry({ id: "create", createdOrder: 1, nextAttemptAt: Date.now() + 60000 }));
+  await api.putEntry(pendingEntry({ id: "change", createdOrder: 2, method: "PATCH" }));
+  await api.putEntry(pendingEntry({ id: "other", recordId: "row-2", recordIds: ["row-2"],
+    payload: { id: "row-2", name: "Otro" }, body: JSON.stringify({ id: "row-2", name: "Otro" }), createdOrder: 3 }));
+  let sent = 0;
+  remoteFetch = async () => { sent++; return Response.json([], { status: 201 }); };
+  await api.flushQueue(false);
+  assert.equal(sent, 1);
+  assert.equal((await api.listEntries()).find((row) => row.id === "change").status, "pending");
+  assert.equal((await api.listEntries()).find((row) => row.id === "other").status, "confirmed");
+});
+
+test("72 valida y renueva la credencial de catalogo y otras RPC sin cambiar el cuerpo operativo", async () => {
+  const payload = { p_auth_token: "old-token", p_session_id: "chat-1" };
+  await api.putEntry(pendingEntry({ id: "chat", entity: "rpc:close_chat_session", recordIds: [], recordId: "",
+    url: endpoint("rpc/close_chat_session"), payload, body: JSON.stringify(payload),
+    headers: [["x-app-token", "old-token"]], status: "failed", lastError: "400", createdOrder: 1 }));
+  await api.putEntry(pendingEntry({ id: "product", headers: [["x-app-token", "old-token"]],
+    status: "failed", lastError: "401", createdOrder: 2 }));
+  let writes = 0;
+  remoteFetch = async (input) => {
+    assert.equal(input.headers.get("x-app-token"), "new-token");
+    if (new URL(input.url).pathname.endsWith("/rpc/get_current_user")) return Response.json({ id: "boss", role: "boss" });
+    writes++;
+    if (new URL(input.url).pathname.endsWith("/close_chat_session")) assert.deepEqual(await input.json(),
+      { p_auth_token: "new-token", p_session_id: "chat-1" });
+    return Response.json([]);
+  };
+  await flushAsAuthenticatedApp("new-token");
+  assert.equal(writes, 2);
+  assert.equal((await api.listEntries()).every((row) => row.status === "confirmed"), true);
+});
+
+test("73 no usa permisos de mesero ni de administrador sin acceso a Marca para guardar zonas", async () => {
+  for (const user of [{ id: "staff", role: "waiter" }, { id: "staff", role: "admin", permissions: ["accounts"] }]) {
+    reset(); await api.putEntry(zonesEntry()); let patches = 0;
+    remoteFetch = async (input) => {
+      if (input.method === "PATCH") patches++;
+      return new URL(input.url).pathname.endsWith("/get_current_user") ? Response.json(user) : zonesFailure();
+    };
+    await api.flushQueue(true);
+    assert.equal(patches, 0); assert.equal((await api.listEntries())[0].status, "failed");
+  }
+});
+
+test("74 la lectura por cuenta exige opt-in del cliente que preserva sus cambios pendientes", async () => {
+  await api.putEntry(closedSessionEntry());
+  const rpc = new Request(endpoint("rpc/get_admin_snapshot"), { method: "POST", body: "{}" });
+  assert.equal((await api.directSupabaseRequest(rpc.clone(), new URL(rpc.url))).status, 503);
+  listeners.get("message")({ data: { type: "SET_SCOPED_ADMIN_READ", enabled: true }, source: { id: "updated-admin" }, ports: [] });
+  assert.equal((await api.directSupabaseRequest(rpc.clone(), new URL(rpc.url), "updated-admin")).status, 200);
+  assert.equal((await api.directSupabaseRequest(rpc.clone(), new URL(rpc.url), "older-admin")).status, 503);
+  assert.equal((await api.listEntries())[0].status, "conflict");
+});
+
+test("75 conserva los UUID de actualizaciones por lote y evita dependencias perdidas", async () => {
+  const entry = await api.serializeRequest(request("table_sessions", "PATCH", { payer_name: "Cliente" }, "?id=in.(session-1,session-2)"));
+  assert.deepEqual(Array.from(entry.recordIds), ["session-1", "session-2"]);
 });
 
 (async () => {

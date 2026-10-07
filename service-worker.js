@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v19";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v20";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -122,7 +122,9 @@ const syncStatusSnapshot = async () => {
     return result;
   }, { pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0 });
   const blockingRecords = blocking.map((entry) => {
-    const recordIds = new Set([...(entry.recordIds || []), entry.recordId].filter(Boolean).map(String));
+    const recordIds = new Set([...(entry.recordIds || []), entry.recordId,
+      ...(entry.entity === "rpc:acknowledge_service_requests" ? (entry.payload?.ids || []) : [])]
+      .filter(Boolean).map(String));
     try {
       const idFilter = new URL(entry.url).searchParams.get("id") || "";
       if (idFilter.startsWith("eq.")) recordIds.add(idFilter.slice(3));
@@ -133,7 +135,8 @@ const syncStatusSnapshot = async () => {
     const payloads = Array.isArray(entry.payload) ? entry.payload : [entry.payload];
     const sessionIds = [...new Set(payloads.flatMap((payload) => [payload?.session_id, payload?.p_session_id])
       .filter(Boolean).map(String))];
-    return { entity: entry.entity || "", status: entry.status, recordIds: [...recordIds], sessionIds };
+    return { entity: entry.entity || "", status: entry.status, recordIds: [...recordIds], sessionIds,
+      sessionStatus: entry.entity === "table_sessions" ? entry.payload?.status || "" : "" };
   });
   return {
     counts,
@@ -160,6 +163,7 @@ const refreshQueuedSessionItemAuth = async (authToken) => {
     if (entry.entity !== "session_items" || !["pending", "failed"].includes(entry.status)) continue;
     if (entry.status === "failed" && !/^401(?:\b|\s)/.test(String(entry.lastError || ""))) continue;
     const headers = new Headers(entry.headers || []);
+    if (headers.has("x-table-code") || headers.has("x-table-id")) continue;
     const previousToken = headers.get("x-app-token");
     if (!previousToken || previousToken === authToken) continue;
     headers.set("x-app-token", authToken);
@@ -178,7 +182,9 @@ const refreshQueuedTableSessionAuth = async (authToken) => {
   if (!networkAvailable || !authToken || typeof authToken !== "string") return;
   const candidates = (await listEntries()).filter((entry) => {
     if (entry.entity !== "table_sessions") return false;
-    const previousToken = new Headers(entry.headers || []).get("x-app-token");
+    const entryHeaders = new Headers(entry.headers || []);
+    if (entryHeaders.has("x-table-code") || entryHeaders.has("x-table-id")) return false;
+    const previousToken = entryHeaders.get("x-app-token");
     if (!previousToken || previousToken === authToken) return false;
     return entry.status === "pending"
       || (entry.status === "failed" && /^401(?:\b|\s)/.test(String(entry.lastError || "")))
@@ -215,18 +221,21 @@ const refreshQueuedRequestAuth = async (authToken) => {
   const candidates = (await listEntries()).filter((entry) => {
     const headers = new Headers(entry.headers || []);
     if (headers.has("x-table-code") || headers.has("x-table-id")) return false;
-    if (entry.entity === "rpc:acknowledge_service_requests") {
+    if (String(entry.entity).startsWith("rpc:")) {
       let payload;
       try { payload = JSON.parse(entry.body); } catch (_) { return false; }
-      if (!payload?.auth_token || payload.auth_token === authToken) return false;
+      const previousToken = payload?.auth_token || payload?.p_auth_token;
+      if (!QUEUEABLE_RPC_NAMES.has(String(entry.entity).slice(4)) || !previousToken || previousToken === authToken) return false;
       return entry.status === "pending" || (entry.status === "failed"
         && /^(?:400|401)(?:\b|\s)/.test(String(entry.lastError || "")));
     }
     // PostgREST devuelve 406 cuando la credencial vieja deja de ver la fila
     // solicitada como objeto. Una credencial nueva debe validarse primero.
-    return entry.entity === "session_items" && entry.status === "conflict"
-      && /^406(?:\b|\s)/.test(String(entry.lastError || ""))
-      && headers.get("x-app-token") && headers.get("x-app-token") !== authToken;
+    return (UUID_REST_TABLES.has(entry.entity) || entry.entity === "business_settings")
+      && headers.get("x-app-token") && headers.get("x-app-token") !== authToken
+      && (entry.status === "pending" || (entry.status === "failed"
+        && /^401(?:\b|\s)/.test(String(entry.lastError || "")))
+        || (entry.status === "conflict" && /^406(?:\b|\s)/.test(String(entry.lastError || ""))));
   });
   if (!candidates.length) return;
   const headers = new Headers(candidates[0].headers || []);
@@ -250,8 +259,9 @@ const refreshQueuedRequestAuth = async (authToken) => {
     updatedHeaders.delete("content-length");
     let body = entry.body;
     let payload = entry.payload;
-    if (entry.entity === "rpc:acknowledge_service_requests") {
-      payload = { ...JSON.parse(body), auth_token: authToken };
+    if (String(entry.entity).startsWith("rpc:")) {
+      payload = JSON.parse(body);
+      payload = { ...payload, [payload.auth_token ? "auth_token" : "p_auth_token"]: authToken };
       body = JSON.stringify(payload);
     }
     await putEntry({ ...entry, headers: [...updatedHeaders.entries()], body, payload,
@@ -269,6 +279,8 @@ const extractRecordId = (url, payload) => {
 const extractRecordIds = (url, payload) => {
   const single = extractRecordId(url, payload);
   if (single) return [single];
+  const filter = url.searchParams.get("id") || "";
+  if (filter.startsWith("in.(") && filter.endsWith(")")) return filter.slice(4, -1).split(",").filter(Boolean);
   if (!Array.isArray(payload)) return [];
   return payload.map((row) => String(row?.id || "")).filter(Boolean);
 };
@@ -450,8 +462,9 @@ const recoverInterruptedEntries = async () => {
   const entries = await listEntries();
   await Promise.all(entries
     .filter((entry) => entry.status === "syncing"
-      || (entry.status === "failed" && entry.entity === "rpc:acknowledge_service_requests"
-        && isAcknowledgeSqlError(entry.lastError) && Number(entry.nextAttemptAt || 0) <= Date.now())
+      || (entry.status === "failed" && Number(entry.nextAttemptAt || 0) <= Date.now()
+        && ((entry.entity === "rpc:acknowledge_service_requests" && isAcknowledgeSqlError(entry.lastError))
+          || (entry.entity === "rpc:save_table_zones" && isZoneSqlError(entry.lastError))))
       || (["failed", "conflict"].includes(entry.status)
         && ["table_sessions", "session_items"].includes(entry.entity)
         && !/^401(?:\b|\s)/.test(String(entry.lastError || ""))
@@ -606,11 +619,13 @@ const verifyRestMutation = async (entry) => {
 
 const isAcknowledgeSqlError = (message) => /\b0A000\b/.test(String(message || ""))
   && /WITH clause containing a data-modifying statement must be at the top level/i.test(String(message || ""));
+const isZoneSqlError = (message) => /\b21000\b/.test(String(message || ""))
+  && /UPDATE requires a WHERE clause/i.test(String(message || ""));
 
 const staffForEntry = async (entry) => {
   const headers = new Headers(entry.headers || []);
   if (headers.has("x-table-code") || headers.has("x-table-id")) return null;
-  const token = entry.payload?.auth_token || headers.get("x-app-token");
+  const token = entry.payload?.auth_token || entry.payload?.p_auth_token || headers.get("x-app-token");
   if (!token) return null;
   headers.set("x-app-token", token);
   ["content-length", "prefer", "accept-profile"].forEach((key) => headers.delete(key));
@@ -688,6 +703,55 @@ const acknowledgeThroughRest = async (entry) => {
       && (payload.message == null || row.message === update.message)));
 };
 
+const readZoneTables = async (entry, headers) => {
+  const all = [];
+  for (let offset = 0; ; offset += 1000) {
+    const url = new URL("/rest/v1/restaurant_tables", entry.url);
+    url.searchParams.set("select", "id,is_outdoor,qr_code,table_name");
+    url.searchParams.set("order", "id.asc");
+    url.searchParams.set("limit", "1000");
+    url.searchParams.set("offset", String(offset));
+    const response = await fetchWithTimeout(new Request(url, { headers }), REMOTE_WRITE_TIMEOUT_MS);
+    if (!response.ok) return null;
+    const rows = await response.json();
+    if (!Array.isArray(rows)) return null;
+    all.push(...rows);
+    if (rows.length < 1000) return all;
+  }
+};
+
+const isZoneServicePoint = (table) => /^(?:interno-bar-|interno-planter-)/.test(String(table.qr_code || ""))
+  || /^(?:barra|matera)\s+\d+$/.test(String(table.table_name || "").normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "").toLowerCase().trim());
+
+// 21000 viene de safeupdate en la RPC del servidor. Solo se modifica la
+// bandera de zona, con WHERE por UUID, usuario autorizado y lectura final.
+const saveZonesThroughRest = async (entry) => {
+  const ids = entry.payload?.outdoor_table_ids;
+  if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string" || !/^[\w-]+$/.test(id))) return false;
+  const staff = await staffForEntry(entry);
+  if (!staff || !["admin", "boss"].includes(staff.user.role)
+    || (staff.user.role !== "boss" && Array.isArray(staff.user.permissions)
+      && !staff.user.permissions.includes("brand"))) return false;
+  const before = await readZoneTables(entry, staff.headers);
+  if (!before?.length) return false;
+  const normal = before.filter((row) => !isZoneServicePoint(row));
+  for (const outdoor of [false, true]) {
+    const changed = normal.filter((row) => ids.includes(row.id) === outdoor && row.is_outdoor !== outdoor);
+    for (let index = 0; index < changed.length; index += 100) {
+      const url = new URL("/rest/v1/restaurant_tables", entry.url);
+      url.searchParams.set("id", `in.(${changed.slice(index, index + 100).map((row) => row.id).join(",")})`);
+      const response = await fetchWithTimeout(new Request(url, {
+        method: "PATCH", headers: staff.headers, body: JSON.stringify({ is_outdoor: outdoor })
+      }), REMOTE_WRITE_TIMEOUT_MS);
+      if (!response.ok) return false;
+    }
+  }
+  const after = await readZoneTables(entry, staff.headers);
+  return Boolean(after && normal.every((row) => after.some((saved) => saved.id === row.id
+    && saved.is_outdoor === ids.includes(row.id))));
+};
+
 let archiveReadConfig = null;
 
 const verifyArchivedItem = async (entry, token) => {
@@ -750,7 +814,8 @@ const isReconcilableTableSessionPatch = (entry) => {
     || !entry.recordId || !entry.payload || Array.isArray(entry.payload)) return false;
   if (entry.payload.status === "closed") return true;
   const fields = Object.keys(entry.payload);
-  return fields.length > 0 && fields.every((field) => ["payer_name", "assigned_waiter_id"].includes(field));
+  return fields.length > 0 && fields.every((field) => ["payer_name", "assigned_waiter_id",
+    "table_id", "sale_channel", "updated_by_user_id", "updated_at"].includes(field));
 };
 
 // Apps Script retira las cuentas cobradas de Supabase. Un cambio de nombre/
@@ -814,11 +879,19 @@ const reconcileTableSessionConflicts = async (authToken, force = false) => {
     if (previousToken !== authToken) continue;
     if (!force && Number(entry.nextReconcileAt || 0) > now) continue;
     if (await verifySettledTableSessionPatch(entry)) {
+      if ((await listEntries()).find((saved) => saved.id === entry.id)?.status !== "conflict") continue;
       await putEntry({ ...entry, status: "confirmed", confirmedAt: new Date().toISOString(), lastError: "", reconciledAs: "already_closed_or_removed" });
       scheduleConfirmedCleanup();
       confirmedAny = true;
     } else {
-      await putEntry({ ...entry, nextReconcileAt: now + 30_000 });
+      // Una cuenta que sigue abierta necesita reintentar su cambio original,
+      // no esperar eternamente a que alguien mas la cierre. Nunca se quitan
+      // los filtros ni se aplican importes sobre una cuenta ya cerrada.
+      const staff = await staffForEntry(entry).catch(() => null);
+      const rows = staff ? await readStaffRows(entry, staff.headers, "table_sessions", [entry.recordId]).catch(() => null) : null;
+      const replay = rows?.length === 1 && rows[0].id === entry.recordId && rows[0].status === "open";
+      if ((await listEntries()).find((saved) => saved.id === entry.id)?.status !== "conflict") continue;
+      await putEntry({ ...entry, ...(replay ? { status: "pending", nextAttemptAt: 0 } : {}), nextReconcileAt: now + 30_000 });
     }
   }
   return confirmedAny;
@@ -826,6 +899,39 @@ const reconcileTableSessionConflicts = async (authToken, force = false) => {
 
 let flushingQueue = null;
 let forceFlushRequested = false;
+
+const queueOrder = (entry) => Number(entry.createdOrder || new Date(entry.createdAt || entry.queuedAt || 0).getTime());
+const writeReferences = (stored) => {
+  const entry = normalizeStoredEntry(stored);
+  const url = new URL(entry.url);
+  const rows = Array.isArray(entry.payload) ? entry.payload : [entry.payload || {}];
+  const ids = [...new Set([...(entry.recordIds || []), entry.recordId,
+    ...extractRecordIds(url, entry.payload)].filter(Boolean))];
+  const refs = new Set(ids.map((id) => `${entry.entity}:${id}`));
+  rows.forEach((row) => {
+    if (row.session_id || row.p_session_id) refs.add(`session:${row.session_id || row.p_session_id}`);
+    if (row.table_id || row.p_table_id) refs.add(`table:${row.table_id || row.p_table_id}`);
+    if (row.menu_item_id) refs.add(`product:${row.menu_item_id}`);
+    if (row.category_id) refs.add(`category:${row.category_id}`);
+  });
+  const sessionFilter = url.searchParams.get("session_id") || "";
+  if (sessionFilter.startsWith("eq.")) refs.add(`session:${sessionFilter.slice(3)}`);
+  if (entry.entity === "table_sessions") ids.forEach((id) => refs.add(`session:${id}`));
+  if (entry.entity === "menu_items") ids.forEach((id) => refs.add(`product:${id}`));
+  if (entry.entity === "menu_categories") ids.forEach((id) => refs.add(`category:${id}`));
+  if (entry.entity === "restaurant_tables") ids.forEach((id) => refs.add(`table:${id}`));
+  const financial = ["table_sessions", "session_items", "service_requests"].includes(entry.entity);
+  return { entity: entry.entity, ids, refs, financial,
+    unknownSession: financial && ![...refs].some((ref) => ref.startsWith("session:")) };
+};
+const writesAreRelated = (left, right) => {
+  const a = writeReferences(left), b = writeReferences(right);
+  if (a.entity === b.entity && (!a.ids.length || !b.ids.length)) return true;
+  if ([a.entity, b.entity].includes("rpc:save_table_zones")
+    && [a.entity, b.entity].includes("restaurant_tables")) return true;
+  if (a.financial && b.financial && (a.unknownSession || b.unknownSession)) return true;
+  return [...a.refs].some((ref) => b.refs.has(ref));
+};
 
 const flushQueue = (force = false) => {
   if (!networkAvailable) return entryCounts();
@@ -835,6 +941,7 @@ const flushQueue = (force = false) => {
   forceFlushRequested = false;
   flushingQueue = (async () => {
     let confirmedAny = false;
+    const attempted = new Set();
     await recoverInterruptedEntries();
     await purgeConfirmedEntries();
     while (true) {
@@ -842,12 +949,14 @@ const flushQueue = (force = false) => {
       const now = Date.now();
       const forceCurrentPass = forceThisRun || forceFlushRequested;
       forceFlushRequested = false;
-      const found = (await listEntries())
-        .filter((candidate) => candidate.status === "pending" && (forceCurrentPass || Number(candidate.nextAttemptAt || 0) <= now))
-        .sort((left, right) => Number(left.createdOrder || new Date(left.createdAt || left.queuedAt || 0).getTime())
-          - Number(right.createdOrder || new Date(right.createdAt || right.queuedAt || 0).getTime()))[0];
+      const blocked = (await listEntries()).filter((candidate) => candidate.status !== "confirmed")
+        .sort((left, right) => queueOrder(left) - queueOrder(right));
+      const found = blocked.find((candidate, index) => candidate.status === "pending" && !attempted.has(candidate.id)
+        && (forceCurrentPass || Number(candidate.nextAttemptAt || 0) <= now)
+        && !blocked.slice(0, index).some((earlier) => writesAreRelated(earlier, candidate)));
       const entry = found ? normalizeStoredEntry(found) : null;
       if (!entry) break;
+      attempted.add(entry.id);
       const startedAt = performance.now();
       await putEntry({ ...entry, status: "syncing", lastAttemptAt: new Date().toISOString() });
       syncLog("sending", { operationId: entry.operationId, destination: "supabase", entity: entry.entity, method: entry.method, attempts: entry.attempts });
@@ -884,6 +993,13 @@ const flushQueue = (force = false) => {
             if (confirmed) reconciledAs = "acknowledged_through_rest";
           }
         }
+        if (!confirmed && response.status === 400 && entry.entity === "rpc:save_table_zones") {
+          const detail = await response.clone().json().catch(() => null);
+          if (isZoneSqlError(`${detail?.code} ${detail?.message}`)) {
+            confirmed = await saveZonesThroughRest(entry);
+            if (confirmed) reconciledAs = "zones_saved_through_rest";
+          }
+        }
         if (confirmed) {
           await putEntry({ ...entry, status: "confirmed", confirmedAt: new Date().toISOString(), lastError: "",
             ...(reconciledSessionPatch ? { reconciledAs: "already_closed_or_removed" }
@@ -902,7 +1018,7 @@ const flushQueue = (force = false) => {
         } catch (_) { /* Un rechazo sin JSON conserva su codigo HTTP. */ }
         // El diagnostico no debe guardar ni mostrar credenciales.
         const secrets = [new Headers(entry.headers || []).get("x-app-token"),
-          entry.payload?.auth_token].filter(Boolean);
+          entry.payload?.auth_token, entry.payload?.p_auth_token].filter(Boolean);
         for (const secret of secrets) message = message.split(secret).join("[credencial]");
         message = message.slice(0, 500);
         if (isTransientStatus(response.status)) {
@@ -916,16 +1032,17 @@ const flushQueue = (force = false) => {
             const attempts = Number(entry.attempts || 0) + 1;
             await putEntry({ ...entry, status: "pending", attempts, lastError: message, nextAttemptAt: Date.now() + retryDelay(attempts) });
             syncLog("retry", { operationId: entry.operationId, destination: "supabase", attempts, durationMs: Math.round(performance.now() - startedAt), error: message });
-            break;
+            continue;
           }
           const status = [406, 409].includes(response.status) ? "conflict" : "failed";
           await putEntry({ ...entry, status, attempts: Number(entry.attempts || 0) + 1, lastError: message,
-            ...(entry.entity === "rpc:acknowledge_service_requests" && isAcknowledgeSqlError(message)
+            ...((entry.entity === "rpc:acknowledge_service_requests" && isAcknowledgeSqlError(message))
+              || (entry.entity === "rpc:save_table_zones" && isZoneSqlError(message))
               ? { nextAttemptAt: Date.now() + 30_000 } : {}) });
           syncLog(status, { operationId: entry.operationId, destination: "supabase", attempts: Number(entry.attempts || 0) + 1, durationMs: Math.round(performance.now() - startedAt), error: message });
           await notifyClients("OFFLINE_SYNC_ISSUE", { status, operationId: entry.operationId, entity: entry.entity });
         }
-        break;
+        continue;
       } catch (error) {
         const attempts = Number(entry.attempts || 0) + 1;
         await putEntry({
@@ -1000,11 +1117,13 @@ const networkFirst = async (request) => {
   }
 };
 
-const directSupabaseRequest = async (request, url) => {
+const scopedAdminReaders = new Set();
+const directSupabaseRequest = async (request, url, clientId = "") => {
   if (!networkAvailable) {
     return new Response('{"message":"offline"}', { status: 503, headers: { "Content-Type": "application/json" } });
   }
   if (RECONCILIATION_RPC_NAMES.has(rpcNameFor(url))
+    && !(rpcNameFor(url) === "get_admin_snapshot" && scopedAdminReaders.has(clientId))
     && await hasBlockingEntriesForEntities(RPC_READ_ENTITIES[rpcNameFor(url)] || [])) {
     return new Response('{"message":"pending_local_writes"}', { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -1072,7 +1191,7 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   if (isSupabaseRequest(url) && request.method === "POST" && url.pathname.includes("/rpc/")) {
-    event.respondWith(directSupabaseRequest(request, url));
+    event.respondWith(directSupabaseRequest(request, url, event.clientId));
   }
 });
 
@@ -1081,6 +1200,13 @@ self.addEventListener("sync", (event) => {
 });
 
 self.addEventListener("message", (event) => {
+  if (event.data?.type === "SET_SCOPED_ADMIN_READ") {
+    if (event.source?.id) {
+      if (event.data.enabled === true) scopedAdminReaders.add(event.source.id);
+      else scopedAdminReaders.delete(event.source.id);
+    }
+    event.ports?.[0]?.postMessage({ ok: Boolean(event.source?.id) });
+  }
   if (event.data?.type === "SET_NETWORK_STATUS") {
     networkAvailable = event.data.online !== false;
   }

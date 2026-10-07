@@ -4268,14 +4268,74 @@ const App = (() => {
     state.adminPollTimer = setInterval(refreshAdminNow, SYNC_INTERVAL_MS);
   };
 
+  const pendingAdminReadScope = (cached, queue) => {
+    const sessionIds = new Set(), requestIds = new Set(), closedIds = new Set();
+    const relevant = ["table_sessions", "session_items", "service_requests", "rpc:acknowledge_service_requests"];
+    const records = queue.blockingRecords;
+    if (!Array.isArray(records)) return { safe: false, sessionIds, requestIds, closedIds };
+    const pending = records.filter((entry) => relevant.includes(entry.entity));
+    if (!pending.length) return { safe: true, sessionIds, requestIds, closedIds };
+    if (!cached) return { safe: false, sessionIds, requestIds, closedIds };
+    for (const entry of pending) {
+      const ids = entry.recordIds || [];
+      if (entry.entity === "table_sessions") {
+        if (!ids.length) return { safe: false, sessionIds, requestIds, closedIds };
+        for (const id of ids) {
+          sessionIds.add(id);
+          if (entry.sessionStatus === "closed") closedIds.add(id);
+          else if (!cached.sessions.some((session) => session.id === id)) return { safe: false, sessionIds, requestIds, closedIds };
+        }
+      } else if (entry.entity === "session_items") {
+        const parents = new Set(entry.sessionIds || []);
+        ids.forEach((id) => cached.sessions.forEach((session) => {
+          if ((session.session_items || []).some((line) => line.id === id)) parents.add(session.id);
+        }));
+        if (!parents.size) return { safe: false, sessionIds, requestIds, closedIds };
+        for (const id of parents) {
+          if (!cached.sessions.some((session) => session.id === id)) return { safe: false, sessionIds, requestIds, closedIds };
+          sessionIds.add(id);
+        }
+      } else {
+        if (!ids.length) return { safe: false, sessionIds, requestIds, closedIds };
+        for (const id of ids) {
+          if (!cached.requests.some((request) => request.id === id)) return { safe: false, sessionIds, requestIds, closedIds };
+          requestIds.add(id);
+        }
+      }
+    }
+    return { safe: true, sessionIds, requestIds, closedIds };
+  };
+
+  const mergePendingAdminRows = (remote, cached, scope) => {
+    if (!scope.safe) return remote;
+    const sessions = new Map((remote.sessions || []).filter((row) => !scope.sessionIds.has(row.id)).map((row) => [row.id, row]));
+    (cached?.sessions || []).filter((row) => scope.sessionIds.has(row.id) && !scope.closedIds.has(row.id))
+      .forEach((row) => sessions.set(row.id, row));
+    const requests = new Map((remote.requests || []).filter((row) => !scope.requestIds.has(row.id)).map((row) => [row.id, row]));
+    (cached?.requests || []).filter((row) => scope.requestIds.has(row.id)).forEach((row) => requests.set(row.id, row));
+    return { ...remote, sessions: [...sessions.values()], requests: [...requests.values()] };
+  };
+
+  const setScopedAdminRead = (enabled) => new Promise((resolve) => {
+    const controller = navigator.serviceWorker?.controller;
+    if (!controller) { resolve(false); return; }
+    const channel = new MessageChannel();
+    const timer = window.setTimeout(() => { channel.port1.close(); resolve(false); }, 500);
+    channel.port1.onmessage = (event) => { window.clearTimeout(timer); channel.port1.close(); resolve(event.data?.ok === true); };
+    controller.postMessage({ type: "SET_SCOPED_ADMIN_READ", enabled }, [channel.port2]);
+  });
+
   const loadAdminData = async () => {
     const cachedSnapshot = readOfflineAdminSnapshot();
+    const pendingScope = pendingAdminReadScope(cachedSnapshot, await getOfflineSyncStatus());
+    await setScopedAdminRead(pendingScope.safe);
     (cachedSnapshot?.removedSessions || []).forEach((entry) => {
       if (entry?.id && Date.now() < Number(entry.retainUntil || 0) && !state.optimisticSessionStates.has(entry.id)) {
         state.optimisticSessionStates.set(entry.id, { mode: "remove", session: null, retainUntil: entry.retainUntil });
       }
     });
-    const snapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
+    const remoteSnapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
+    const snapshot = remoteSnapshot ? mergePendingAdminRows(remoteSnapshot, cachedSnapshot, pendingScope) : null;
     if (!snapshot) {
       const [requests, sessions] = await Promise.all([
         dbQuiet(
@@ -4296,13 +4356,14 @@ const App = (() => {
         state.sessions = mergeOptimisticSessions(cachedSnapshot.sessions);
         return false;
       }
-      state.syncFresh.operational = true;
-      state.requests = mergeOptimisticRequests(requests || []);
-      state.sessions = mergeOptimisticSessions(sessions || []);
+      state.syncFresh.operational = !pendingScope.sessionIds.size && !pendingScope.requestIds.size;
+      const merged = mergePendingAdminRows({ requests, sessions }, cachedSnapshot, pendingScope);
+      state.requests = mergeOptimisticRequests(merged.requests || []);
+      state.sessions = mergeOptimisticSessions(merged.sessions || []);
       persistOfflineAdminSnapshot();
       return true;
     }
-    state.syncFresh.operational = true;
+    state.syncFresh.operational = !pendingScope.sessionIds.size && !pendingScope.requestIds.size;
     const requests = mergeOptimisticRequests(snapshot.requests || []);
     const sessions = mergeOptimisticSessions(snapshot.sessions || []);
     const signature = JSON.stringify([

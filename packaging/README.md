@@ -1,7 +1,31 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.7.exe` con Inno Setup 6. Esta versión
+`dist/Tienda-Napoles-Offline-Setup-1.0.8.exe` con Inno Setup 6. Esta versión
+recupera `save_table_zones` rechazado con `21000` usando solamente cambios
+de `is_outdoor` filtrados por UUID y comprobados en el servidor. Conserva
+los puntos de servicio y exige el rol y acceso a Marca ya previstos por la app.
+Renueva credenciales de las operaciones administrativas pendientes tras
+validar el login vigente, incluyendo catálogo y las RPC con `p_auth_token`.
+Las credenciales QR no se reemplazan por credenciales administrativas.
+
+Una operación rechazada conserva el error y sus datos, pero permite enviar
+operaciones independientes. Conserva el orden y las dependencias de cada
+cuenta/producto. Las lecturas del panel preservan las cuentas y solicitudes
+pendientes del caché durable y actualizan las demás desde el servidor; si no
+puede identificarse el cambio local, mantiene la protección anterior.
+Los cierres `406` de cuentas que aún están abiertas se reintentan con sus
+filtros e importes originales, sin modificar cuentas ya cerradas con otros importes.
+Se mantienen los intervalos y la actualización paralela de inventario,
+movimientos y ventas existentes.
+
+`supabase/fix-save-table-zones.sql` corrige únicamente los UPDATE sin WHERE
+compatibles de la definición actual de esa función en Supabase. Conserva
+su firma, autenticación, permisos y retorno; no desactiva `safeupdate`.
+Subirlo al repositorio no lo aplica al servidor. El instalador recupera el
+guardado de zonas mediante REST sin depender de ejecutar ese SQL.
+
+Conserva la recuperación de la versión 1.0.7, que
 recupera las solicitudes bloqueadas por el error SQL `0A000` del servidor,
 incluso si el token no cambia. Usa el guardado REST ya previsto por la app,
 valida primero al usuario y comprueba el resultado remoto. Un consumo `406`

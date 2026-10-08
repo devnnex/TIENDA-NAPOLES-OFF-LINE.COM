@@ -17,6 +17,7 @@ let status = {};
 let sent = [];
 let retryScheduled = false;
 let requestFailure = false;
+let afterRequest = () => undefined;
 const context = vm.createContext({
   state,
   Date,
@@ -35,6 +36,7 @@ const context = vm.createContext({
   appsScriptRequest: async (action, payload) => {
     sent.push({ action, payload });
     if (requestFailure) throw new Error("offline");
+    afterRequest();
     return { ok: true, items: [] };
   },
   applyRemoteInventoryItems: () => undefined,
@@ -70,6 +72,7 @@ const reset = (nextJobs, nextStatus) => {
   sent = [];
   retryScheduled = false;
   requestFailure = false;
+  afterRequest = () => undefined;
   state.localSupabaseWrites = 0;
 };
 
@@ -117,5 +120,37 @@ const reset = (nextJobs, nextStatus) => {
   assert.equal(await context.testApi.runAppsScriptOutbox(true), true);
   assert.equal(jobs.length, 0, "Al volver internet se confirma la misma venta sin crear otra.");
 
-  console.log("9/9 escenarios de dependencias y envío de ventas aprobados");
+  const inventory = (action, productId) => ({
+    id: `${action}:${productId}`, operationId: `${action}:${productId}`, action,
+    status: "pending", nextAttemptAt: 0,
+    payload: action === "upsert_inventory" ? { item: { productId } }
+      : action === "adjust_inventory" ? { adjustment: { productId } } : { productId }
+  });
+  for (const action of ["upsert_inventory", "set_inventory_stock", "adjust_inventory", "delete_inventory"]) {
+    const job = inventory(action, "product-1");
+    reset([job], counts(blocked("menu_items", ["other-product"])));
+    assert.equal(await context.testApi.runAppsScriptOutbox(), true,
+      `${action} no espera cambios de otro producto.`);
+    assert.equal(sent.length, 1);
+    reset([job], counts(blocked("menu_items", ["product-1"])));
+    assert.equal(await context.testApi.runAppsScriptOutbox(), false,
+      `${action} conserva la dependencia de su propio producto.`);
+    assert.equal(sent.length, 0);
+  }
+  reset([inventory("upsert_inventory", "product-1")], counts(blocked("menu_items")));
+  assert.equal(await context.testApi.runAppsScriptOutbox(), false,
+    "Un pendiente antiguo sin IDs conserva su protección.");
+  reset([inventory("upsert_inventory", "product-1")], counts(blocked("menu_categories", ["category-1"])));
+  assert.equal(await context.testApi.runAppsScriptOutbox(), false,
+    "La categoría pendiente se confirma antes de enviar el producto.");
+
+  reset([inventory("upsert_inventory", "product-1"), inventory("set_inventory_stock", "product-2")],
+    counts(blocked("menu_items", ["product-2"])));
+  afterRequest = () => { status = counts(); };
+  assert.equal(await context.testApi.runAppsScriptOutbox(), true);
+  assert.deepEqual(sent.map((entry) => entry.action), ["upsert_inventory", "set_inventory_stock"],
+    "El segundo cambio usa el estado actual de Supabase sin esperar otro ciclo.");
+  assert.equal(jobs.length, 0);
+
+  console.log("PASS dependencias de ventas e inventario; envíos inmediatos con estado actualizado y recuperación de red");
 })().catch((error) => { console.error(error); process.exitCode = 1; });

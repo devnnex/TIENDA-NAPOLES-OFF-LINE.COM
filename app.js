@@ -1,7 +1,7 @@
 const SYNC_INTERVAL_MS = 1500;
 const CHAT_SYNC_INTERVAL_MS = 1200;
 const OFFLINE_SYNC_PULSE_MS = 2500;
-const REMOTE_STORAGE_POLL_MS = 60000;
+const REMOTE_STORAGE_POLL_MS = 5000;
 const REMOTE_CONFIRMATION_HOLD_MS = 15000;
 const LOCAL_DATA_DB = "tienda-napoles-local-data-v1";
 const LOCAL_DATA_STORE = "records";
@@ -1302,7 +1302,14 @@ const App = (() => {
     if (!$("#globalSyncStatus")) return;
     const [counts] = await Promise.all([getOfflineSyncStatus(), flushDurableWrites()]);
     const jobs = readAppsScriptOutbox();
-    const issues = Number(counts.failed || 0) + Number(counts.conflict || 0)
+    // El aviso REST antiguo de cero filas no es un error de lectura del snapshot.
+    // Solo se omite su presentación; la operación permanece en la cola.
+    const legacyNotices = (counts.issues || []).filter((entry) =>
+      entry.entity === "table_sessions" && entry.status === "conflict"
+      && /\b406\b/.test(entry.error || "") && /\bPGRST116\b/.test(entry.error || "")
+      && /(?:contains|contain)\s+0\s+rows/i.test(entry.error || ""));
+    const visibleIssues = (counts.issues || []).filter((entry) => !legacyNotices.includes(entry));
+    const issues = Math.max(0, Number(counts.failed || 0) + Number(counts.conflict || 0) - legacyNotices.length)
       + jobs.filter((job) => ["failed", "conflict"].includes(job.status)).length;
     const issueNames = {
       business_settings: "marca y colores",
@@ -1319,12 +1326,12 @@ const App = (() => {
       upsert_inventory: "inventario"
     };
     const issueDetails = [
-      ...(counts.issues || []).map((entry) => `${issueNames[entry.entity] || entry.entity}: ${entry.status}${entry.error ? ` (${entry.error})` : ""}${entry.operationId ? ` [${entry.operationId}]` : ""}`),
+      ...visibleIssues.map((entry) => `${issueNames[entry.entity] || entry.entity}: ${entry.status}${entry.error ? ` (${entry.error})` : ""}${entry.operationId ? ` [${entry.operationId}]` : ""}`),
       ...jobs.filter((job) => ["failed", "conflict"].includes(job.status))
         .map((job) => `${issueNames[job.action] || job.action}: ${job.status}${job.lastError ? ` (${String(job.lastError).slice(0, 160)})` : ""}`)
     ];
     $("#globalSyncStatus").title = issueDetails.join("\n");
-    const firstIssue = counts.issues?.[0]?.entity || jobs.find((job) => ["failed", "conflict"].includes(job.status))?.action || "";
+    const firstIssue = visibleIssues[0]?.entity || jobs.find((job) => ["failed", "conflict"].includes(job.status))?.action || "";
     const displayPhase = syncBadgeDisplayPhase(navigator.onLine);
     if (!counts.controllerAvailable) {
       setGlobalSyncStatus("Sin protección offline; recarga la aplicación", "error", "triangle-alert");
@@ -1356,9 +1363,11 @@ const App = (() => {
     const sessionId = String(job.payload?.invoice?.sessionId || "");
     const productIds = new Set((job.payload?.invoice?.items || [])
       .map((item) => String(item.menu_item_id || "")).filter(Boolean));
+    const inventoryProductId = String(job.payload?.item?.productId || job.payload?.adjustment?.productId || job.payload?.productId || "");
+    if (inventoryProductId) productIds.add(inventoryProductId);
     return counts.blockingRecords.some((record) => {
       if (!entities.includes(record.entity)) return false;
-      if (job.action !== "record_sale") return true;
+      if (job.action !== "record_sale" && (record.entity !== "menu_items" || !inventoryProductId)) return true;
       if (["table_sessions", "session_items", "service_requests", "rpc:record_session_payment", "rpc:replay_table_session_change"].includes(record.entity)) {
         const ids = record.entity === "table_sessions" ? record.recordIds : record.sessionIds;
         return !sessionId || !Array.isArray(ids) || !ids.length || ids.map(String).includes(sessionId);
@@ -2660,12 +2669,12 @@ const App = (() => {
   const runAppsScriptOutbox = async (force = false) => {
     if (state.appsScriptOutboxBusy || !isAppsScriptConfigured()) return false;
     await flushDurableWrites();
-    const supabaseStatus = await getOfflineSyncStatus();
     state.appsScriptOutboxBusy = true;
     let activeJob = null;
     try {
       let jobs = readAppsScriptOutbox();
       while (true) {
+        const supabaseStatus = await getOfflineSyncStatus();
         const now = Date.now();
         const job = nextReadyAppsScriptJob(jobs, supabaseStatus, force, now);
         if (!job) {
@@ -6024,6 +6033,7 @@ const App = (() => {
         ? { ...saved, menu_categories: saved.menu_categories || hydrated.menu_categories }
         : item);
       persistBootstrapCache();
+      void flushAppsScriptOutbox();
     })();
   };
 
@@ -11079,6 +11089,7 @@ const App = (() => {
       }
       if (event.data?.type !== "OFFLINE_QUEUE_FLUSHED") return;
       notifyAdminPeers({ core:true, operational:true, users:true });
+      if (state.page === "admin" && state.currentUser) void flushAppsScriptOutbox();
       void (async () => {
         await refreshCoreNow();
         if (state.page === "admin") {

@@ -89,6 +89,27 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
   assert.match(badge.innerHTML, /Error de sincronización/,
     "Una falla real no se oculta detrás del estado visual.");
 
+  const legacyNotice = { entity: "table_sessions", status: "conflict", operationId: "old-account",
+    error: "406 · PGRST116 · Cannot coerce the result to a single JSON object · The result contains 0 rows" };
+  queueStatus = { ...queueStatus, failed: 0, conflict: 1, issues: [legacyNotice] };
+  const original = structuredClone(queueStatus);
+  await statusContext.testStatus.updateGlobalSyncStatus();
+  assert.doesNotMatch(badge.innerHTML, /Error de sincronización|cuentas de mesa/);
+  assert.equal(badge.title, "");
+  assert.deepEqual(queueStatus, original, "El cambio visual no elimina ni modifica la operación pendiente.");
+  queueStatus = { ...queueStatus, failed: 1,
+    issues: [legacyNotice, { entity: "menu_items", status: "failed", error: "Producto rechazado" }] };
+  await statusContext.testStatus.updateGlobalSyncStatus();
+  assert.match(badge.innerHTML, /1 operación por revisar \(productos\)/);
+  assert.match(badge.title, /Producto rechazado/);
+  assert.doesNotMatch(badge.title, /PGRST116/);
+  for (const error of ["400 · Importe inválido", "406 · PGRST116 · The result contains 2 rows"]) {
+    queueStatus = { ...queueStatus, failed: 0, conflict: 1,
+      issues: [{ entity: "table_sessions", status: "conflict", error }] };
+    await statusContext.testStatus.updateGlobalSyncStatus();
+    assert.match(badge.innerHTML, /Error de sincronización/, "Los demás errores siguen visibles.");
+  }
+
   assert.match(html, /data-toggle-user-pin aria-label="Mostrar PIN"/);
   assert.match(css, /\.user-pin-toggle \{/);
   pinContext.testPin.toggleUserPinVisibility(toggle);
@@ -101,5 +122,5 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
   assert.equal(pin.type, "password");
   assert.equal(toggle.attributes["aria-label"], "Mostrar PIN");
 
-  console.log("8/8 escenarios visuales de conexión y PIN aprobados");
+  console.log("PASS conexión, aviso REST histórico omitido solo en presentación, errores reales visibles y PIN");
 })().catch((error) => { console.error(error); process.exitCode = 1; });

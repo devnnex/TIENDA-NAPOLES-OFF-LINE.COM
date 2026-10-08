@@ -1,7 +1,14 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.11.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.12.exe` con Inno Setup 6.
+
+La versión 1.0.12 limita el ajuste a la rapidez del inventario y al aviso visual
+histórico 406/PGRST116 de cuentas sin filas. Inventario consulta cada cinco segundos,
+espera solo los cambios de su producto y retoma sus envíos al confirmarse el catálogo.
+Cada envío revisa el estado actual de los pendientes. El aviso histórico se omite
+en la presentación; conserva la operación y muestra los demás errores reales.
+No requiere SQL adicional. BCA retira Abrir caja y Configurar caja de Cuentas.
 
 La versión 1.0.11 consulta los snapshots autorizados actuales al iniciar sesión
 sin esperar a que terminen las colas de escritura. Un GET vacío por permisos o

@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v22";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v23";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -121,7 +121,7 @@ const syncStatusSnapshot = async () => {
     result[status] = Number(result[status] || 0) + 1;
     return result;
   }, { pending: 0, syncing: 0, confirmed: 0, failed: 0, conflict: 0 });
-  const blockingRecords = blocking.map((entry) => {
+  const blockingRecords = blocking.sort((left,right) => queueOrder(left)-queueOrder(right)).map((entry) => {
     const recordIds = new Set([...(entry.recordIds || []), entry.recordId,
       ...(entry.entity === "rpc:acknowledge_service_requests" ? (entry.payload?.ids || []) : [])]
       .filter(Boolean).map(String));
@@ -135,7 +135,9 @@ const syncStatusSnapshot = async () => {
     const payloads = Array.isArray(entry.payload) ? entry.payload : [entry.payload];
     const sessionIds = [...new Set(payloads.flatMap((payload) => [payload?.session_id, payload?.p_session_id])
       .filter(Boolean).map(String))];
-    return { entity: entry.entity || "", status: entry.status, recordIds: [...recordIds], sessionIds,
+    const patches = entry.entity === "rpc:replay_table_session_change" ? [entry.payload?.p_patch] : payloads;
+    const changedFields = [...new Set(patches.flatMap((patch) => Object.keys(patch || {})))].filter((field) => !/token|secret|password|pin|key/i.test(field));
+    return { entity: entry.entity || "", status: entry.status, method: entry.method, changedFields, recordIds: [...recordIds], sessionIds,
       sessionStatus: entry.entity === "table_sessions" ? entry.payload?.status || "" : entry.entity === "rpc:replay_table_session_change" ? entry.payload?.p_patch?.status || "" : "" };
   });
   return {
@@ -862,6 +864,22 @@ const replayRejectedSessionPatch = async (entry) => {
   }));
 };
 
+const verifyCommittedTableSessionCreate = async (entry) => {
+  if (entry.entity !== 'table_sessions' || entry.method !== 'POST' || !entry.recordId) return false;
+  const rows = Array.isArray(entry.payload) ? entry.payload : [entry.payload];
+  if (rows.length !== 1) return false;
+  const payload = rows[0];
+  const allowed = ['id','table_id','status','sale_channel','payer_name','assigned_waiter_id','opened_at','created_at','updated_at','created_by_user_id'];
+  if (!payload || payload.id !== entry.recordId || !payload.table_id || (payload.status || 'open') !== 'open'
+    || Object.keys(payload).some((field) => !allowed.includes(field))) return false;
+  const staff = await staffForEntry(entry);
+  if (!staff) return false;
+  const authority = await readSessionForSync(entry,staff.headers,new Headers(entry.headers).get('x-app-token'));
+  const row = authority?.session;
+  return Boolean(authority?.exists && row?.id === payload.id && row.table_id === payload.table_id
+    && ['open','closed'].includes(row.status) && (!payload.sale_channel || row.sale_channel === payload.sale_channel));
+};
+
 // Apps Script retira las cuentas cobradas de Supabase. Un cambio de nombre/
 // responsable o un cierre que llega despues puede recibir 406. Solo se
 // libera si la credencial es valida y la cuenta ya no existe o esta cerrada
@@ -880,18 +898,19 @@ const verifySettledTableSessionPatch = async (entry) => {
       method: "POST", headers, body: JSON.stringify({ auth_token: token })
     }), REMOTE_WRITE_TIMEOUT_MS);
     if (!authenticated.ok || !(await authenticated.json())?.id) return false;
-    const rowUrl = new URL(entry.url);
-    rowUrl.search = "";
-    rowUrl.searchParams.set("id", `eq.${entry.recordId}`);
-    rowUrl.searchParams.set("select", "id,status,subtotal,discount,tax,service_fee,total");
-    const readHeaders = new Headers(headers);
-    readHeaders.delete("content-type");
-    const response = await fetchWithTimeout(new Request(rowUrl.href, {
-      method: "GET", headers: readHeaders
-    }), REMOTE_WRITE_TIMEOUT_MS);
-    if (!response.ok) return false;
     const authority = await readSessionForSync(entry, headers, token);
-    const rows = authority ? (authority.session ? [authority.session] : []) : await response.json();
+    let rows;
+    if (authority) rows = authority.session ? [authority.session] : [];
+    else {
+      const rowUrl = new URL(entry.url);
+      rowUrl.search = '';
+      rowUrl.searchParams.set('id',`eq.${entry.recordId}`);
+      rowUrl.searchParams.set('select','id,status,subtotal,discount,tax,service_fee,total');
+      const readHeaders = new Headers(headers); readHeaders.delete('content-type');
+      const response = await fetchWithTimeout(new Request(rowUrl.href,{method:'GET',headers:readHeaders}),REMOTE_WRITE_TIMEOUT_MS);
+      if (!response.ok) return false;
+      rows = await response.json();
+    }
     const matches = Array.isArray(rows) ? rows : (rows ? [rows] : []);
     if (matches.length === 0) {
       if (!authority) return false;
@@ -1030,6 +1049,9 @@ const flushQueue = (force = false) => {
           confirmed = await verifyRestMutation(entry);
         }
         if (!confirmed && [406, 409].includes(response.status)) confirmed = await verifyRestMutation(entry);
+        if (!confirmed && [406,409].includes(response.status) && await verifyCommittedTableSessionCreate(entry)) {
+          confirmed = true; reconciledAs = 'session_creation_verified_with_authorization';
+        }
         if (!confirmed && response.status === 409) confirmed = Boolean(await resolveOpenSessionConflict(entry));
         if (!confirmed && response.status === 406) {
           reconciledSessionPatch = await verifySettledTableSessionPatch(entry);
@@ -1175,12 +1197,14 @@ const networkFirst = async (request) => {
 };
 
 const scopedAdminReaders = new Set();
+const scopedCoreReaders = new Set();
 const directSupabaseRequest = async (request, url, clientId = "") => {
   if (!networkAvailable) {
     return new Response('{"message":"offline"}', { status: 503, headers: { "Content-Type": "application/json" } });
   }
   if (RECONCILIATION_RPC_NAMES.has(rpcNameFor(url))
     && !(rpcNameFor(url) === "get_admin_snapshot" && scopedAdminReaders.has(clientId))
+    && !(rpcNameFor(url) === "get_bootstrap_data" && scopedCoreReaders.has(clientId))
     && await hasBlockingEntriesForEntities(RPC_READ_ENTITIES[rpcNameFor(url)] || [])) {
     return new Response('{"message":"pending_local_writes"}', { status: 503, headers: { "Content-Type": "application/json" } });
   }
@@ -1257,6 +1281,13 @@ self.addEventListener("sync", (event) => {
 });
 
 self.addEventListener("message", (event) => {
+  if (event.data?.type === 'SET_SCOPED_CORE_READ') {
+    if (event.source?.id) {
+      if (event.data.enabled === true) scopedCoreReaders.add(event.source.id);
+      else scopedCoreReaders.delete(event.source.id);
+    }
+    event.ports?.[0]?.postMessage({ok:Boolean(event.source?.id)});
+  }
   if (event.data?.type === "SET_SCOPED_ADMIN_READ") {
     if (event.source?.id) {
       if (event.data.enabled === true) scopedAdminReaders.add(event.source.id);

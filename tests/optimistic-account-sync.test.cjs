@@ -1,0 +1,18 @@
+const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),vm=require('node:vm');
+const source=fs.readFileSync(path.join(__dirname,'../app.js'),'utf8');
+const start=source.indexOf('  const mergeOptimisticRequests ='),end=source.indexOf(source.includes('  const applyOfflineSessionRemap =')?'  const applyOfflineSessionRemap =':'  const isSongRequest =',start);
+assert.ok(start>0&&end>start);
+const local={id:'account-a',payer_name:'Nombre local',assigned_waiter_id:'staff-a',session_items:[{id:'old-item',item_name:'Producto',quantity:1,unit_price:1000,status:'served'},{id:'pending-item',item_name:'Nuevo consumo',quantity:2,unit_price:2000,status:'served'}],session_payments:[]};
+const overlay={mode:'upsert',session:local,expectedSession:{payer_name:'Nombre local',assigned_waiter_id:'staff-a'},expectedItems:[local.session_items[1]]};
+const state={optimisticRequestStates:new Map(),optimisticSessionStates:new Map([['account-a',overlay]])};
+const context=vm.createContext({state,Date,Map,REMOTE_CONFIRMATION_HOLD_MS:1500});
+vm.runInContext(source.slice(start,end)+';globalThis.merge=mergeOptimisticSessions;',context);
+const remote={id:'account-a',payer_name:'Nombre anterior',assigned_waiter_id:'staff-a',session_items:[{id:'old-item',item_name:'Producto',quantity:5,unit_price:1000,status:'served'},{id:'peer-item',item_name:'Desde el otro PC',quantity:1,unit_price:3000,status:'served'}],session_payments:[{id:'peer-payment',amount:2000}]};
+const result=context.merge([remote])[0];
+assert.equal(result.payer_name,'Nombre local');
+assert.equal(result.session_items.find(i=>i.id==='old-item').quantity,5,'Un consumo pendiente conserva cantidades nuevas de otras líneas.');
+assert.ok(result.session_items.some(i=>i.id==='peer-item'));
+assert.ok(result.session_items.some(i=>i.id==='pending-item'));
+assert.equal(result.session_payments[0].amount,2000,'La vista optimista no oculta abonos del otro equipo.');
+assert.equal(state.optimisticSessionStates.size,1,'El consumo aún pendiente conserva su protección.');
+console.log('PASS mezcla optimista: conserva consumo/nombre local pendiente y recibe otros consumos y abonos del otro dispositivo.');

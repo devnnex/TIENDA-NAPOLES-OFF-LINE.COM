@@ -62,5 +62,10 @@ vm.runInContext(source.slice(readerFrom,readerTo)+section('loadClientSnapshot','
   responses.get_session_payments=Promise.resolve({data:{payments:[{id:'payment-a',amount:10000,payment_method:'cash',created_at:'2026-10-07T17:00:00Z'},{id:'payment-d',amount:10000,payment_method:'cash',created_at:'2026-10-07T19:00:00Z'}]}});
   assert.equal(await context.reader.loadClientSnapshot(),false,'Los consumos y solicitudes no cambiaron.');
   assert.match(box.innerHTML,/\$10000/,'El abono actualiza Tu cuenta aunque la firma de consumos no cambie.');
+  state.sessionItems=[];
+  context.api.renderBillChat();
+  assert.doesNotMatch(box.innerHTML,/account-abono-line|Abonos/,'Sin consumo no se muestra un abono antiguo en el QR.');
+  const emptyBill=JSON.parse(context.api.buildBillMessage({...account,session_items:[]}));
+  assert.equal(emptyBill.paid,0);assert.equal(emptyBill.payments.length,0);assert.equal(emptyBill.total,0);
   console.log('PASS QR: abonos y saldo en consulta y recibo enviado; concurrencia, cambios sin nuevos consumos, errores de red y aislamiento entre mesas.');
 })().catch(error=>{console.error(error);process.exitCode=1;});

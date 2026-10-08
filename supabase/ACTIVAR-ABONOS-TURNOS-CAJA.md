@@ -1,4 +1,26 @@
-# Activación compartida de BCA y Offline 1.0.9
+# Activación compartida de BCA y Offline
+
+## Actualización 1.0.11: coherencia entre consumos y abonos
+
+Si el SQL de abonos de 1.0.9 ya terminó correctamente, conservarlo y ejecutar
+UNA vez el nuevo archivo completo `migrations/20261007230000_abonos_consumos_coherentes.sql`
+en el mismo backend compartido. Instalar Offline 1.0.11 con sus ventanas cerradas,
+recargar BCA e iniciar sesión con internet. No borrar el perfil ni las colas.
+
+La regla rechaza reducir precio/cantidad o retirar productos si el consumo
+restante es positivo y menor que los abonos. Si se retira TODO el consumo,
+elimina los abonos de la cuenta abierta y permite liberar la mesa. El QR
+muestra la cuenta actual sin esos abonos. Conserva pagos de cuentas cerradas
+archivadas. La validación del backend comparte el bloqueo de cuenta con el
+registro de abonos y comprueba el resultado completo de cada sentencia.
+
+Las lecturas actuales no esperan a que se resuelva una operación antigua.
+Los cambios pendientes conservan sus campos y líneas propios sin ocultar otros
+consumos, abonos, solicitudes ni cambios de catálogo y Marca. Las lecturas
+fallidas conservan el estado visible. Los cambios confirmados avisan a las
+sesiones abiertas; la consulta periódica y la reconexión sirven como respaldo.
+
+## Activación inicial de abonos, turnos y caja (1.0.9)
 
 Ambos proyectos usan el mismo backend. Ejecutar una sola vez en su SQL Editor
 el archivo completo `migrations/20261007190000_abonos_turnos_caja.sql` y esperar

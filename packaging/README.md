@@ -1,7 +1,27 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.10.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.11.exe` con Inno Setup 6.
+
+La versión 1.0.11 consulta los snapshots autorizados actuales al iniciar sesión
+sin esperar a que terminen las colas de escritura. Un GET vacío por permisos o
+una lectura fallida no reemplaza datos válidos. Los pendientes conservan sus
+campos y líneas propios; reciben consumos, abonos y cambios de los otros equipos.
+Las escrituras confirmadas avisan a las sesiones abiertas de ambos proyectos;
+las lecturas y los cambios únicamente locales no generan avisos de confirmación.
+La actualización periódica y la reconexión siguen como respaldo.
+Un alta de cuenta con 406 se confirma únicamente al comprobar el mismo UUID,
+mesa y canal mediante lectura autorizada. No repite un cobro ni borra la cola.
+Los avisos recibidos durante una lectura se revisan de nuevo al terminar.
+
+Para la NUEVA regla de consumos y abonos, ejecutar una vez en el backend compartido
+`supabase/migrations/20261007230000_abonos_consumos_coherentes.sql` después del SQL
+de abonos de 1.0.9. Rechaza reducciones que dejen consumo positivo inferior a
+lo abonado. Al retirar todo el consumo de una cuenta abierta elimina sus abonos,
+permite liberar la mesa y deja de mostrarlos en el QR. Conserva pagos archivados
+de cuentas cerradas. Las validaciones de productos y abonos comparten el bloqueo
+de cuenta del backend. La app valida también antes de modificar el consumo.
+Este SQL adicional debe ejecutarse en Supabase; el instalador no lo ejecuta.
 
 La versión 1.0.10 corrige la lectura de cuentas cuando una operación antigua
 identificada ya no tiene copia en el caché. Conserva las escrituras pendientes

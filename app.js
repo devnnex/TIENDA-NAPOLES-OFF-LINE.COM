@@ -63,7 +63,22 @@ const SupabaseDb = (() => {
       if (authToken) headers.set("x-app-token", authToken);
       if (clientTableAccess.table_id) headers.set("x-table-id", clientTableAccess.table_id);
       if (clientTableAccess.code) headers.set("x-table-code", clientTableAccess.code);
-      return fetch(input, { ...options, headers });
+      return fetch(input, { ...options, headers }).then((response) => {
+        try {
+          const url = new URL(typeof input === "string" ? input : input?.url || String(input), SUPABASE_CONFIG.url);
+          const method = String(options.method || input?.method || "GET").toUpperCase();
+          const entity = url.pathname.replace(/^.*\/rest\/v1\//, "");
+          const core = ["business_settings", "restaurant_tables", "menu_categories", "menu_items"].includes(entity);
+          const operational = ["table_sessions", "session_items", "service_requests"].includes(entity)
+            || /^rpc\/(save_table_zones|record_session_payment|replay_table_session_change|acknowledge_service_requests|resolve_bill|create_service_requests?(?:_batch)?)$/.test(entity);
+          const users = entity === "app_users" || /^rpc\/(save_user|delete_user)$/.test(entity);
+          if (response.ok && !response.headers.get("X-Offline-Queued") && ["POST","PATCH","DELETE"].includes(method)
+            && (core || operational || users) && typeof window.dispatchEvent === "function") {
+            window.dispatchEvent(new CustomEvent("napoles-remote-change", { detail: { core, operational, users } }));
+          }
+        } catch (_) { /* El aviso no interrumpe una respuesta ya confirmada. */ }
+        return response;
+      });
     };
     client = window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey, {
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -708,41 +723,9 @@ const App = (() => {
     }
   };
 
-  const loadBusiness = async () => {
-    const data = await db(
-      state.sb.from("business_settings").select("*").eq("is_primary", true).maybeSingle(),
-      null
-    );
-    state.business = data || state.business || {
-      business_name: "Tu restaurante",
-      subtitle: "Servicio a la mesa rapido y claro",
-      accent_color: "#f05a28",
-      currency: DEFAULT_CURRENCY,
-      tips_enabled: false,
-      tip_percentage: 10
-    };
-    applyBusinessTipSettings();
-    document.documentElement.style.setProperty("--accent", state.business.accent_color || "#f05a28");
-    return Boolean(data);
-  };
+  const loadBusiness = async () => refreshCoreNow();
 
-  const loadCore = async () => {
-    const [tables, categories, items] = await Promise.all([
-      db(state.sb.from("restaurant_tables").select("*").order("table_number", { ascending: true }), null),
-      db(state.sb.from("menu_categories").select("*").order("sort_order", { ascending: true }), null),
-      db(
-        state.sb
-          .from("menu_items")
-          .select("*, menu_categories(name)")
-          .order("sort_order", { ascending: true }),
-        null
-      )
-    ]);
-    if (Array.isArray(tables)) state.tables = tables;
-    if (Array.isArray(categories)) state.categories = categories;
-    if (Array.isArray(items)) state.items = items;
-    return Array.isArray(tables) && Array.isArray(categories) && Array.isArray(items);
-  };
+  const loadCore = async () => refreshCoreNow();
 
   const ensurePresetCategories = async () => {
     if (!isManager()) return;
@@ -1705,7 +1688,7 @@ const App = (() => {
           <span>${icon("receipt", 18)} Cuenta actual</span>
           <strong>${money(Math.max(0,subtotal-sessionPaid(state.currentSession)))}</strong>
         </div>
-        ${sessionPaid(state.currentSession) ? `<div class="account-abono-summary">Consumo: ${money(subtotal)} · Abonos: −${money(sessionPaid(state.currentSession))}</div>` : ""}
+        ${subtotal > 0 && sessionPaid(state.currentSession) ? `<div class="account-abono-summary">Consumo: ${money(subtotal)} · Abonos: −${money(sessionPaid(state.currentSession))}</div>` : ""}
         <div class="account-list">
           ${[...state.sessionItems]
             .sort((left, right) => new Date(right.created_at || right.updated_at || 0) - new Date(left.created_at || left.updated_at || 0))
@@ -1754,8 +1737,8 @@ const App = (() => {
       tax: totals.tax,
       service_fee: totals.serviceFee,
       consumption_total: totals.total,
-      paid: sessionPaid(session),
-      payments: sessionPayments(session),
+      paid: totals.total > 0 ? sessionPaid(session) : 0,
+      payments: totals.total > 0 ? sessionPayments(session) : [],
       total: sessionBalance(session)
     });
   };
@@ -2538,6 +2521,7 @@ const App = (() => {
         throw transientAppsScriptError("La respuesta del respaldo remoto todavía se está confirmando.");
       }
       if (result?.ok && action !== "status" && !action.startsWith("get_")) {
+        if (typeof notifyAdminPeers === "function") notifyAdminPeers({ reports:true });
         appsScriptStatusAt = 0;
         appsScriptStatusEpoch += 1;
         appsScriptStatusPromise = null;
@@ -2920,6 +2904,13 @@ const App = (() => {
       // Las lecturas independientes comienzan de inmediato. Una operación
       // pendiente de una entidad no debe congelar toda la aplicación.
       const coreRefresh = refreshCoreNow();
+      const initialReads = state.page === 'admin' && navigator.onLine ? Promise.allSettled([
+        refreshAdminNow(),
+        syncInventoryWithAppsScript(),
+        isManager() ? loadInventoryMovements() : Promise.resolve(false),
+        canAccessAdminSection('income') ? loadIncomeReport({ background:true,force:true }) : Promise.resolve(false),
+        isBoss() ? loadUsers() : Promise.resolve(false)
+      ]) : Promise.resolve([]);
       const initialCounts = await getOfflineSyncStatus();
       await flushOfflineQueue(true);
       await coreRefresh;
@@ -2943,6 +2934,7 @@ const App = (() => {
         showAdminSection(state.activeAdminSection || "dashboard");
       }
       if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
+      await initialReads;
       const finalCounts = await getOfflineSyncStatus();
       const requiredFresh = requiredSyncDomains();
       const cleanQueue = finalCounts.controllerAvailable
@@ -4007,6 +3999,7 @@ const App = (() => {
     bindClient();
     state.adminBroadcastChannel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
+      .on("broadcast", { event: "refresh" }, () => void refreshClientPosData())
       .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .subscribe();
     subscribeClient();
@@ -4060,7 +4053,15 @@ const App = (() => {
         }
         merged.set(sessionId, serverSession);
       } else {
-        merged.set(sessionId, overlay.session);
+        if (!serverSession || overlay.localOnly) { merged.set(sessionId, overlay.session); return; }
+        const items = new Map((serverSession.session_items || []).map((item) => [item.id,item]));
+        expectedItems.forEach((item) => items.set(item.id,item));
+        const pending = { ...serverSession, session_items: [...items.values()] };
+        Object.keys(overlay.expectedSession || {}).forEach((field) => {
+          if (Object.prototype.hasOwnProperty.call(overlay.session || {},field)) pending[field] = overlay.session[field];
+        });
+        if (overlay.expectedSession && Object.prototype.hasOwnProperty.call(overlay.expectedSession,'assigned_waiter_id')) pending.assigned_waiter = overlay.session?.assigned_waiter;
+        merged.set(sessionId,pending);
       }
     });
     return Array.from(merged.values());
@@ -4376,8 +4377,21 @@ const App = (() => {
     }, 12000);
   };
 
+  const notifyAdminPeers = (detail = {}) => {
+    if (!state.authToken || !state.currentUser) return;
+    const channel = state.adminBroadcastChannel;
+    if (!channel?.send) return;
+    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.users,"users-refresh"]]) {
+      if (enabled) {
+        try { Promise.resolve(channel.send({type:"broadcast",event,payload:{}})).catch(() => undefined); }
+        catch (_) { /* La consulta periódica recupera un canal desconectado. */ }
+      }
+    }
+  };
+
+  let adminRefreshPending = false;
   const refreshAdminNow = async () => {
-    if (state.adminSyncBusy) return false;
+    if (state.adminSyncBusy) { adminRefreshPending = true; return false; }
     state.adminSyncBusy = true;
     try {
       const changed = await loadAdminData();
@@ -4386,12 +4400,19 @@ const App = (() => {
       return changed;
     } finally {
       state.adminSyncBusy = false;
+      if (adminRefreshPending) { adminRefreshPending = false; window.setTimeout(() => void refreshAdminNow(),0); }
     }
   };
 
   const startAdminPolling = () => {
     clearInterval(state.adminPollTimer);
-    state.adminPollTimer = setInterval(refreshAdminNow, SYNC_INTERVAL_MS);
+    state.adminPollTimer = setInterval(() => {
+      void refreshAdminNow();
+      if (Date.now()-Number(state.coreRefreshedAt || 0) >= 5000) {
+        void refreshCoreNow();
+        if (isBoss()) void loadUsers();
+      }
+    }, SYNC_INTERVAL_MS);
   };
 
   const pendingAdminReadScope = (cached, queue) => {
@@ -4401,7 +4422,6 @@ const App = (() => {
     if (!Array.isArray(records)) return { safe: false, sessionIds, requestIds, closedIds };
     const pending = records.filter((entry) => relevant.includes(entry.entity));
     if (!pending.length) return { safe: true, sessionIds, requestIds, closedIds };
-    if (!cached) return { safe: false, sessionIds, requestIds, closedIds };
     for (const entry of pending) {
       const ids = entry.recordIds || [];
       if (entry.entity === "rpc:replay_table_session_change") {
@@ -4415,7 +4435,7 @@ const App = (() => {
         }
       } else if (["session_items","rpc:record_session_payment"].includes(entry.entity)) {
         const parents = new Set(entry.sessionIds || []);
-        ids.forEach((id) => cached.sessions.forEach((session) => {
+        ids.forEach((id) => (cached?.sessions || []).forEach((session) => {
           if ((session.session_items || []).some((line) => line.id === id)) parents.add(session.id);
         }));
         if (!parents.size) return { safe: false, sessionIds, requestIds, closedIds };
@@ -4429,19 +4449,55 @@ const App = (() => {
         }
       }
     }
-    return { safe: true, sessionIds, requestIds, closedIds };
+    return { safe: true, sessionIds, requestIds, closedIds, records: pending };
   };
 
   const mergePendingAdminRows = (remote, cached, scope) => {
     if (!scope.safe) return remote;
-    const localSessionIds = new Set((cached?.sessions || []).map((row) => row.id));
-    const localRequestIds = new Set((cached?.requests || []).map((row) => row.id));
-    const sessions = new Map((remote.sessions || []).filter((row) => !scope.closedIds.has(row.id)
-      && !(scope.sessionIds.has(row.id) && localSessionIds.has(row.id))).map((row) => [row.id, row]));
-    (cached?.sessions || []).filter((row) => scope.sessionIds.has(row.id) && !scope.closedIds.has(row.id))
-      .forEach((row) => sessions.set(row.id, row));
-    const requests = new Map((remote.requests || []).filter((row) => !(scope.requestIds.has(row.id) && localRequestIds.has(row.id))).map((row) => [row.id, row]));
-    (cached?.requests || []).filter((row) => scope.requestIds.has(row.id)).forEach((row) => requests.set(row.id, row));
+    const sessions = new Map((remote.sessions || []).filter((row) => !scope.closedIds.has(row.id)).map((row) => [row.id,row]));
+    const relevant = (entry,id,local) => entry.entity === 'table_sessions' ? entry.recordIds?.includes(id)
+      : entry.sessionIds?.includes(id) || (entry.entity === 'session_items' && (local.session_items || []).some((item) => entry.recordIds?.includes(item.id)));
+    const overlayFields = (base,local,fields) => {
+      const result = { ...base };
+      fields.filter((field) => !['id','session_items','session_payments'].includes(field)).forEach((field) => {
+        if (Object.prototype.hasOwnProperty.call(local,field)) result[field] = local[field];
+      });
+      return result;
+    };
+    (cached?.sessions || []).filter((local) => scope.sessionIds.has(local.id) && !scope.closedIds.has(local.id)).forEach((local) => {
+      const entries = (scope.records || []).filter((entry) => relevant(entry,local.id,local));
+      if (!sessions.has(local.id) || !entries.length || entries.some((entry) => !Array.isArray(entry.changedFields))) { sessions.set(local.id,local); return; }
+      let merged = { ...sessions.get(local.id) };
+      entries.forEach((entry) => {
+        if (['table_sessions','rpc:replay_table_session_change'].includes(entry.entity)) {
+          if (entry.method === 'POST' && entry.entity === 'table_sessions') return;
+          merged = overlayFields(merged,local,entry.changedFields);
+          if (entry.changedFields.includes('assigned_waiter_id')) merged.assigned_waiter = local.assigned_waiter;
+          if (entry.changedFields.includes('table_id')) merged.restaurant_tables = local.restaurant_tables;
+        } else if (entry.entity === 'session_items') {
+          const items = new Map((merged.session_items || []).map((item) => [item.id,item]));
+          (entry.recordIds || []).forEach((id) => {
+            if (entry.method === 'DELETE') { items.delete(id); return; }
+            const line = (local.session_items || []).find((item) => item.id === id);
+            if (line) items.set(id,items.has(id) ? overlayFields(items.get(id),line,entry.changedFields) : line);
+          });
+          merged.session_items = [...items.values()];
+        } else if (entry.entity === 'rpc:record_session_payment') {
+          const payments = new Map((merged.session_payments || []).map((payment) => [payment.id,payment]));
+          (local.session_payments || []).filter((payment) => entry.recordIds?.includes(payment.id)).forEach((payment) => { if (!payments.has(payment.id)) payments.set(payment.id,payment); });
+          merged.session_payments = [...payments.values()];
+        }
+      });
+      sessions.set(local.id,merged);
+    });
+    const requests = new Map((remote.requests || []).map((row) => [row.id,row]));
+    (cached?.requests || []).filter((local) => scope.requestIds.has(local.id)).forEach((local) => {
+      const entries = (scope.records || []).filter((entry) => entry.recordIds?.includes(local.id));
+      if (!requests.has(local.id) || !entries.length || entries.some((entry) => !Array.isArray(entry.changedFields))) { requests.set(local.id,local); return; }
+      let merged = requests.get(local.id);
+      entries.forEach((entry) => { merged = overlayFields(merged,local,String(entry.entity).startsWith('rpc:') ? ['status','acknowledged_at','message'] : entry.changedFields); });
+      requests.set(local.id,merged);
+    });
     return { ...remote, sessions: [...sessions.values()], requests: [...requests.values()] };
   };
 
@@ -4457,7 +4513,7 @@ const App = (() => {
   const loadAdminData = async () => {
     const cachedSnapshot = readOfflineAdminSnapshot();
     const pendingScope = pendingAdminReadScope(cachedSnapshot, await getOfflineSyncStatus());
-    await setScopedAdminRead(pendingScope.safe);
+    await setScopedAdminRead(true);
     (cachedSnapshot?.removedSessions || []).forEach((entry) => {
       if (entry?.id && Date.now() < Number(entry.retainUntil || 0) && !state.optimisticSessionStates.has(entry.id)) {
         state.optimisticSessionStates.set(entry.id, { mode: "remove", session: null, retainUntil: entry.retainUntil });
@@ -4468,45 +4524,18 @@ const App = (() => {
     if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
     if (!snapshot) {
-      const [requests, sessions] = await Promise.all([
-        dbQuiet(
-          state.sb.from("service_requests").select("*, restaurant_tables(table_number, table_name)")
-            .in("status", ["pending", "acknowledged"]).order("created_at", { ascending: false }),
-          null
-        ),
-        dbQuiet(
-          state.sb.from("table_sessions").select("*, restaurant_tables(table_number, table_name), session_items(*)")
-            .eq("status", "open").order("opened_at", { ascending: false }),
-          null
-        )
-      ]);
-      if (!Array.isArray(requests) || !Array.isArray(sessions)) {
-        state.syncFresh.operational = false;
-        if (!cachedSnapshot) return false;
-        state.requests = mergeOptimisticRequests(cachedSnapshot.requests);
-        state.sessions = mergeOptimisticSessions(cachedSnapshot.sessions);
-        return false;
+      state.syncFresh.operational = false;
+      // Una RPC fallida y un GET vacío por RLS no prueban que se borraron las cuentas.
+      if (cachedSnapshot && !state.sessions.length && !state.requests.length) {
+        state.requests = mergeOptimisticRequests(cachedSnapshot.requests || []);
+        state.sessions = mergeOptimisticSessions(cachedSnapshot.sessions || []);
       }
-      state.syncFresh.operational = !pendingScope.sessionIds.size && !pendingScope.requestIds.size;
-      const merged = mergePendingAdminRows({ requests, sessions }, cachedSnapshot, pendingScope);
-      state.requests = mergeOptimisticRequests(merged.requests || []);
-      state.sessions = mergeOptimisticSessions(merged.sessions || []);
-      persistOfflineAdminSnapshot();
-      return true;
+      return false;
     }
     state.syncFresh.operational = !pendingScope.sessionIds.size && !pendingScope.requestIds.size;
     const requests = mergeOptimisticRequests(snapshot.requests || []);
     const sessions = mergeOptimisticSessions(snapshot.sessions || []);
-    const signature = JSON.stringify([
-      requests.map((request) => [request.id, request.status, request.updated_at]),
-      sessions.map((session) => [
-        session.id,
-        session.status,
-        session.updated_at,
-        session.session_payments,
-        ...(session.session_items || []).map((item) => [item.id, item.status, item.quantity, item.updated_at])
-      ])
-    ]);
+    const signature = JSON.stringify([requests,sessions]);
     if (signature === state.adminSnapshotSignature) return false;
     state.adminSnapshotSignature = signature;
     state.requests = requests;
@@ -4515,17 +4544,77 @@ const App = (() => {
     return true;
   };
 
+  const setScopedCoreRead = (enabled) => new Promise((resolve) => {
+    const controller = navigator.serviceWorker?.controller;
+    if (!controller) { resolve(false); return; }
+    const channel = new MessageChannel();
+    const timer = window.setTimeout(() => { channel.port1.close(); resolve(false); },500);
+    channel.port1.onmessage = (event) => { window.clearTimeout(timer); channel.port1.close(); resolve(event.data?.ok === true); };
+    controller.postMessage({type:'SET_SCOPED_CORE_READ',enabled},[channel.port2]);
+  });
+
+  const mergePendingCoreData = (remote,queue) => {
+    const records = queue?.blockingRecords || [];
+    const result = { ...remote };
+    for (const [entity,key] of [['restaurant_tables','tables'],['menu_categories','categories'],['menu_items','items']]) {
+      const pending = records.filter((record) => record.entity === entity);
+      const rows = new Map((remote[key] || []).map((row) => [row.id,row]));
+      const local = state[key] || [];
+      pending.forEach((record) => {
+        const ids = record.recordIds || [];
+        if (!ids.length) { local.forEach((row) => rows.set(row.id,row)); return; }
+        ids.forEach((id) => {
+          if (record.method === 'DELETE') { rows.delete(id); return; }
+          const saved = local.find((row) => row.id === id);
+          if (!saved) return;
+          if (!rows.has(id) || !Array.isArray(record.changedFields)) { rows.set(id,saved); return; }
+          if (record.method === 'POST') return;
+          const row = { ...rows.get(id) };
+          record.changedFields.filter((field) => field !== 'id').forEach((field) => { if (Object.prototype.hasOwnProperty.call(saved,field)) row[field] = saved[field]; });
+          rows.set(id,row);
+        });
+      });
+      if (entity === 'restaurant_tables' && records.some((record) => record.entity === 'rpc:save_table_zones')) {
+        local.forEach((row) => { if (rows.has(row.id)) rows.set(row.id,{...rows.get(row.id),is_outdoor:row.is_outdoor}); });
+      }
+      result[key] = [...rows.values()];
+    }
+    const businessChanges = records.filter((record) => record.entity === 'business_settings');
+    businessChanges.forEach((record) => {
+      if (!state.business) return;
+      if (!Array.isArray(record.changedFields)) { result.business = state.business; return; }
+      result.business = { ...result.business };
+      record.changedFields.filter((field) => field !== 'id').forEach((field) => { if (Object.prototype.hasOwnProperty.call(state.business,field)) result.business[field] = state.business[field]; });
+    });
+    return result;
+  };
+
   let coreRefreshPromise = null;
+  let coreRefreshPending = false;
   const refreshCoreNow = () => {
-    if (coreRefreshPromise) return coreRefreshPromise;
+    if (coreRefreshPromise) { coreRefreshPending = true; return coreRefreshPromise; }
     state.coreSyncBusy = true;
     coreRefreshPromise = (async () => {
-      const [businessLoaded, coreLoaded] = await Promise.all([loadBusiness(), loadCore()]);
-      if (businessLoaded || coreLoaded) state.coreDirectReadSucceeded = true;
+      const queue = typeof getOfflineSyncStatus === 'function' ? await getOfflineSyncStatus() : {blockingRecords:[]};
+      if (typeof setScopedCoreRead === 'function') await setScopedCoreRead(Array.isArray(queue.blockingRecords));
+      const params = new URLSearchParams(location.search);
+      const data = await dbQuiet(state.sb.rpc('getBootstrapData',{
+        auth_token:state.authToken || '',
+        table_access_code:state.currentTable ? tableCode(state.currentTable) : params.get('mesa') || params.get('table') || params.get('t') || params.get('qr') || ''
+      }),null);
+      const businessLoaded = Boolean(data?.business);
+      const coreLoaded = Array.isArray(data?.tables) && Array.isArray(data?.categories) && Array.isArray(data?.items);
+      state.syncFresh ||= {};
+      if (businessLoaded && coreLoaded) {
+        const fresh = mergePendingCoreData(data,queue);
+        state.business = fresh.business; state.tables = fresh.tables; state.categories = fresh.categories; state.items = fresh.items;
+        state.coreRefreshedAt = Date.now();
+      }
+      if (businessLoaded && coreLoaded) state.coreDirectReadSucceeded = true;
       state.syncFresh.core = Boolean(businessLoaded && coreLoaded);
       applyBusinessTipSettings();
       if (!state.outdoorTableDraftDirty) state.outdoorTableDraftIds = null;
-      if (businessLoaded || coreLoaded) persistBootstrapCache();
+      if (businessLoaded && coreLoaded) persistBootstrapCache();
       if (state.page === "admin") {
         renderBrand();
         syncTipFeatureVisibility();
@@ -4540,11 +4629,12 @@ const App = (() => {
         renderBrand();
         renderMenu();
       }
-      return businessLoaded || coreLoaded;
+      return businessLoaded && coreLoaded;
     })().finally(() => {
       state.coreSyncBusy = false;
       coreRefreshPromise = null;
-      void updateGlobalSyncStatus();
+      if (coreRefreshPending) { coreRefreshPending = false; window.setTimeout(() => void refreshCoreNow(),0); }
+      if (typeof updateGlobalSyncStatus === 'function') void updateGlobalSyncStatus();
     });
     return coreRefreshPromise;
   };
@@ -4615,13 +4705,24 @@ const App = (() => {
   const sessionPayments = (session) => [...new Map((session?.session_payments || []).map((row) => [row.id, row])).values()];
   const sessionPaid = (session) => sessionPayments(session).reduce((sum, row) => sum + integerMoney(row.amount), 0);
   const sessionBalance = (session) => Math.max(0, sessionTotal(session) - sessionPaid(session));
+
+  const consumptionChangeAllowed = (session, itemId, replacement) => {
+    const projected = { ...session, session_items: (session?.session_items || []).map((item) =>
+      item.id === itemId ? { ...item, ...replacement } : item) };
+    const total = sessionTotal(projected);
+    return total === 0 || total >= sessionPaid(session);
+  };
+
+  const clearPaymentsWithoutConsumption = (session) => sessionTotal(session) === 0
+    ? { ...session, session_payments: [] } : session;
+
   const aggregateAccountPayments = (session, finalPayments) => {
     const totals = new Map();
     [...sessionPayments(session).map((row) => ({ method: row.payment_method, amount: row.amount })), ...finalPayments]
       .forEach((row) => totals.set(row.method, (totals.get(row.method) || 0) + integerMoney(row.amount)));
     return [...totals].filter(([, amount]) => amount > 0).map(([method, amount]) => ({ method, amount }));
   };
-  const abonoRowsHtml = (session) => sessionPayments(session).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
+  const abonoRowsHtml = (session) => (Array.isArray(session?.session_items) && sessionTotal(session) === 0 ? [] : sessionPayments(session)).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
     .map((row) => '<div class="account-abono-line"><div><strong>Abono · ' + escapeHTML(paymentMethodLabel(row.payment_method)) + '</strong><small>'
       + escapeHTML(new Date(row.created_at).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "medium" }))
       + (row.reference ? ' · ' + escapeHTML(row.reference) : '') + (row._offline_pending ? ' · Pendiente de sincronizar' : '')
@@ -4654,6 +4755,7 @@ const App = (() => {
       if (typeof flushDurableWrites === "function") await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
       delete form.dataset.paymentId; $("#abonoDialog")?.close();
       state.accountsRenderSignature = ""; state.adminSnapshotSignature = "";
+      if (!data.payment._offline_pending) notifyAdminPeers({ operational:true });
       renderAdminLive(); renderAccountDetail();
       if ($("#consumptionDialog")?.open && $("#consumptionForm")?.session_id?.value === session.id) {
         const wasVisible = !$("#tableConsumptionPreview")?.hidden;
@@ -6905,7 +7007,7 @@ const App = (() => {
         </div>
         ${suggestedTip ? `<div class="account-detail-tip"><span><small>Propina voluntaria (${state.tipSettings.percentage}%)</small><strong>${money(suggestedTip)}</strong></span><span><small>Total sugerido con propina</small><strong>${money(suggestedTotal)}</strong></span></div>` : ""}
         ${abonoRowsHtml(session)}
-        ${sessionPaid(session) ? `<div class="account-detail-total"><span>Consumo / abonado</span><strong>${money(sessionTotal(session))} / −${money(sessionPaid(session))}</strong></div>` : ""}
+        ${sessionTotal(session) > 0 && sessionPaid(session) ? `<div class="account-detail-total"><span>Consumo / abonado</span><strong>${money(sessionTotal(session))} / −${money(sessionPaid(session))}</strong></div>` : ""}
         <div class="account-detail-total"><span>Saldo pendiente</span><strong>${money(total)}</strong></div>
       </div>
       <div class="invoice-actions account-detail-actions">
@@ -6981,7 +7083,7 @@ const App = (() => {
               <article class="account-summary-card ${items.length ? "" : "is-empty"}" data-account-session="${session.id}">
                 <div class="account-summary-head"><div><span>${escapeHTML(sessionLabel(session))}</span><small>#${sessionReference(session)}</small></div><span class="account-summary-status">${items.length ? `${items.length} ${items.length === 1 ? "consumo" : "consumos"}` : "Cuenta en $0"}</span></div>
                 <div class="account-summary-total"><small>Saldo pendiente</small><strong>${money(total)}</strong></div>
-                ${sessionPaid(session) ? `<div class="account-abono-summary">Abonado: −${money(sessionPaid(session))} · Consumo: ${money(sessionTotal(session))}</div>` : ""}
+                ${sessionTotal(session) > 0 && sessionPaid(session) ? `<div class="account-abono-summary">Abonado: −${money(sessionPaid(session))} · Consumo: ${money(sessionTotal(session))}</div>` : ""}
                 ${suggestedTip ? `<div class="account-summary-tip"><span>Propina voluntaria (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong><small>Total sugerido: ${money(total + suggestedTip)}</small></div>` : ""}
                 <div class="account-summary-meta"><span>${icon("user-round", 15)} ${escapeHTML(session.payer_name || "Por definir")}</span><span>${icon("contact", 15)} ${escapeHTML(session.assigned_waiter?.full_name || "Sin asignar")}</span><span>${icon("clock-3", 15)} ${opened.date} · ${opened.time}</span></div>
                 <div class="account-summary-actions">
@@ -8744,9 +8846,13 @@ const App = (() => {
       accept: "Sí, quitar producto",
       cancel: "Conservar producto"
     })) return;
+    if (!consumptionChangeAllowed(session, itemId, { status: "cancelled" })) {
+      toast("No puedes quitar este producto: el consumo restante quedaría por debajo de los abonos.", "error", "consumption-below-payments");
+      return;
+    }
     const originalSession = session;
     state.sessions = state.sessions.map((entry) => entry.id === sessionId
-      ? { ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) }
+      ? clearPaymentsWithoutConsumption({ ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) })
       : entry);
     state.accountsRenderSignature = "";
     renderAdminLive();
@@ -8812,6 +8918,10 @@ const App = (() => {
       form.quantity.focus({ preventScroll: true });
       return;
     }
+    if (session && itemId && !consumptionChangeAllowed(session, itemId, { quantity, unit_price: price, status: "served" })) {
+      toast("No puedes reducir este consumo por debajo de los abonos registrados.", "error", "consumption-below-payments");
+      return;
+    }
     if (!session && !pendingTableId) return;
     if (!session && pendingTableId) {
       const table = state.tables.find((entry) => String(entry.id) === String(pendingTableId) && entry.is_active !== false);
@@ -8856,6 +8966,8 @@ const App = (() => {
             : [...(entry.session_items || []), optimisticItem]
         })
       : entry);
+    optimisticSession = clearPaymentsWithoutConsumption(optimisticSession);
+    state.sessions = state.sessions.map((entry) => entry.id === sessionId ? optimisticSession : entry);
     state.optimisticSessionStates.set(sessionId, {
       mode: "upsert",
       session: optimisticSession,
@@ -9936,9 +10048,15 @@ const App = (() => {
   };
 
   const subscribeAdmin = () => {
+    if (!state.peerSyncListener) {
+      state.peerSyncListener = (event) => notifyAdminPeers(event.detail);
+      window.addEventListener("napoles-remote-change", state.peerSyncListener);
+    }
     const channel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
+      .on("broadcast", { event: "reports-refresh" }, () => void refreshBackgroundReports({ force:true }))
+      .on("broadcast", { event: "users-refresh" }, () => { if (isBoss()) void loadUsers(); })
       .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
@@ -9959,6 +10077,7 @@ const App = (() => {
         }
       });
     state.subscriptions.push(channel);
+    state.adminBroadcastChannel = channel;
   };
 
   const tableFromScannedValue = (value) => {
@@ -10959,6 +11078,7 @@ const App = (() => {
         return;
       }
       if (event.data?.type !== "OFFLINE_QUEUE_FLUSHED") return;
+      notifyAdminPeers({ core:true, operational:true, users:true });
       void (async () => {
         await refreshCoreNow();
         if (state.page === "admin") {

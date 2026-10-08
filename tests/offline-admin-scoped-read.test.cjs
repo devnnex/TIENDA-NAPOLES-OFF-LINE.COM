@@ -29,7 +29,7 @@ scope = pendingAdminReadScope(cached, { blockingRecords: [record('rpc:acknowledg
 merged = mergePendingAdminRows(remote, cached, scope);
 assert.equal(merged.requests.find(row => row.id === 'request-a').status, 'acknowledged');
 assert.ok(merged.requests.some(row => row.id === 'request-b'));
-assert.equal(pendingAdminReadScope(null, { blockingRecords: [record('session_items', ['item-a'], ['a'])] }).safe, false);
+assert.equal(pendingAdminReadScope(null, { blockingRecords: [record('session_items', ['item-a'], ['a'])] }).safe, true,'Sin copia local, la cola conserva el cambio y se muestra el estado actual del servidor.');
 assert.equal(pendingAdminReadScope(cached, { blockingRecords: [record('session_items', ['unknown-item'])] }).safe, false);
 assert.equal(pendingAdminReadScope(cached, { blockingRecords: null }).safe, false);
 scope = pendingAdminReadScope(cached, { blockingRecords: [record('rpc:record_session_payment', ['payment-a'], ['a'])] });
@@ -41,4 +41,16 @@ assert.equal(scope.safe,true,'Un conflicto antiguo identificado sin copia local 
 assert.equal(mergePendingAdminRows(remote,{requests:[],sessions:[]},scope).sessions.length,3);
 scope = pendingAdminReadScope({requests:[],sessions:[]}, {blockingRecords:[record('table_sessions',['a'])]});
 assert.equal(mergePendingAdminRows(remote,{requests:[],sessions:[]},scope).sessions.find(row=>row.id==='a').id,'a','Sin copia local se muestra la lectura remota; la operación sigue en la cola.');
-console.log('Lectura por cuenta: conserva pendientes, refresca otras cuentas, protege cierres y solicitudes; sin evidencia mantiene proteccion.');
+const live={requests:[],sessions:[{id:'a',payer_name:'Nombre remoto',session_items:[{id:'item-a',quantity:7,unit_price:4500},{id:'item-remote',quantity:1,unit_price:9000}],session_payments:[{id:'remote-payment',amount:5000}]}]};
+scope=pendingAdminReadScope(cached,{blockingRecords:[{...record('table_sessions',['a']),method:'PATCH',changedFields:['payer_name']}]});
+merged=mergePendingAdminRows(live,cached,scope);
+assert.equal(merged.sessions[0].payer_name,'Cliente pendiente');
+assert.equal(merged.sessions[0].session_items[0].quantity,7,'Un nombre pendiente no congela consumos recientes de la misma cuenta.');
+assert.equal(merged.sessions[0].session_items.length,2);
+assert.equal(merged.sessions[0].session_payments[0].id,'remote-payment');
+scope=pendingAdminReadScope(cached,{blockingRecords:[{...record('session_items',['item-a'],['a']),method:'PATCH',changedFields:['quantity']}]});
+merged=mergePendingAdminRows(live,cached,scope);
+assert.equal(merged.sessions[0].session_items.find(i=>i.id==='item-a').quantity,2);
+assert.ok(merged.sessions[0].session_items.some(i=>i.id==='item-remote'),'Solo se protege la línea pendiente, no toda la cuenta.');
+assert.equal(merged.sessions[0].session_payments[0].amount,5000);
+console.log('Lectura por cuenta y campo: conserva pendientes y muestra cambios recientes de la misma cuenta y otras cuentas.');

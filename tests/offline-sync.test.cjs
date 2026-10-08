@@ -1490,6 +1490,40 @@ test("82 no concilia cambios de cuenta cerrada sin autorización ni una creació
   assert.equal((await api.listEntries()).find(row=>row.id===entry.id).status,'conflict');
 });
 
+test('83 concilia un POST de cuenta 406 ya guardado aunque REST no permita leer la fila',async()=>{
+  const payload={id:'session-1',table_id:'table-1',status:'open',payer_name:'Nombre inicial'};
+  const entry=closedSessionEntry({method:'POST',url:endpoint('table_sessions'),payload,body:JSON.stringify(payload)});
+  await api.putEntry(entry);
+  remoteFetch=async input=>{
+    const url=new URL(input.url);
+    if(url.pathname.endsWith('/get_current_user'))return Response.json({id:'staff-1'});
+    if(url.pathname.endsWith('/get_table_session_for_sync'))return Response.json({exists:true,session:{id:'session-1',table_id:'table-1',status:'open',payer_name:'Nombre más reciente'}});
+    if(input.method==='GET')return Response.json([]);
+    return Response.json({code:'PGRST116',details:'The result contains 0 rows'},{status:406});
+  };
+  await flushAsAuthenticatedApp('valid-token');
+  const saved=(await api.listEntries())[0];
+  assert.equal(saved.status,'confirmed','La creación ya existe con el mismo UUID y mesa; no queda detenida por RLS.');
+  assert.equal(saved.body,entry.body);assert.equal(saved.operationId,entry.operationId);
+});
+
+test('84 no descarta un POST 406 sin prueba de su UUID y mesa',async()=>{
+  for(const row of [null,{id:'session-1',table_id:'other-table',status:'open'}]){
+    reset();
+    const payload={id:'session-1',table_id:'table-1',status:'open'};
+    const entry=closedSessionEntry({method:'POST',url:endpoint('table_sessions'),payload,body:JSON.stringify(payload)});
+    await api.putEntry(entry);
+    remoteFetch=async input=>{
+      const url=new URL(input.url);
+      if(url.pathname.endsWith('/get_current_user'))return Response.json({id:'staff-1'});
+      if(url.pathname.endsWith('/get_table_session_for_sync'))return Response.json({exists:!!row,session:row});
+      if(input.method==='GET')return Response.json([]);
+      return Response.json({code:'PGRST116',details:'The result contains 0 rows'},{status:406});
+    };
+    await flushAsAuthenticatedApp('valid-token');assert.equal((await api.listEntries())[0].status,'conflict');
+  }
+});
+
 (async () => {
   let passed = 0;
   for (const scenario of tests) {

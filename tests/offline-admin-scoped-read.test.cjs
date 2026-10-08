@@ -36,4 +36,9 @@ scope = pendingAdminReadScope(cached, { blockingRecords: [record('rpc:record_ses
 assert.equal(scope.safe,true);assert.equal(mergePendingAdminRows(remote,cached,scope).sessions.find(row=>row.id==='a').session_items[0].quantity,2);
 scope = pendingAdminReadScope(cached, { blockingRecords: [record('rpc:replay_table_session_change', ['a'], ['a'],'closed')] });
 assert.equal(scope.safe,true);assert.equal(mergePendingAdminRows(remote,cached,scope).sessions.some(row=>row.id==='a'),false);
+scope = pendingAdminReadScope({requests:[],sessions:[]}, {blockingRecords:[record('table_sessions',['old-account'])]});
+assert.equal(scope.safe,true,'Un conflicto antiguo identificado sin copia local no congela las demás cuentas.');
+assert.equal(mergePendingAdminRows(remote,{requests:[],sessions:[]},scope).sessions.length,3);
+scope = pendingAdminReadScope({requests:[],sessions:[]}, {blockingRecords:[record('table_sessions',['a'])]});
+assert.equal(mergePendingAdminRows(remote,{requests:[],sessions:[]},scope).sessions.find(row=>row.id==='a').id,'a','Sin copia local se muestra la lectura remota; la operación sigue en la cola.');
 console.log('Lectura por cuenta: conserva pendientes, refresca otras cuentas, protege cierres y solicitudes; sin evidencia mantiene proteccion.');

@@ -86,7 +86,7 @@ vm.runInContext(`${workerSource}\n;globalThis.__syncTest = {
   directSupabaseRequest, flushQueue, isQueueableRpc, isRestMutation,
   listEntries, networkFirst, normalizeStoredEntry, putEntry, queuedResponse,
   recoverInterruptedEntries, refreshQueuedSessionItemAuth, serializeRequest,
-  syncStatusSnapshot, verifyRestMutation
+  syncStatusSnapshot, verifyRestMutation, verifySettledTableSessionPatch
 };`, context, { filename: workerPath });
 
 const api = context.__syncTest;
@@ -1437,6 +1437,57 @@ test("79 recupera el 406 de la foto cuando REST no ve la cuenta abierta", async 
   await api.flushQueue(true);const saved=(await api.listEntries())[0];
   assert.equal(saved.status,"confirmed");assert.equal(saved.operationId,entry.operationId);assert.deepEqual(replayed.p_patch,entry.payload);
   assert.equal(replayed.p_session_id,entry.recordId);assert.equal(saved.reconciledAs,"session_change_replayed_with_authorization");
+});
+
+test("80 cambio de responsable en una cuenta ya cerrada no bloquea su archivo", async () => {
+  const payload={payer_name:"Nombre tardío",assigned_waiter_id:"waiter-1"};
+  const entry=closedSessionEntry({payload,body:JSON.stringify(payload)});
+  await api.putEntry(entry);
+  let writes=0;
+  remoteFetch=async input=>{
+    const url=new URL(input.url);
+    if(url.pathname.endsWith('/get_current_user'))return Response.json({id:'staff-1'});
+    if(url.pathname.endsWith('/get_table_session_for_sync'))return Response.json({exists:true,session:{id:'session-1',status:'closed',subtotal:12000,total:12000}});
+    if(input.method==='GET')return Response.json([{id:'session-1',status:'closed'}]);
+    writes++;return Response.json({code:'PGRST116',details:'The result contains 0 rows'},{status:406});
+  };
+  await flushAsAuthenticatedApp('valid-token');
+  assert.equal((await api.listEntries())[0].status,'confirmed');
+  assert.equal(writes,0,'No modifica la cuenta cerrada ni vuelve a cobrarla.');
+});
+
+test("81 recupera los datos de una operación antigua aunque ya tenga metadatos básicos", async () => {
+  const payload={payer_name:'Nombre'};
+  const entry=closedSessionEntry({payload:undefined,recordId:undefined,recordIds:[],body:JSON.stringify(payload)});
+  await api.putEntry(entry);
+  const normalized=(await api.listEntries())[0];
+  assert.equal(normalized.recordId,'session-1');
+  assert.equal(normalized.payload.payer_name,'Nombre');
+  assert.equal((await api.syncStatusSnapshot()).blockingRecords[0].recordIds[0],'session-1');
+  assert.equal(normalized.operationId,entry.operationId);
+  assert.equal(normalized.body,entry.body);
+  assert.deepEqual(normalized.headers,entry.headers);
+  assert.equal(normalized.status,'conflict');
+});
+
+test("82 no concilia cambios de cuenta cerrada sin autorización ni una creación local pendiente", async () => {
+  const payload={payer_name:'Nombre tardío'};
+  const entry=closedSessionEntry({payload,body:JSON.stringify(payload)});
+  await api.putEntry(entry);
+  remoteFetch=async()=>Response.json({message:'Sesión no autorizada'},{status:401});
+  assert.equal(await api.verifySettledTableSessionPatch(entry),false);
+  remoteFetch=async input=>{
+    const url=new URL(input.url);
+    if(url.pathname.endsWith('/get_current_user'))return Response.json({id:'staff-1'});
+    if(url.pathname.endsWith('/get_table_session_for_sync'))return Response.json({exists:true,session:{id:'session-1',status:'closed'}});
+    return Response.json([{id:'session-1',status:'closed'}]);
+  };
+  const creation=closedSessionEntry({method:'POST',payload:{id:'session-1',status:'open'},status:'pending',body:JSON.stringify({id:'session-1',status:'open'})});
+  await api.putEntry(creation);
+  assert.equal(await api.verifySettledTableSessionPatch(entry),false);
+  const financial=closedSessionEntry({payload:{payer_name:'Nombre',total:5000}});
+  assert.equal(await api.verifySettledTableSessionPatch(financial),false,'Los importes no se tratan como cambios de nombre.');
+  assert.equal((await api.listEntries()).find(row=>row.id===entry.id).status,'conflict');
 });
 
 (async () => {

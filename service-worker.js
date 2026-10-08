@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v21";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v22";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -79,7 +79,7 @@ const withStore = async (mode, action) => {
 };
 
 const putEntry = (entry) => withStore("readwrite", (store) => store.put(entry));
-const listEntries = () => withStore("readonly", (store) => store.getAll());
+const listEntries = async () => (await withStore("readonly", (store) => store.getAll())).map(normalizeStoredEntry);
 const removeEntry = (id) => withStore("readwrite", (store) => store.delete(id));
 
 const entryCounts = async () => (await listEntries()).reduce((counts, entry) => {
@@ -334,18 +334,19 @@ const serializeRequest = async (request) => {
 };
 
 const normalizeStoredEntry = (entry) => {
-  if (entry.operationId && entry.entity && entry.createdAt) return entry;
   const url = new URL(entry.url);
-  let payload = {};
-  try { payload = entry.body ? JSON.parse(entry.body) : {}; } catch (_) { payload = {}; }
-  const entity = url.pathname.includes("/rpc/") ? `rpc:${rpcNameFor(url)}` : url.pathname.split("/").pop();
+  let payload = entry.payload;
+  if (payload == null) {
+    try { payload = entry.body ? JSON.parse(entry.body) : {}; } catch (_) { payload = {}; }
+  }
+  const entity = entry.entity || (url.pathname.includes("/rpc/") ? `rpc:${rpcNameFor(url)}` : url.pathname.split("/").pop());
   return {
     ...entry,
     operationId: entry.operationId || entry.id || crypto.randomUUID(),
     entity,
     payload,
     recordId: entry.recordId || extractRecordId(url, payload),
-    recordIds: entry.recordIds || extractRecordIds(url, payload),
+    recordIds: [...new Set([...(entry.recordIds || []), ...extractRecordIds(url, payload), entry.recordId].filter(Boolean))],
     operationType: entry.operationType || entry.method,
     createdAt: entry.createdAt || entry.queuedAt || new Date().toISOString(),
     createdOrder: Number(entry.createdOrder || new Date(entry.createdAt || entry.queuedAt || 0).getTime()),
@@ -901,7 +902,12 @@ const verifySettledTableSessionPatch = async (entry) => {
         && candidate.status !== "confirmed");
       return !unsettledCreate;
     }
-    if (entry.payload.status !== "closed") return false;
+    if (entry.payload.status !== "closed") {
+      // Un cambio tardío de nombre o responsable no puede reabrir una cuenta
+      // cerrada. No contiene importes y su estado terminal está verificado.
+      if (matches.length !== 1 || matches[0]?.id !== entry.recordId || matches[0]?.status !== "closed") return false;
+      return !(await hasQueuedCreate("table_sessions", [entry.recordId]));
+    }
     const moneyFields = ["subtotal", "discount", "tax", "service_fee", "total"];
     return matches.length === 1 && matches[0]?.status === "closed"
       && moneyFields.every((field) => !Object.prototype.hasOwnProperty.call(entry.payload, field)

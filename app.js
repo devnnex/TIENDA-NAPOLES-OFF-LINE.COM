@@ -1036,6 +1036,8 @@ const App = (() => {
       if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId || !session) return null;
       await loadClientSnapshot();
     }
+    await refreshClientPosData();
+    if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
     reconcilePendingBillsForTable(state.clientRequests);
     refreshTableLock();
     renderAccount();
@@ -1162,8 +1164,8 @@ const App = (() => {
   };
 
   const loadClientSnapshot = async () => {
-    void refreshClientPosData();
-    if (!state.currentSession) return;
+    const posRead = refreshClientPosData();
+    if (!state.currentSession) { await posRead; return; }
     const snapshot = await dbQuiet(
       state.sb.rpc("getClientSnapshot", {
         session_id: state.currentSession.id,
@@ -1172,6 +1174,7 @@ const App = (() => {
       }),
       null
     );
+    await posRead;
     if (!snapshot) {
       await Promise.all([loadClientSessionItems(), loadClientRequests()]);
       return true;
@@ -1750,7 +1753,10 @@ const App = (() => {
       discount: totals.discount,
       tax: totals.tax,
       service_fee: totals.serviceFee,
-      total: totals.total
+      consumption_total: totals.total,
+      paid: sessionPaid(session),
+      payments: sessionPayments(session),
+      total: sessionBalance(session)
     });
   };
 
@@ -1937,7 +1943,7 @@ const App = (() => {
     if (!box) return;
     if (box.classList.contains("is-closing")) return;
     const isLocalBill = state.localBillOpen && Boolean(state.currentTable);
-    const localSession = isLocalBill ? {
+    const localSession = (isLocalBill || state.currentSession) ? {
       ...(state.currentSession || {}),
       id: state.currentSession?.id || state.currentTable.id,
       restaurant_tables: state.currentTable,
@@ -1952,9 +1958,13 @@ const App = (() => {
           session_id: state.currentSession?.id || null
         }
       : latestClientBill();
-    const bill = isLocalBill
-      ? parseBillMessage(buildBillMessage(localSession))
-      : parseBillMessage(request?.message);
+    const storedBill = parseBillMessage(request?.message);
+    const liveBill = localSession ? parseBillMessage(buildBillMessage(localSession)) : null;
+    const bill = isLocalBill ? liveBill
+      : storedBill && liveBill && request?.session_id === state.currentSession?.id
+        ? { ...storedBill, ...liveBill, sent_at: storedBill.sent_at || liveBill.sent_at,
+            payer_name: liveBill.payer_name || storedBill.payer_name, waiter_name: liveBill.waiter_name || storedBill.waiter_name }
+        : storedBill;
     if (!request || !bill) {
       document.body.classList.remove("receipt-open");
       box.hidden = true;
@@ -1981,7 +1991,7 @@ const App = (() => {
               <strong>${billTicketId(request)}</strong>
             </div>
             <div>
-              <span>Total</span>
+              <span>${Number(bill.paid || 0) ? "Saldo pendiente" : "Total"}</span>
               <strong>${money(bill.total, bill.currency)}</strong>
             </div>
             <div>
@@ -2020,6 +2030,8 @@ const App = (() => {
             ${Number(bill.tax || 0) ? `<div><span>Impuestos</span><strong>${money(bill.tax, bill.currency)}</strong></div>` : ""}
             ${Number(bill.service_fee || 0) ? `<div><span>Servicio</span><strong>${money(bill.service_fee, bill.currency)}</strong></div>` : ""}
           </div>
+
+          ${Number(bill.paid || 0) ? `<div class="account-abono-summary">Consumo: ${money(bill.consumption_total ?? bill.subtotal, bill.currency)} · Abonos: −${money(bill.paid, bill.currency)}</div>${abonoRowsHtml({ session_payments: bill.payments || [] })}` : ""}
 
           <div class="receipt-barcode" aria-hidden="true">
             <span></span><span></span><span></span><span></span><span></span><span></span>
@@ -4394,13 +4406,12 @@ const App = (() => {
       const ids = entry.recordIds || [];
       if (entry.entity === "rpc:replay_table_session_change") {
         if (!entry.sessionIds?.length) return { safe:false,sessionIds,requestIds,closedIds };
-        for (const id of entry.sessionIds) { sessionIds.add(id); if (entry.sessionStatus === "closed") closedIds.add(id); else if (!cached.sessions.some((row) => row.id === id)) return { safe:false,sessionIds,requestIds,closedIds }; }
+        for (const id of entry.sessionIds) { sessionIds.add(id); if (entry.sessionStatus === "closed") closedIds.add(id); }
       } else if (entry.entity === "table_sessions") {
         if (!ids.length) return { safe: false, sessionIds, requestIds, closedIds };
         for (const id of ids) {
           sessionIds.add(id);
           if (entry.sessionStatus === "closed") closedIds.add(id);
-          else if (!cached.sessions.some((session) => session.id === id)) return { safe: false, sessionIds, requestIds, closedIds };
         }
       } else if (["session_items","rpc:record_session_payment"].includes(entry.entity)) {
         const parents = new Set(entry.sessionIds || []);
@@ -4409,13 +4420,11 @@ const App = (() => {
         }));
         if (!parents.size) return { safe: false, sessionIds, requestIds, closedIds };
         for (const id of parents) {
-          if (!cached.sessions.some((session) => session.id === id)) return { safe: false, sessionIds, requestIds, closedIds };
           sessionIds.add(id);
         }
       } else {
         if (!ids.length) return { safe: false, sessionIds, requestIds, closedIds };
         for (const id of ids) {
-          if (!cached.requests.some((request) => request.id === id)) return { safe: false, sessionIds, requestIds, closedIds };
           requestIds.add(id);
         }
       }
@@ -4425,10 +4434,13 @@ const App = (() => {
 
   const mergePendingAdminRows = (remote, cached, scope) => {
     if (!scope.safe) return remote;
-    const sessions = new Map((remote.sessions || []).filter((row) => !scope.sessionIds.has(row.id)).map((row) => [row.id, row]));
+    const localSessionIds = new Set((cached?.sessions || []).map((row) => row.id));
+    const localRequestIds = new Set((cached?.requests || []).map((row) => row.id));
+    const sessions = new Map((remote.sessions || []).filter((row) => !scope.closedIds.has(row.id)
+      && !(scope.sessionIds.has(row.id) && localSessionIds.has(row.id))).map((row) => [row.id, row]));
     (cached?.sessions || []).filter((row) => scope.sessionIds.has(row.id) && !scope.closedIds.has(row.id))
       .forEach((row) => sessions.set(row.id, row));
-    const requests = new Map((remote.requests || []).filter((row) => !scope.requestIds.has(row.id)).map((row) => [row.id, row]));
+    const requests = new Map((remote.requests || []).filter((row) => !(scope.requestIds.has(row.id) && localRequestIds.has(row.id))).map((row) => [row.id, row]));
     (cached?.requests || []).filter((row) => scope.requestIds.has(row.id)).forEach((row) => requests.set(row.id, row));
     return { ...remote, sessions: [...sessions.values()], requests: [...requests.values()] };
   };
@@ -4654,23 +4666,30 @@ const App = (() => {
       toast(error?.message || "No se pudo confirmar el abono. Revisa el registro antes de volver a intentarlo.", "error", "abono-failed");
     } finally { delete form.dataset.saving; button.disabled = false; }
   };
-  let clientPosReadBusy = false;
-  const refreshClientPosData = async () => {
-    if (!state.currentTable || clientPosReadBusy) return;
-    clientPosReadBusy = true;
-    try {
-      const table = state.currentTable;
-      const sessionId = state.currentSession?.id || "";
+  let clientPosReadPending = null;
+  let clientPosReadKey = "";
+  const refreshClientPosData = () => {
+    if (!state.currentTable) return Promise.resolve(false);
+    const table = state.currentTable, sessionId = state.currentSession?.id || "";
+    const key = table.id + ":" + sessionId + ":" + tableCode(table);
+    if (clientPosReadPending && clientPosReadKey === key) return clientPosReadPending;
+    clientPosReadKey = key;
+    const read = (async () => {
       const [queue, payments] = await Promise.all([
         dbQuiet(state.sb.rpc("get_service_request_queue", { p_table_id: table.id, p_table_access_code: tableCode(table) }), null),
-        state.currentSession ? dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: state.currentSession.id,
+        sessionId ? dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: sessionId,
           p_table_id: table.id, p_table_access_code: tableCode(table), auth_token: "" }), null) : null
       ]);
-      if (state.currentTable?.id !== table.id) return;
-      state.clientQueuePositions = Array.isArray(queue?.requests) ? queue.requests : [];
-      if (payments && state.currentSession?.id === sessionId) state.currentSession.session_payments = payments.payments || [];
-      renderClientQueue(); renderAccount();
-    } finally { clientPosReadBusy = false; }
+      if (state.currentTable?.id !== table.id || (state.currentSession?.id || "") !== sessionId) return false;
+      if (Array.isArray(queue?.requests)) { state.clientQueuePositions = queue.requests; renderClientQueue(); }
+      if (!Array.isArray(payments?.payments)) return false;
+      const changed = JSON.stringify(state.currentSession.session_payments) !== JSON.stringify(payments.payments);
+      state.currentSession.session_payments = payments.payments;
+      if (changed) { renderAccount(); renderBillChat(); }
+      return changed;
+    })().finally(() => { if (clientPosReadPending === read) clientPosReadPending = null; });
+    clientPosReadPending = read;
+    return read;
   };
   const renderClientQueue = () => {
     const box = $("#clientQueueStatus"); if (!box) return;

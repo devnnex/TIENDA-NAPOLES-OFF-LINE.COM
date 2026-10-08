@@ -1,7 +1,22 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.9.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.10.exe` con Inno Setup 6.
+
+La versión 1.0.10 corrige la lectura de cuentas cuando una operación antigua
+identificada ya no tiene copia en el caché. Conserva las escrituras pendientes
+y actualiza las otras cuentas y solicitudes desde el servidor. Recupera los
+metadatos incompletos de operaciones anteriores sin cambiar su UUID ni su cuerpo.
+Los cambios tardíos de nombre o responsable sobre cuentas cerradas se concilian
+con sesión validada y estado remoto comprobado, sin volver a cobrar ni reabrirlas.
+Los conflictos de importes conservan su protección y registro.
+
+En ambos proyectos, «Tu cuenta» del QR muestra el abono con fecha y hora y el
+saldo pendiente, incluso si no cambiaron los consumos. Las respuestas fallidas
+no borran abonos cargados y las respuestas tardías de otra mesa no se mezclan.
+Mantiene la actualización al iniciar sesión y los intervalos de la versión 1.0.8.
+Si la migración de abonos de 1.0.9 ya terminó correctamente, esta actualización
+no requiere ejecutar otro SQL.
 
 La versión 1.0.9 añade abonos con registro de fecha y hora, turnos QR y apertura
 remota de una sola caja conectada. Comparte estas funciones con BCA, junto con

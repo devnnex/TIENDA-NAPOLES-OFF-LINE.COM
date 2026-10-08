@@ -32,4 +32,8 @@ assert.ok(merged.requests.some(row => row.id === 'request-b'));
 assert.equal(pendingAdminReadScope(null, { blockingRecords: [record('session_items', ['item-a'], ['a'])] }).safe, false);
 assert.equal(pendingAdminReadScope(cached, { blockingRecords: [record('session_items', ['unknown-item'])] }).safe, false);
 assert.equal(pendingAdminReadScope(cached, { blockingRecords: null }).safe, false);
+scope = pendingAdminReadScope(cached, { blockingRecords: [record('rpc:record_session_payment', ['payment-a'], ['a'])] });
+assert.equal(scope.safe,true);assert.equal(mergePendingAdminRows(remote,cached,scope).sessions.find(row=>row.id==='a').session_items[0].quantity,2);
+scope = pendingAdminReadScope(cached, { blockingRecords: [record('rpc:replay_table_session_change', ['a'], ['a'],'closed')] });
+assert.equal(scope.safe,true);assert.equal(mergePendingAdminRows(remote,cached,scope).sessions.some(row=>row.id==='a'),false);
 console.log('Lectura por cuenta: conserva pendientes, refresca otras cuentas, protege cierres y solicitudes; sin evidencia mantiene proteccion.');

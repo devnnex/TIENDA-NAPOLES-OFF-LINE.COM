@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v20";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v21";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -26,7 +26,7 @@ const UUID_REST_TABLES = new Set([
 const QUEUEABLE_RPC_NAMES = new Set([
   "acknowledge_service_requests", "resolve_bill", "create_service_request",
   "create_service_requests_batch", "send_chat_message", "close_chat_session",
-  "save_table_zones"
+  "save_table_zones", "record_session_payment", "replay_table_session_change"
 ]);
 const RECONCILIATION_RPC_NAMES = new Set([
   "get_bootstrap_data", "get_admin_snapshot", "get_client_snapshot",
@@ -34,7 +34,7 @@ const RECONCILIATION_RPC_NAMES = new Set([
 ]);
 const RPC_READ_ENTITIES = {
   get_bootstrap_data: ["business_settings", "restaurant_tables", "menu_categories", "menu_items"],
-  get_admin_snapshot: ["restaurant_tables", "table_sessions", "session_items", "service_requests"],
+  get_admin_snapshot: ["restaurant_tables", "table_sessions", "session_items", "service_requests", "rpc:record_session_payment", "rpc:replay_table_session_change"],
   get_client_snapshot: ["restaurant_tables", "table_sessions", "session_items", "service_requests", "menu_items"],
   get_client_table_state: ["restaurant_tables", "table_sessions", "session_items", "service_requests", "menu_items"],
   list_chat_messages: ["chat_sessions", "chat_messages"]
@@ -136,7 +136,7 @@ const syncStatusSnapshot = async () => {
     const sessionIds = [...new Set(payloads.flatMap((payload) => [payload?.session_id, payload?.p_session_id])
       .filter(Boolean).map(String))];
     return { entity: entry.entity || "", status: entry.status, recordIds: [...recordIds], sessionIds,
-      sessionStatus: entry.entity === "table_sessions" ? entry.payload?.status || "" : "" };
+      sessionStatus: entry.entity === "table_sessions" ? entry.payload?.status || "" : entry.entity === "rpc:replay_table_session_change" ? entry.payload?.p_patch?.status || "" : "" };
   });
   return {
     counts,
@@ -273,6 +273,8 @@ const extractRecordId = (url, payload) => {
   const raw = url.searchParams.get("id") || "";
   if (raw.startsWith("eq.")) return raw.slice(3);
   if (!Array.isArray(payload) && payload?.id) return String(payload.id);
+  if (!Array.isArray(payload) && payload?.payment_id) return String(payload.payment_id);
+  if (!Array.isArray(payload) && payload?.p_session_id && url.pathname.endsWith("/replay_table_session_change")) return String(payload.p_session_id);
   return "";
 };
 
@@ -371,6 +373,11 @@ const localRow = (entry, row = {}) => {
 const queuedRpcPayload = (entry) => {
   const payload = entry.payload || {};
   const rpcName = String(entry.entity || "").replace(/^rpc:/, "");
+  if (rpcName === "record_session_payment") return { payment: localRow(entry, {
+    id: payload.payment_id, session_id: payload.p_session_id, amount: payload.p_amount,
+    payment_method: payload.p_method, reference: payload.p_reference || "", created_at: payload.p_created_at
+  }), duplicate: false };
+  if (rpcName === "replay_table_session_change") return { session: localRow(entry, { id: payload.p_session_id, ...payload.p_patch }) };
   if (rpcName === "create_service_requests_batch") {
     return {
       results: (payload.requests || []).map((request) => ({
@@ -499,7 +506,7 @@ const remapQueuedSessionReferences = async (previousId, nextId, currentEntryId) 
     ["id", "session_id"].forEach((key) => {
       if (url.searchParams.get(key) === `eq.${previousId}`) url.searchParams.set(key, `eq.${nextId}`);
     });
-    const remapsOwnId = entry.entity === "table_sessions" && String(entry.recordId || "") === previousId;
+    const remapsOwnId = ["table_sessions", "rpc:replay_table_session_change"].includes(entry.entity) && String(entry.recordId || "") === previousId;
     const recordIds = remapsOwnId
       ? (entry.recordIds || []).map((id) => String(id) === previousId ? nextId : id)
       : entry.recordIds;
@@ -815,7 +822,43 @@ const isReconcilableTableSessionPatch = (entry) => {
   if (entry.payload.status === "closed") return true;
   const fields = Object.keys(entry.payload);
   return fields.length > 0 && fields.every((field) => ["payer_name", "assigned_waiter_id",
-    "table_id", "sale_channel", "updated_by_user_id", "updated_at"].includes(field));
+    "table_id", "sale_channel", "updated_by_user_id", "updated_at", "notes", "payment_method"].includes(field));
+};
+
+const readSessionForSync = async (entry, headers, token) => {
+  const url = new URL("/rest/v1/rpc/get_table_session_for_sync", entry.url);
+  try {
+    const response = await fetchWithTimeout(new Request(url.href, {
+      method: "POST", headers, body: JSON.stringify({ auth_token: token, p_session_id: entry.recordId })
+    }), REMOTE_WRITE_TIMEOUT_MS);
+    if (!response.ok) return null;
+    const result = await response.json();
+    return typeof result?.exists === "boolean" ? result : null;
+  } catch (_) { return null; }
+};
+
+// Recupera un rechazo REST de cero filas mediante la operación autorizada
+// del servidor, respetando el UUID, el cuerpo y el filtro de estado original.
+const replayRejectedSessionPatch = async (entry) => {
+  if (!isReconcilableTableSessionPatch(entry)) return false;
+  const url = new URL(entry.url);
+  if ([...url.searchParams.keys()].some((key) => !["id", "status", "select"].includes(key))) return false;
+  const status = url.searchParams.get("status") || "";
+  if (status && !status.startsWith("eq.")) return false;
+  const staff = await staffForEntry(entry);
+  if (!staff) return false;
+  const response = await fetchWithTimeout(new Request(new URL("/rest/v1/rpc/replay_table_session_change", url).href, {
+    method: "POST", headers: staff.headers,
+    body: JSON.stringify({ auth_token: new Headers(entry.headers).get("x-app-token"), p_session_id: entry.recordId,
+      p_patch: entry.payload, p_expected_status: status.slice(3), p_expected_paid: null })
+  }), REMOTE_WRITE_TIMEOUT_MS);
+  if (!response.ok) return false;
+  const row = (await response.json())?.session;
+  return Boolean(row?.id === entry.recordId && Object.entries(entry.payload).every(([key, value]) => {
+    if (["updated_at", "closed_at"].includes(key)) return new Date(row[key]).getTime() === new Date(value).getTime() || key === "updated_at";
+    if (["subtotal", "discount", "tax", "service_fee", "total"].includes(key)) return Number(row[key]) === Number(value);
+    return row[key] === value;
+  }));
 };
 
 // Apps Script retira las cuentas cobradas de Supabase. Un cambio de nombre/
@@ -846,9 +889,11 @@ const verifySettledTableSessionPatch = async (entry) => {
       method: "GET", headers: readHeaders
     }), REMOTE_WRITE_TIMEOUT_MS);
     if (!response.ok) return false;
-    const rows = await response.json();
+    const authority = await readSessionForSync(entry, headers, token);
+    const rows = authority ? (authority.session ? [authority.session] : []) : await response.json();
     const matches = Array.isArray(rows) ? rows : (rows ? [rows] : []);
     if (matches.length === 0) {
+      if (!authority) return false;
       // Una cuenta creada sin conexion puede no existir todavia en Supabase.
       // En ese caso, el cambio no equivale a una cuenta ya retirada.
       const unsettledCreate = (await listEntries()).some((candidate) => candidate.entity === "table_sessions"
@@ -888,7 +933,9 @@ const reconcileTableSessionConflicts = async (authToken, force = false) => {
       // no esperar eternamente a que alguien mas la cierre. Nunca se quitan
       // los filtros ni se aplican importes sobre una cuenta ya cerrada.
       const staff = await staffForEntry(entry).catch(() => null);
-      const rows = staff ? await readStaffRows(entry, staff.headers, "table_sessions", [entry.recordId]).catch(() => null) : null;
+      const authority = staff ? await readSessionForSync(entry, staff.headers, previousToken) : null;
+      const rows = authority ? (authority.session ? [authority.session] : [])
+        : staff ? await readStaffRows(entry, staff.headers, "table_sessions", [entry.recordId]).catch(() => null) : null;
       const replay = rows?.length === 1 && rows[0].id === entry.recordId && rows[0].status === "open";
       if ((await listEntries()).find((saved) => saved.id === entry.id)?.status !== "conflict") continue;
       await putEntry({ ...entry, ...(replay ? { status: "pending", nextAttemptAt: 0 } : {}), nextReconcileAt: now + 30_000 });
@@ -920,7 +967,7 @@ const writeReferences = (stored) => {
   if (entry.entity === "menu_items") ids.forEach((id) => refs.add(`product:${id}`));
   if (entry.entity === "menu_categories") ids.forEach((id) => refs.add(`category:${id}`));
   if (entry.entity === "restaurant_tables") ids.forEach((id) => refs.add(`table:${id}`));
-  const financial = ["table_sessions", "session_items", "service_requests"].includes(entry.entity);
+  const financial = ["table_sessions", "session_items", "service_requests", "rpc:record_session_payment", "rpc:replay_table_session_change"].includes(entry.entity);
   return { entity: entry.entity, ids, refs, financial,
     unknownSession: financial && ![...refs].some((ref) => ref.startsWith("session:")) };
 };
@@ -981,6 +1028,10 @@ const flushQueue = (force = false) => {
         if (!confirmed && response.status === 406) {
           reconciledSessionPatch = await verifySettledTableSessionPatch(entry);
           confirmed = reconciledSessionPatch;
+          if (!confirmed && entry.entity === "table_sessions") {
+            confirmed = await replayRejectedSessionPatch(entry);
+            if (confirmed) reconciledAs = "session_change_replayed_with_authorization";
+          }
           if (!confirmed) {
             reconciledAs = await recoverMissingSessionItem(entry, response);
             confirmed = Boolean(reconciledAs);

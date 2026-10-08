@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Iniciador de Tienda Napoles Offline sin consola")]
 [assembly: AssemblyCompany("Tienda Napoles")]
 [assembly: AssemblyProduct("Tienda Napoles Offline")]
-[assembly: AssemblyVersion("1.0.8.0")]
-[assembly: AssemblyFileVersion("1.0.8.0")]
+[assembly: AssemblyVersion("1.0.9.0")]
+[assembly: AssemblyFileVersion("1.0.9.0")]
 
 internal static class TiendaNapolesOffline
 {
@@ -147,7 +147,8 @@ internal static class TiendaNapolesOffline
             request.Proxy = null;
             request.Timeout = 1000;
             using (var response = (HttpWebResponse)request.GetResponse())
-                return response.StatusCode == HttpStatusCode.OK;
+            using (var reader = new StreamReader(response.GetResponseStream()))
+                return response.StatusCode == HttpStatusCode.OK && reader.ReadToEnd().Trim() == "OK_DRAWER_V2";
         }
         catch (WebException) { return false; }
     }

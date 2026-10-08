@@ -457,6 +457,7 @@
             <h2>Cuentas abiertas</h2>
           </div>
         </div>
+        <label class="accounts-search">Buscar mesa<span><i data-lucide="search"></i><input id="accountsSearch" type="search" placeholder="Mesa 8 o 8" autocomplete="off"></span></label>
         <div class="accounts-panel" id="accountsPanel"></div>
       </section>
 
@@ -610,6 +611,7 @@
         </div>
         <div class="table-session-actions" id="tableSessionActions" hidden>
           <button class="ghost" id="viewTableConsumption" type="button"><i data-lucide="receipt-text"></i> Ver consumo</button>
+          <button class="ghost abono-button" id="abonoTableAccount" type="button"><i data-lucide="hand-coins"></i> Abonar</button>
           <button class="primary" id="chargeTableAccount" type="button"><i data-lucide="badge-dollar-sign"></i> Cobrar cuenta</button>
           <button class="ghost danger-text" id="releaseEmptyTable" type="button" hidden><i data-lucide="door-open"></i> Liberar mesa</button>
         </div>
@@ -677,6 +679,15 @@
       </form>
     </dialog>
 
+    <dialog class="modal" id="abonoDialog"><form class="modal-card" id="abonoForm">
+      <input name="session_id" type="hidden"><div class="section-head"><div><span class="eyebrow">Pago parcial</span><h2 id="abonoTitle">Abonar</h2><p id="abonoBalance"></p></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+      <label>Valor del abono<input name="amount" type="text" inputmode="numeric" data-currency-input autocomplete="off" required></label>
+      <label>Medio de pago<select name="payment_method"><option value="cash">Efectivo</option><option value="transfer">Transferencia</option><option value="breb">Bre-B</option></select></label>
+      <label>Referencia (opcional)<input name="reference" type="text" maxlength="100"></label>
+      <p>El abono reduce el saldo y deja fecha y hora en el desglose. La cuenta continúa abierta.</p>
+      <div class="modal-actions"><button class="ghost" type="button" data-close-dialog>Cancelar</button><button class="primary" type="submit">Confirmar abono</button></div>
+    </form></dialog>
+
     <dialog class="modal payment-modal" id="paymentDialog">
       <form class="modal-card payment-card" id="paymentForm">
         <input type="hidden" name="session_id">
@@ -688,6 +699,7 @@
           <button class="icon-btn" type="button" data-cancel-payment aria-label="Cerrar"><i data-lucide="x"></i></button>
         </div>
 
+        <p id="paymentAbonoSummary" class="account-abono-summary"></p>
         <div class="payment-summary">
           <span id="paymentTableLabel">Mesa</span>
           <strong id="paymentTotal">$0</strong>

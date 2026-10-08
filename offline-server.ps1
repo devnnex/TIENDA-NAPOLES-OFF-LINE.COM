@@ -44,6 +44,22 @@ function Send-Json($response, [int]$statusCode, $value) {
 
 $drawerBridgeLoaded = $false
 $loginVaultLoaded = $false
+$drawerStatePath = Join-Path $env:LOCALAPPDATA "TiendaNapolesOffline\drawer-controller.json"
+function Get-DrawerState {
+  if (Test-Path -LiteralPath $drawerStatePath) {
+    try { return Get-Content -LiteralPath $drawerStatePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+  }
+  $state = @{ deviceId = [guid]::NewGuid().ToString(); secret = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")); settings = $null }
+  Save-DrawerState $state
+  return $state
+}
+function Save-DrawerState($state) {
+  $directory = Split-Path -Parent $drawerStatePath
+  [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+  $temporary = $drawerStatePath + ".tmp"
+  [System.IO.File]::WriteAllText($temporary, ($state | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+  Move-Item -LiteralPath $temporary -Destination $drawerStatePath -Force
+}
 
 try {
   $listener.Start()
@@ -67,7 +83,7 @@ try {
       }
 
       if ($request.Url.AbsolutePath -eq "/__tienda_napoles_drawer_health") {
-        Send-Text $response 200 "OK"
+        Send-Text $response 200 "OK_DRAWER_V2"
         continue
       }
 
@@ -122,13 +138,25 @@ try {
       }
 
       if ($request.Url.AbsolutePath -eq "/__tienda_napoles_drawer") {
+        $bcaOrigin = $request.Headers["Origin"] -eq "https://devnnex.github.io"
+        if ($bcaOrigin -and [System.Net.IPAddress]::IsLoopback($request.RemoteEndPoint.Address)) {
+          $response.Headers["Access-Control-Allow-Origin"] = "https://devnnex.github.io"
+          $response.Headers["Vary"] = "Origin"
+          if ($request.HttpMethod -eq "OPTIONS") {
+            $response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            $response.Headers["Access-Control-Allow-Headers"] = "Content-Type, X-Tienda-Napoles-Drawer"
+            $response.Headers["Access-Control-Allow-Private-Network"] = "true"
+            $response.StatusCode = 204
+            continue
+          }
+        }
         $sameOrigin = $request.Headers["Origin"] -eq "http://127.0.0.1:$Port" -or
           ($request.HttpMethod -eq "GET" -and (
             $request.Headers["Sec-Fetch-Site"] -eq "same-origin" -or
             ($request.UrlReferrer -and $request.UrlReferrer.GetLeftPart([System.UriPartial]::Authority) -eq "http://127.0.0.1:$Port")
           ))
         $fromApp = $request.Headers["X-Tienda-Napoles-Drawer"] -eq "1"
-        if (-not $sameOrigin -or -not $fromApp -or -not [System.Net.IPAddress]::IsLoopback($request.RemoteEndPoint.Address)) {
+        if ((-not $sameOrigin -and -not $bcaOrigin) -or -not $fromApp -or -not [System.Net.IPAddress]::IsLoopback($request.RemoteEndPoint.Address)) {
           Send-Json $response 403 @{ error = "Solicitud local no autorizada." }
           continue
         }
@@ -142,7 +170,8 @@ try {
             $drawerBridgeLoaded = $true
           }
           if ($request.HttpMethod -eq "GET") {
-            Send-Json $response 200 @{ printers = @([CashDrawerPrinter]::InstalledPrinters()) }
+            $drawerState = Get-DrawerState
+            Send-Json $response 200 @{ printers = @([CashDrawerPrinter]::InstalledPrinters()); settings = $drawerState.settings; deviceId = $drawerState.deviceId; secret = $drawerState.secret }
           } else {
             if ($request.ContentLength64 -lt 1 -or $request.ContentLength64 -gt 1024) {
               Send-Json $response 400 @{ error = "Configuracion de impresora no valida." }
@@ -157,6 +186,9 @@ try {
               continue
             }
             [CashDrawerPrinter]::Open($name, $pin)
+            $drawerState = Get-DrawerState
+            $drawerState.settings = @{ printer = $name; pin = $pin }
+            Save-DrawerState $drawerState
             Send-Json $response 200 @{ accepted = $true; printer = $name }
           }
         } catch {

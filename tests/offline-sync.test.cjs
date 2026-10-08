@@ -582,6 +582,7 @@ test("29 confirma cierre 406 si la venta ya archivo la cuenta remota", async () 
   let patches = 0;
   remoteFetch = async (input) => {
     const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_table_session_for_sync")) return Response.json({exists:false,session:null});
     if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
     if (input.method === "GET" && url.pathname.endsWith("/table_sessions")) return new Response("[]", { status: 200 });
     if (input.method === "PATCH") patches += 1;
@@ -625,6 +626,7 @@ test("32 reconcilia el 406 de un cierre que aun estaba pendiente", async () => {
   let patches = 0;
   remoteFetch = async (input) => {
     const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_table_session_for_sync")) return Response.json({exists:false,session:null});
     if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
     if (input.method === "GET") return new Response("[]", { status: 200 });
     if (input.method === "PATCH") patches += 1;
@@ -701,6 +703,7 @@ test("37 reintenta el cierre 406 una vez con la credencial vigente", async () =>
   let patches = 0;
   remoteFetch = async (input) => {
     const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_table_session_for_sync")) return Response.json({exists:false,session:null});
     assert.equal(input.headers.get("x-app-token"), "valid-token");
     if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
     if (input.method === "GET") return new Response("[]", { status: 200 });
@@ -764,6 +767,7 @@ test("40 concilia el 406 de nombre y responsable de una cuenta retirada", async 
   let patches = 0;
   remoteFetch = async (input) => {
     const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_table_session_for_sync")) return Response.json({exists:false,session:null});
     if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
     if (input.method === "GET") return new Response("[]", { status: 200 });
     if (input.method === "PATCH") patches += 1;
@@ -781,6 +785,7 @@ test("41 renueva la credencial del 406 de nombre antes de conciliar", async () =
   let patches = 0;
   remoteFetch = async (input) => {
     const url = new URL(input.url);
+    if (url.pathname.endsWith("/rpc/get_table_session_for_sync")) return Response.json({exists:false,session:null});
     assert.equal(input.headers.get("x-app-token"), "valid-token");
     if (url.pathname.endsWith("/rpc/get_current_user")) return new Response(JSON.stringify({ id: "boss-1" }), { status: 200 });
     if (input.method === "GET") return new Response("[]", { status: 200 });
@@ -1389,6 +1394,49 @@ test("74 la lectura por cuenta exige opt-in del cliente que preserva sus cambios
 test("75 conserva los UUID de actualizaciones por lote y evita dependencias perdidas", async () => {
   const entry = await api.serializeRequest(request("table_sessions", "PATCH", { payer_name: "Cliente" }, "?id=in.(session-1,session-2)"));
   assert.deepEqual(Array.from(entry.recordIds), ["session-1", "session-2"]);
+});
+
+test("76 abono offline conserva el UUID y su hora y no encola aperturas remotas", async () => {
+  const payload={auth_token:"valid-token",payment_id:"payment-1",p_session_id:"session-1",p_amount:5000,p_method:"cash",p_reference:"Parcial",p_created_at:"2026-10-07T18:00:00Z"};
+  const entry=await api.serializeRequest(request("rpc/record_session_payment","POST",payload));
+  assert.equal(entry.recordId,"payment-1");
+  const payment=(await api.queuedResponse(entry).json()).payment;
+  assert.equal(payment.id,payload.payment_id);assert.equal(payment.amount,5000);assert.equal(payment.created_at,payload.p_created_at);
+  assert.equal(payment._offline_pending,true);
+  assert.equal(api.isQueueableRpc(request("rpc/request_pos_drawer","POST",{}),new URL(endpoint("rpc/request_pos_drawer"))),false);
+});
+test("77 un abono rechazado bloquea solo el cierre de su cuenta", async () => {
+  const payload={auth_token:"valid-token",payment_id:"payment-1",p_session_id:"session-1",p_amount:5000,p_method:"cash"};
+  await api.putEntry({...await api.serializeRequest(request("rpc/record_session_payment","POST",payload)),createdOrder:1,status:"failed",lastError:"400 Saldo modificado"});
+  await api.putEntry({...await api.serializeRequest(request("rpc/replay_table_session_change","POST",{auth_token:"valid-token",p_session_id:"session-1",p_patch:{status:"closed"}})),createdOrder:2});
+  await api.putEntry({...await api.serializeRequest(request("rpc/replay_table_session_change","POST",{auth_token:"valid-token",p_session_id:"session-2",p_patch:{status:"closed"}})),createdOrder:3});
+  const sent=[];remoteFetch=async(input)=>{sent.push(JSON.parse(await input.text()).p_session_id);return Response.json({session:{id:"session-2",status:"closed"}})};
+  await api.flushQueue(true);assert.deepEqual(sent,["session-2"]);
+  assert.equal((await api.syncStatusSnapshot()).blockingRecords.find(row=>row.entity==="rpc:replay_table_session_change").sessionStatus,"closed");
+});
+test("78 no descarta una cuenta por cero filas REST sin lectura autorizada del servidor", async () => {
+  await api.putEntry(metadataSessionEntry());
+  remoteFetch=async(input)=>{
+    const url=new URL(input.url);
+    if(url.pathname.endsWith("/get_current_user"))return Response.json({id:"staff-1"});
+    if(url.pathname.includes("/rpc/"))return Response.json({message:"Funcion no disponible"},{status:404});
+    return input.method==="GET"?Response.json([]):Response.json({code:"PGRST116",details:"The result contains 0 rows"},{status:406});
+  };
+  await flushAsAuthenticatedApp("valid-token");assert.equal((await api.listEntries())[0].status,"conflict");
+});
+test("79 recupera el 406 de la foto cuando REST no ve la cuenta abierta", async () => {
+  const entry=metadataSessionEntry();await api.putEntry({...entry,status:"pending"});
+  let replayed=null;
+  remoteFetch=async(input)=>{
+    const url=new URL(input.url);
+    if(url.pathname.endsWith("/get_current_user"))return Response.json({id:"staff-1"});
+    if(url.pathname.endsWith("/get_table_session_for_sync"))return Response.json({exists:true,session:{id:"session-1",status:"open"}});
+    if(url.pathname.endsWith("/replay_table_session_change")){replayed=JSON.parse(await input.text());return Response.json({session:{id:"session-1",status:"open",...replayed.p_patch}})}
+    return input.method==="GET"?Response.json([]):Response.json({code:"PGRST116",details:"The result contains 0 rows"},{status:406});
+  };
+  await api.flushQueue(true);const saved=(await api.listEntries())[0];
+  assert.equal(saved.status,"confirmed");assert.equal(saved.operationId,entry.operationId);assert.deepEqual(replayed.p_patch,entry.payload);
+  assert.equal(replayed.p_session_id,entry.recordId);assert.equal(saved.reconciledAs,"session_change_replayed_with_authorization");
 });
 
 (async () => {

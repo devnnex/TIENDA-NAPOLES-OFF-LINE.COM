@@ -5228,3 +5228,20 @@ body[data-page="admin"] { overflow-x: hidden; }
       "walk-in";
   }
 }
+
+/* Búsqueda y lectura de cuentas por número. */
+.accounts-search { display: grid; gap: .45rem; max-width: 28rem; margin-bottom: 1rem; font-weight: 700; }
+.accounts-search > span { display: flex; align-items: center; gap: .6rem; }
+.accounts-search input { flex: 1; min-width: 0; }
+.account-summary-head > div > span { font-size: 1.45rem; font-weight: 900; }
+.accounts-drawer-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+
+/* Abonos y turnos compartidos. */
+.account-abono-line { display:flex; justify-content:space-between; gap:.8rem; margin:.55rem 0; padding:.85rem; background:#f2eaff; color:#5b2194; border:1px solid #d9c0f1; border-radius:12px; }
+.account-abono-line > div { display:grid; gap:.3rem; }
+.account-abono-line small { color:#65348e; }
+.account-abono-summary { color:#5b2194; font-weight:800; }
+.abono-button { color:#5b2194; border-color:#cfadeb; }
+.client-queue-status { display:grid; gap:.65rem; margin:1rem 0; padding:1rem; background:#eef4ff; border:1px solid #b6cef4; border-radius:16px; }
+.client-queue-status[hidden] { display:none; }
+.client-queue-status > div { display:grid; gap:.3rem; }

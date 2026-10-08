@@ -1,7 +1,23 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.8.exe` con Inno Setup 6. Esta versión
+`dist/Tienda-Napoles-Offline-Setup-1.0.9.exe` con Inno Setup 6.
+
+La versión 1.0.9 añade abonos con registro de fecha y hora, turnos QR y apertura
+remota de una sola caja conectada. Comparte estas funciones con BCA, junto con
+el cobro mediante Enter sin imprimir, búsqueda y orden de cuentas y facturas
+en negro y negrita con el pie de Devnex. El atajo de dos ceros del teclado
+numérico abre la caja si no hay modales ni campos de escritura activos.
+La recuperación del último conflicto de cuentas `406/PGRST116` usa una lectura
+autorizada y reenvía el cambio original; no interpreta una respuesta REST vacía
+como prueba de que se borró la cuenta.
+
+Antes de activar estas funciones, ejecutar una vez en el backend compartido
+`supabase/migrations/20261007190000_abonos_turnos_caja.sql` y volver a iniciar
+sesión con internet. Consultar `supabase/ACTIVAR-ABONOS-TURNOS-CAJA.md`.
+El instalador no ejecuta SQL ni limpia los datos pendientes del navegador.
+
+Conserva las correcciones de 1.0.8: esta versión
 recupera `save_table_zones` rechazado con `21000` usando solamente cambios
 de `is_outdoor` filtrados por UUID y comprobados en el servidor. Conserva
 los puntos de servicio y exige el rol y acceso a Marca ya previstos por la app.

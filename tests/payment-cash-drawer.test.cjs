@@ -13,13 +13,13 @@ const section = (start, end) => {
 };
 
 const setup = ({ method = 'cash', validPayment = true, validStock = true, savedLocally = true,
-  received = 100, duplicate = false, drawerAccepted = true } = {}) => {
+  received = 100, duplicate = false, drawerAccepted = true, beforeDurableSave = null } = {}) => {
   const calls = [];
   const session = { id: 'session-1', table_id: 'table-1', session_items: [
     { id: 'line-1', menu_item_id: 'product-1', item_name: 'Producto', quantity: 1, unit_price: 100, status: 'served' }
   ] };
   const state = { paymentProcessing: false, sessions: [session], invoiceHistory: duplicate ? [{ sessionId: session.id }] : [],
-    activePaymentTotal: 100, inventoryMeta: {}, localSupabaseWrites: 0, currentUser: { id: 'staff-1' } };
+    authToken: 'valid-token', activePaymentTotal: 100, inventoryMeta: {}, localSupabaseWrites: 0, currentUser: { id: 'staff-1' } };
   const buttons = [{ value: 'save', disabled: false }, { value: 'print', disabled: false }];
   const form = { session_id: { value: session.id }, cash_received: { value: received, focus() {} },
     payment_reference: { value: '' }, querySelector: () => buttons[0] };
@@ -43,14 +43,14 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
       } }
     },
     toast: () => {}, tipsEnabled: () => false,
-    paymentFromForm: () => validPayment ? { method, payments: [{ method, amount: 100 }] } : null,
+    paymentFromForm: () => validPayment ? { method, payments: [{ method, amount: state.activePaymentTotal }] } : null,
     currencyInputNumber: (input) => Number(input?.value || 0), integerMoney: (value) => Number(value),
     paidInventoryPlan: () => [], validatePaidInventory: () => validStock,
     sessionTotals: () => ({ subtotal: 100, total: 100 }), uid: () => 'invoice-1',
     sessionReference: () => 'M1', sessionLabel: () => 'Mesa 1',
     applyPaidInventoryLocally: () => {},
     applyInvoiceToInventory: (invoice) => { state.invoiceHistory.push(invoice); calls.push('invoice'); },
-    flushDurableWrites: async () => { calls.push('storage'); return savedLocally; },
+    flushDurableWrites: async () => { calls.push('storage'); beforeDurableSave?.(state); return savedLocally; },
     closeSession: () => { calls.push('remote-close'); return closePromise; },
     rollbackLocalPayment: () => { calls.push('rollback'); },
     renderInventory: () => {}, renderInventoryMovements: () => {}, renderIncomeReport: () => {}, renderTips: () => {},
@@ -63,7 +63,8 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
     paymentMethodLabel: () => method,
     flushAppsScriptOutbox: () => {}
   });
-  vm.runInContext(section('  const openCashDrawer =', '  const getAppsScriptUrl =')
+  vm.runInContext(section("  const sessionPayments =", "  const abonoRowsHtml ="), context);
+  vm.runInContext(section('  const openLocalCashDrawer =', '  const getAppsScriptUrl =')
     + section('  const bindPaymentConfirmShortcut =', '  const renderConsumptionSelection =')
     + ';globalThis.api = {processPayment, bindPaymentConfirmShortcut};', context);
   return { context, state, form, buttons, dialog, listeners, calls, finishClose };
@@ -118,6 +119,33 @@ test('un rechazo del controlador no duplica el cobro ni impide generar su recibo
   assert.equal(app.state.invoiceHistory.length, 1);
   assert.equal(app.calls.filter((call) => call === 'drawer').length, 1);
   assert.equal(app.calls.filter((call) => call === 'print').length, 1);
+});
+
+test('el cierre cobra solo el saldo y conserva el abono en la factura sin duplicar ingresos', async () => {
+  const app = setup();
+  app.state.sessions[0].session_payments = [{ id: 'abono-1', amount: 40, payment_method: 'cash', created_at: '2026-10-07T18:00:00Z' }];
+  app.state.activePaymentTotal = 60;
+  const saving = app.context.api.processPayment(app.form, { value: 'print' });
+  app.finishClose({});
+  await saving;
+  const invoice = app.state.invoiceHistory[0];
+  assert.equal(invoice.remainingPaid, 60);
+  assert.equal(invoice.payments[0].amount, 100);
+  assert.equal(invoice.prepayments.length, 1);
+  assert.equal(invoice.changeDue, 40);
+  assert.equal(app.calls.filter(call => call === 'drawer').length, 1);
+});
+
+test('un abono que llega mientras se guarda obliga a revisar y no imprime un saldo atrasado', async () => {
+  const app = setup({ beforeDurableSave: state => {
+    state.sessions[0].session_payments = [{ id: 'abono-nuevo', amount: 40, payment_method: 'transfer' }];
+  } });
+  await app.context.api.processPayment(app.form, { value: 'print' });
+  assert.equal(app.calls.includes('rollback'), true);
+  assert.equal(app.calls.includes('remote-close'), false);
+  assert.equal(app.calls.includes('drawer'), false);
+  assert.equal(app.calls.includes('print'), false);
+  assert.equal(app.state.localSupabaseWrites, 0);
 });
 
 test('Enter principal y numerico eligen sin imprimir incluso con foco en Imprimir', () => {

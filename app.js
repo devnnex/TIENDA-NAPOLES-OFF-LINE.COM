@@ -454,6 +454,8 @@ const App = (() => {
     productPickerMatches: [],
     consumptionDrafts: [],
     activePaymentTotal: 0,
+    posFeatures: {},
+    clientQueuePositions: [],
     activePaymentBase: 0,
     activePaymentTip: 0,
     tipSettings: { enabled: false, percentage: 10 },
@@ -1160,6 +1162,7 @@ const App = (() => {
   };
 
   const loadClientSnapshot = async () => {
+    void refreshClientPosData();
     if (!state.currentSession) return;
     const snapshot = await dbQuiet(
       state.sb.rpc("getClientSnapshot", {
@@ -1216,6 +1219,7 @@ const App = (() => {
   const persistOfflineAdminSnapshot = () => {
     void persistDurableJson(OFFLINE_ADMIN_SNAPSHOT_KEY, {
       sessions: state.sessions,
+      posFeatures: state.posFeatures,
       requests: state.requests,
       removedSessions: Array.from(state.optimisticSessionStates.entries())
         .filter(([, overlay]) => overlay.mode === "remove" && Date.now() < Number(overlay.retainUntil || 0))
@@ -1357,7 +1361,7 @@ const App = (() => {
       .some((status) => Number(counts[status] || 0) > 0);
     if (!hasBlockingStatus) return false;
     const entities = job.action === "record_sale"
-      ? ["table_sessions", "session_items", "service_requests", "menu_items"]
+      ? ["table_sessions", "session_items", "service_requests", "menu_items", "rpc:record_session_payment", "rpc:replay_table_session_change"]
       : ["menu_items", "menu_categories"];
     if (!Array.isArray(counts.blockingRecords)) {
       return entities.some((entity) => (counts.blockingEntities || []).includes(entity))
@@ -1369,7 +1373,7 @@ const App = (() => {
     return counts.blockingRecords.some((record) => {
       if (!entities.includes(record.entity)) return false;
       if (job.action !== "record_sale") return true;
-      if (["table_sessions", "session_items", "service_requests"].includes(record.entity)) {
+      if (["table_sessions", "session_items", "service_requests", "rpc:record_session_payment", "rpc:replay_table_session_change"].includes(record.entity)) {
         const ids = record.entity === "table_sessions" ? record.recordIds : record.sessionIds;
         return !sessionId || !Array.isArray(ids) || !ids.length || ids.map(String).includes(sessionId);
       }
@@ -1696,8 +1700,9 @@ const App = (() => {
       ? `
         <div class="account-head">
           <span>${icon("receipt", 18)} Cuenta actual</span>
-          <strong>${money(subtotal)}</strong>
+          <strong>${money(Math.max(0,subtotal-sessionPaid(state.currentSession)))}</strong>
         </div>
+        ${sessionPaid(state.currentSession) ? `<div class="account-abono-summary">Consumo: ${money(subtotal)} · Abonos: −${money(sessionPaid(state.currentSession))}</div>` : ""}
         <div class="account-list">
           ${[...state.sessionItems]
             .sort((left, right) => new Date(right.created_at || right.updated_at || 0) - new Date(left.created_at || left.updated_at || 0))
@@ -1711,6 +1716,7 @@ const App = (() => {
             )
             .join("")}
         </div>
+        ${abonoRowsHtml(state.currentSession)}
       `
       : emptyState("Sin consumos", "Agrega platos o llama al mesero para ordenar.", "shopping-bag");
     refreshIcons();
@@ -2046,6 +2052,7 @@ const App = (() => {
       await hydrateSelectedTable(state.currentTable.id);
       state.localBillOpen = true;
       renderBillChat();
+      void refreshClientPosData();
     } finally {
       button?.classList.remove("is-pending");
     }
@@ -2247,6 +2254,7 @@ const App = (() => {
     const response = await fetch("/__tienda_napoles_drawer", {
       method,
       cache: "no-store",
+      signal: AbortSignal.timeout(2500),
       headers: { "X-Tienda-Napoles-Drawer": "1", ...(body ? { "Content-Type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {})
     });
@@ -2280,7 +2288,7 @@ const App = (() => {
     if (button) button.disabled = true;
     try {
       await cashDrawerRequest("POST", settings);
-      if (save) localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(settings));
+      if (save) { localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(settings)); void pollDrawerReceiver(); }
       $("#cashDrawerDialog")?.close();
       toast("Orden de apertura enviada a la impresora POS.", "ok", "cash-drawer-opened");
       return true;
@@ -2292,7 +2300,7 @@ const App = (() => {
     }
   };
 
-  const openCashDrawer = async () => {
+  const openLocalCashDrawer = async () => {
     const bridge = window.posCashDrawer;
     if (bridge && typeof bridge.open === "function") {
       try {
@@ -2314,6 +2322,110 @@ const App = (() => {
     const opened = await sendCashDrawerPulse(settings);
     if (!opened) await configureCashDrawer();
     return opened;
+  };
+
+  const canHostCashDrawer = () => !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
+  let drawerSignalChannel = null;
+  let drawerSignalReady = null;
+  let drawerSignalAuth = "";
+  const prepareDrawerSignal = () => {
+    if (!state.authToken || !state.sb?.channel) return Promise.resolve(false);
+    if (drawerSignalAuth !== state.authToken) {
+      if (drawerSignalChannel) void state.sb.removeChannel?.(drawerSignalChannel);
+      drawerSignalChannel = null; drawerSignalReady = null; drawerSignalAuth = state.authToken;
+    }
+    if (drawerSignalReady) return drawerSignalReady;
+    drawerSignalReady = new Promise((resolve) => {
+      const timer = window.setTimeout(() => resolve(false), 2000);
+      drawerSignalChannel = state.sb.channel("tienda-napoles-drawer-control", { config: { broadcast: { self: false } } })
+        .on("broadcast", { event: "wake" }, () => void pollDrawerReceiver())
+        .on("broadcast", { event: "open" }, () => void pollDrawerReceiver())
+        .subscribe((status) => {
+          if (status === "SUBSCRIBED") { window.clearTimeout(timer); resolve(true); }
+          else if (["CHANNEL_ERROR","TIMED_OUT","CLOSED"].includes(status)) { window.clearTimeout(timer); resolve(false); }
+        });
+    });
+    return drawerSignalReady;
+  };
+  let drawerReceiverBusy = false;
+  let drawerReceiverData = null;
+  let drawerOpenBusy = false;
+  const pollDrawerReceiver = async () => {
+    if (!canHostCashDrawer() || drawerReceiverBusy || !state.authToken || !state.currentUser || !navigator.onLine || !state.posFeatures?.remote_drawer) return;
+    drawerReceiverBusy = true;
+    void prepareDrawerSignal();
+    const receiverAuth = state.authToken;
+    try {
+      const local = await cashDrawerRequest("GET");
+      if (!local.settings) { try { local.settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {} }
+      if (!local.deviceId || !local.secret || !local.settings?.printer || !local.printers?.includes(local.settings.printer)) { drawerReceiverData = null; return; }
+      drawerReceiverData = local;
+      localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(local.settings));
+      const registered = await dbQuiet(state.sb.rpc("register_pos_drawer", { auth_token: state.authToken,
+        p_device_id: local.deviceId, p_secret: local.secret, p_label: local.settings.printer }), null);
+      if (!registered?.ok) return;
+      const next = await dbQuiet(state.sb.rpc("claim_pos_drawer", { auth_token: state.authToken, p_device_id: local.deviceId, p_secret: local.secret }), null);
+      if (!next?.command?.id) return;
+      if (state.authToken !== receiverAuth || !state.currentUser) return;
+      let accepted = false, error = "";
+      try { await cashDrawerRequest("POST", local.settings); accepted = true; }
+      catch (failure) { error = String(failure.message || "No se pudo enviar la orden a la impresora POS."); }
+      // A claimed command is never pulsed again, even if its acknowledgment is interrupted.
+      await retryQuiet(() => state.sb.rpc("finish_pos_drawer", { auth_token: state.authToken, p_device_id: local.deviceId,
+        p_secret: local.secret, p_command_id: next.command.id, p_accepted: accepted, p_error: error }), 3);
+      if (!accepted) toast(error, "error", "drawer-command:" + next.command.id);
+    } catch (_) { drawerReceiverData = null; }
+    finally { drawerReceiverBusy = false; }
+  };
+  const openRemoteCashDrawer = async () => {
+    const id = uid();
+    const signalReady = await prepareDrawerSignal();
+    if (signalReady) { await drawerSignalChannel.send({ type: "broadcast", event: "wake", payload: {} }); await new Promise((resolve) => setTimeout(resolve, 350)); }
+    let data = null, error = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      ({ data, error } = await state.sb.rpc("request_pos_drawer", { auth_token: state.authToken, p_command_id: id, p_device_id: drawerReceiverData?.deviceId || null }));
+      if (data?.command?.id || !signalReady || !/No hay una caja conectada/i.test(error?.message || "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 550));
+    }
+    if (error || !data?.command?.id) throw new Error(error?.message || "No hay una caja conectada.");
+    if (signalReady) await drawerSignalChannel.send({ type: "broadcast", event: "open", payload: { deviceId: data.command.device_id } });
+    toast("Orden enviada a " + (data.device || "la caja conectada") + ". Esperando confirmación…", "ok", "remote-drawer:" + id);
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      const result = await dbQuiet(state.sb.rpc("get_pos_drawer_command", { auth_token: state.authToken, p_command_id: id }), null);
+      if (result?.command?.status === "accepted") { toast("El PC de la caja confirmó la orden de apertura.", "ok", "remote-drawer:" + id); return true; }
+      if (["failed","expired"].includes(result?.command?.status)) throw new Error(result.command.error || "La caja no pudo recibir la orden. Comprueba el PC conectado.");
+    }
+    throw new Error("No se recibió confirmación de la caja. Comprueba el PC conectado antes de volver a intentarlo.");
+  };
+  const startDrawerReceiver = () => {
+    window.clearInterval(state.drawerReceiverTimer);
+    state.drawerReceiverTimer = window.setInterval(() => void pollDrawerReceiver(), 1500);
+    void prepareDrawerSignal();
+    void pollDrawerReceiver();
+  };
+
+  const openCashDrawer = async () => {
+    if (!state.currentUser || !state.authToken || drawerOpenBusy) return false;
+    drawerOpenBusy = true;
+    try {
+      if (window.posCashDrawer?.open) return await openLocalCashDrawer();
+      if (drawerReceiverData?.settings) return await sendCashDrawerPulse(drawerReceiverData.settings);
+      let local = null;
+      if (canHostCashDrawer()) { try { local = await cashDrawerRequest("GET"); } catch (_) {} }
+      if (local && !local.settings) { try { local.settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {} }
+      if (local?.settings?.printer && local.printers?.includes(local.settings.printer)) {
+        drawerReceiverData = local;
+        return await sendCashDrawerPulse(local.settings);
+      }
+      if (state.posFeatures?.remote_drawer && navigator.onLine) {
+        try { return await openRemoteCashDrawer(); }
+        catch (error) { if (!local?.printers?.length) { toast(error.message, "error", "remote-drawer-failed"); return false; } }
+      }
+      if (local?.printers?.length) { await configureCashDrawer(); return false; }
+      toast("No hay una caja conectada. Abre el offline en el PC de la caja, configura la impresora e inicia sesión.", "error", "cash-drawer-unavailable");
+      return false;
+    } finally { drawerOpenBusy = false; }
   };
 
   const getAppsScriptUrl = () => String(APPS_SCRIPT_CONFIG.webAppUrl || "").trim();
@@ -3603,11 +3715,13 @@ const App = (() => {
       assistantSay("bot", "Primero selecciona tu mesa para poder enviar la canción.");
       return;
     }
+    const queuedSongs = state.clientRequests.filter((row) => isSongRequest(row) && ["sending","pending"].includes(row.status));
+    if (queuedSongs.length >= 5) { assistantSay("bot", "Puedes pedir máximo 5 canciones por turno. Espera a que termine tu turno."); return; }
     const request = await createServiceNotification(
       "other",
       `${tableLabel(state.currentTable)} solicita la canción: ${song}`
     );
-    if (request) assistantSay("bot", `Listo. La canción “${song}” fue solicitada al equipo.`);
+    if (request) { assistantSay("bot", `La canción “${song}” fue solicitada. Puedes pedir máximo 5 por turno; tu posición aparecerá al confirmarse el envío.`); void refreshClientPosData(); }
   };
 
   const addItemToSession = async (itemId) => {
@@ -4270,7 +4384,7 @@ const App = (() => {
 
   const pendingAdminReadScope = (cached, queue) => {
     const sessionIds = new Set(), requestIds = new Set(), closedIds = new Set();
-    const relevant = ["table_sessions", "session_items", "service_requests", "rpc:acknowledge_service_requests"];
+    const relevant = ["table_sessions", "session_items", "service_requests", "rpc:acknowledge_service_requests", "rpc:record_session_payment", "rpc:replay_table_session_change"];
     const records = queue.blockingRecords;
     if (!Array.isArray(records)) return { safe: false, sessionIds, requestIds, closedIds };
     const pending = records.filter((entry) => relevant.includes(entry.entity));
@@ -4278,14 +4392,17 @@ const App = (() => {
     if (!cached) return { safe: false, sessionIds, requestIds, closedIds };
     for (const entry of pending) {
       const ids = entry.recordIds || [];
-      if (entry.entity === "table_sessions") {
+      if (entry.entity === "rpc:replay_table_session_change") {
+        if (!entry.sessionIds?.length) return { safe:false,sessionIds,requestIds,closedIds };
+        for (const id of entry.sessionIds) { sessionIds.add(id); if (entry.sessionStatus === "closed") closedIds.add(id); else if (!cached.sessions.some((row) => row.id === id)) return { safe:false,sessionIds,requestIds,closedIds }; }
+      } else if (entry.entity === "table_sessions") {
         if (!ids.length) return { safe: false, sessionIds, requestIds, closedIds };
         for (const id of ids) {
           sessionIds.add(id);
           if (entry.sessionStatus === "closed") closedIds.add(id);
           else if (!cached.sessions.some((session) => session.id === id)) return { safe: false, sessionIds, requestIds, closedIds };
         }
-      } else if (entry.entity === "session_items") {
+      } else if (["session_items","rpc:record_session_payment"].includes(entry.entity)) {
         const parents = new Set(entry.sessionIds || []);
         ids.forEach((id) => cached.sessions.forEach((session) => {
           if ((session.session_items || []).some((line) => line.id === id)) parents.add(session.id);
@@ -4336,6 +4453,8 @@ const App = (() => {
     });
     const remoteSnapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
     const snapshot = remoteSnapshot ? mergePendingAdminRows(remoteSnapshot, cachedSnapshot, pendingScope) : null;
+    if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
+    else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
     if (!snapshot) {
       const [requests, sessions] = await Promise.all([
         dbQuiet(
@@ -4372,6 +4491,7 @@ const App = (() => {
         session.id,
         session.status,
         session.updated_at,
+        session.session_payments,
         ...(session.session_items || []).map((item) => [item.id, item.status, item.quantity, item.updated_at])
       ])
     ]);
@@ -4480,6 +4600,106 @@ const App = (() => {
 
   const sessionTotal = (session) => sessionTotals(session).total;
 
+  const sessionPayments = (session) => [...new Map((session?.session_payments || []).map((row) => [row.id, row])).values()];
+  const sessionPaid = (session) => sessionPayments(session).reduce((sum, row) => sum + integerMoney(row.amount), 0);
+  const sessionBalance = (session) => Math.max(0, sessionTotal(session) - sessionPaid(session));
+  const aggregateAccountPayments = (session, finalPayments) => {
+    const totals = new Map();
+    [...sessionPayments(session).map((row) => ({ method: row.payment_method, amount: row.amount })), ...finalPayments]
+      .forEach((row) => totals.set(row.method, (totals.get(row.method) || 0) + integerMoney(row.amount)));
+    return [...totals].filter(([, amount]) => amount > 0).map(([method, amount]) => ({ method, amount }));
+  };
+  const abonoRowsHtml = (session) => sessionPayments(session).sort((a,b) => String(b.created_at).localeCompare(String(a.created_at)))
+    .map((row) => '<div class="account-abono-line"><div><strong>Abono · ' + escapeHTML(paymentMethodLabel(row.payment_method)) + '</strong><small>'
+      + escapeHTML(new Date(row.created_at).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "medium" }))
+      + (row.reference ? ' · ' + escapeHTML(row.reference) : '') + (row._offline_pending ? ' · Pendiente de sincronizar' : '')
+      + '</small></div><strong>−' + money(row.amount) + '</strong></div>').join('');
+
+  const openAbonoDialog = (sessionId) => {
+    const session = state.sessions.find((row) => row.id === sessionId);
+    const form = $("#abonoForm"), dialog = $("#abonoDialog");
+    if (!session || !form || !dialog) return;
+    if (!state.posFeatures?.abonos) { toast("Primero activa los abonos ejecutando la migración SQL en Supabase y actualiza la sesión.", "error", "abonos-backend"); return; }
+    if (sessionBalance(session) <= 0) { toast("Esta cuenta no tiene saldo pendiente.", "error"); return; }
+    form.reset(); form.session_id.value = session.id;
+    $("#abonoTitle").textContent = "Abonar a " + sessionLabel(session);
+    $("#abonoBalance").textContent = "Saldo pendiente: " + money(sessionBalance(session));
+    dialog.showModal(); setTimeout(() => form.amount.focus(), 0);
+  };
+  const recordAbono = async (form) => {
+    if (form.dataset.saving === "1") return;
+    const session = state.sessions.find((row) => row.id === form.session_id.value);
+    const amount = currencyInputNumber(form.amount);
+    if (!session || amount <= 0 || amount > sessionBalance(session)) { toast("El abono debe ser mayor a cero y no superar el saldo pendiente.", "error"); return; }
+    const id = form.dataset.paymentId || uid(); form.dataset.paymentId = id;
+    form.dataset.saving = "1"; const button = form.querySelector('[type="submit"]'); button.disabled = true;
+    try {
+      const { data, error } = await state.sb.rpc("record_session_payment", { auth_token: state.authToken, payment_id: id,
+        p_session_id: session.id, p_amount: amount, p_method: form.payment_method.value, p_reference: form.reference.value.trim(), p_created_at: new Date().toISOString() });
+      if (error || !data?.payment) { toast(error?.message || "El abono no pudo guardarse. La cuenta conserva su saldo.", "error", "abono-failed"); return; }
+      session.session_payments = [...sessionPayments(session).filter((row) => row.id !== id), data.payment];
+      if (typeof persistOfflineAdminSnapshot === "function") persistOfflineAdminSnapshot();
+      if (typeof flushDurableWrites === "function") await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
+      delete form.dataset.paymentId; $("#abonoDialog")?.close();
+      state.accountsRenderSignature = ""; state.adminSnapshotSignature = "";
+      renderAdminLive(); renderAccountDetail();
+      if ($("#consumptionDialog")?.open && $("#consumptionForm")?.session_id?.value === session.id) {
+        const wasVisible = !$("#tableConsumptionPreview")?.hidden;
+        renderTableConsumptionPreview(session);
+        if (wasVisible) setTableConsumptionPreviewVisible(true);
+      }
+      toast("Abono guardado: " + money(amount) + ". Saldo: " + money(sessionBalance(session)), "ok", "abono:" + id);
+      if (form.payment_method.value === "cash") void openCashDrawer();
+    } catch (error) {
+      toast(error?.message || "No se pudo confirmar el abono. Revisa el registro antes de volver a intentarlo.", "error", "abono-failed");
+    } finally { delete form.dataset.saving; button.disabled = false; }
+  };
+  let clientPosReadBusy = false;
+  const refreshClientPosData = async () => {
+    if (!state.currentTable || clientPosReadBusy) return;
+    clientPosReadBusy = true;
+    try {
+      const table = state.currentTable;
+      const sessionId = state.currentSession?.id || "";
+      const [queue, payments] = await Promise.all([
+        dbQuiet(state.sb.rpc("get_service_request_queue", { p_table_id: table.id, p_table_access_code: tableCode(table) }), null),
+        state.currentSession ? dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: state.currentSession.id,
+          p_table_id: table.id, p_table_access_code: tableCode(table), auth_token: "" }), null) : null
+      ]);
+      if (state.currentTable?.id !== table.id) return;
+      state.clientQueuePositions = Array.isArray(queue?.requests) ? queue.requests : [];
+      if (payments && state.currentSession?.id === sessionId) state.currentSession.session_payments = payments.payments || [];
+      renderClientQueue(); renderAccount();
+    } finally { clientPosReadBusy = false; }
+  };
+  const renderClientQueue = () => {
+    const box = $("#clientQueueStatus"); if (!box) return;
+    const rows = state.clientQueuePositions || [];
+    const groups = new Map(); rows.forEach((row) => groups.set(row.kind, row));
+    box.hidden = !groups.size;
+    box.innerHTML = [...groups].map(([kind,row]) => '<div><strong>' + (kind === "song" ? "Canciones" : "Solicitudes")
+      + ': turno ' + Number(row.position) + '</strong><small>' + (Number(row.position) === 1 ? 'Tu mesa es la siguiente en el orden de llegada.' : 'Hay ' + (Number(row.position)-1) + ' turno(s) antes del tuyo.')
+      + (kind === "song" ? ' · ' + rows.filter((entry) => entry.kind === "song").length + '/5 canciones en este turno.' : '') + '</small></div>').join('');
+  };
+  const bindAccountFeatures = () => {
+    $("#abonoForm")?.addEventListener("submit", (event) => { event.preventDefault(); void recordAbono(event.currentTarget); });
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-abono-session]"); if (button) openAbonoDialog(button.dataset.abonoSession);
+      if (event.target.closest("#abonoTableAccount")) openAbonoDialog($("#consumptionForm")?.session_id?.value || "");
+    });
+    let lastNumpadZero = 0;
+    document.addEventListener("keydown", (event) => {
+      if (event.code !== "Numpad0" || event.key !== "0" || event.repeat || event.ctrlKey || event.altKey || event.metaKey
+        || document.querySelector("dialog[open], [aria-modal='true']")
+        || event.target.closest?.("input,textarea,select,[contenteditable]")
+        || document.activeElement?.closest?.("input,textarea,select,[contenteditable]")) { lastNumpadZero = 0; return; }
+      const now = Date.now();
+      if (lastNumpadZero && now-lastNumpadZero <= 450) { lastNumpadZero = 0; event.preventDefault(); void openCashDrawer(); }
+      else lastNumpadZero = now;
+    });
+    document.addEventListener("focusin", () => { lastNumpadZero = 0; });
+  };
+
   const newestSessionItems = (session) => [...(session?.session_items || [])]
     .filter((item) => item.status !== "cancelled")
     .sort((left, right) => {
@@ -4511,7 +4731,7 @@ const App = (() => {
 
   const groupedActiveRequests = () => {
     const groups = new Map();
-    activeRequests().forEach((request) => {
+    [...activeRequests()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id))).forEach((request) => {
       const kind = requestKind(request);
       const key = `${request.table_id}:${request.session_id || "no-session"}:${kind}`;
       if (!groups.has(key)) {
@@ -4520,6 +4740,7 @@ const App = (() => {
       const group = groups.get(key);
       group.request_ids.push(request.id);
       group.count += 1;
+      if (kind === "song" && group.count > 1) { group.message += "\n" + (request.message || ""); group.latest_message = group.message; }
     });
     return Array.from(groups.values());
   };
@@ -6635,8 +6856,8 @@ const App = (() => {
       return;
     }
     const items = newestSessionItems(session);
-    const total = sessionTotal(session);
-    const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(total) : 0;
+    const total = sessionBalance(session);
+    const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(sessionTotal(session)) : 0;
     const suggestedTotal = total + suggestedTip;
     const opened = accountDateParts(session);
     const billRequest = state.requests.find((request) => request.session_id === session.id && request.request_type === "bill");
@@ -6664,9 +6885,12 @@ const App = (() => {
             </div>`).join("") || `<div class="invoice-empty">${icon("clipboard-list", 18)} Sin consumos registrados</div>`}
         </div>
         ${suggestedTip ? `<div class="account-detail-tip"><span><small>Propina voluntaria (${state.tipSettings.percentage}%)</small><strong>${money(suggestedTip)}</strong></span><span><small>Total sugerido con propina</small><strong>${money(suggestedTotal)}</strong></span></div>` : ""}
-        <div class="account-detail-total"><span>Total del consumo</span><strong>${money(total)}</strong></div>
+        ${abonoRowsHtml(session)}
+        ${sessionPaid(session) ? `<div class="account-detail-total"><span>Consumo / abonado</span><strong>${money(sessionTotal(session))} / −${money(sessionPaid(session))}</strong></div>` : ""}
+        <div class="account-detail-total"><span>Saldo pendiente</span><strong>${money(total)}</strong></div>
       </div>
       <div class="invoice-actions account-detail-actions">
+        ${items.length ? `<button class="ghost abono-button" type="button" data-abono-session="${session.id}">${icon("hand-coins", 16)} Abonar</button>` : ""}
         ${items.length ? `<button class="ghost small" type="button" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>` : `<button class="ghost small danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 15)} Liberar mesa</button>`}
         ${session.sale_channel === "walk_in" || !session.table_id ? "" : `<button class="ghost small" type="button" data-move-session="${session.id}">${icon("replace", 15)} Cambiar mesa</button>`}
         ${items.length ? `<button class="ghost small" type="button" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>` : ""}
@@ -6684,11 +6908,30 @@ const App = (() => {
     if (!dialog.open) dialog.showModal();
   };
 
+  const compareAccountNumbers = (left, right) => {
+    const table = (session) => state.tables.find((row) => String(row.id) === String(session.table_id)) || session.restaurant_tables;
+    const number = (session) => Number(String(sessionLabel(session)).match(/\d+/)?.[0] || table(session)?.table_number || Number.MAX_SAFE_INTEGER);
+    return number(left) - number(right) || sessionLabel(left).localeCompare(sessionLabel(right), "es", { numeric: true }) || String(left.opened_at || "").localeCompare(String(right.opened_at || ""));
+  };
+  const matchesAccountSearch = (session, query) => {
+    const normalized = normalizeText(query).trim();
+    if (!normalized) return true;
+    const digits = normalized.match(/^(?:mesa\s*|m\s*)?(\d+)$/);
+    if (digits) {
+      const table = state.tables.find((row) => String(row.id) === String(session.table_id)) || session.restaurant_tables;
+      const number = String(sessionLabel(session)).match(/\d+/)?.[0] || String(table?.table_number || "");
+      return Number(number) === Number(digits[1]);
+    }
+    return normalizeText(sessionLabel(session)).includes(normalized);
+  };
+
   const renderAccounts = () => {
     const box = $("#accountsPanel");
     if (!box) return;
-    const accountSessions = state.sessions.filter((session) => !isLocalWalkInSession(session));
+    const accountSearch = $("#accountsSearch")?.value || "";
+    const accountSessions = state.sessions.filter((session) => !isLocalWalkInSession(session) && matchesAccountSearch(session, accountSearch)).sort(compareAccountNumbers);
     const renderSignature = JSON.stringify([
+      accountSearch,
       state.business?.tax_rate,
       state.business?.service_fee,
       state.tipSettings?.enabled,
@@ -6699,6 +6942,8 @@ const App = (() => {
         session.payer_name,
         session.assigned_waiter_id,
         session.assigned_waiter?.full_name,
+        session.session_payments,
+        sessionLabel(session),
         (session.session_items || []).map((item) => [
           item.id, item.item_name, item.quantity, item.unit_price, item.notes, item.status, item.updated_at
         ])
@@ -6710,16 +6955,18 @@ const App = (() => {
       ? accountSessions
           .map((session) => {
             const items = newestSessionItems(session);
-            const total = sessionTotal(session);
-            const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(total) : 0;
+            const total = sessionBalance(session);
+            const suggestedTip = tipsEnabled() && items.length ? tipAmountFor(sessionTotal(session)) : 0;
             const opened = accountDateParts(session);
             return `
               <article class="account-summary-card ${items.length ? "" : "is-empty"}" data-account-session="${session.id}">
                 <div class="account-summary-head"><div><span>${escapeHTML(sessionLabel(session))}</span><small>#${sessionReference(session)}</small></div><span class="account-summary-status">${items.length ? `${items.length} ${items.length === 1 ? "consumo" : "consumos"}` : "Cuenta en $0"}</span></div>
-                <div class="account-summary-total"><small>Total actual</small><strong>${money(total)}</strong></div>
+                <div class="account-summary-total"><small>Saldo pendiente</small><strong>${money(total)}</strong></div>
+                ${sessionPaid(session) ? `<div class="account-abono-summary">Abonado: −${money(sessionPaid(session))} · Consumo: ${money(sessionTotal(session))}</div>` : ""}
                 ${suggestedTip ? `<div class="account-summary-tip"><span>Propina voluntaria (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong><small>Total sugerido: ${money(total + suggestedTip)}</small></div>` : ""}
                 <div class="account-summary-meta"><span>${icon("user-round", 15)} ${escapeHTML(session.payer_name || "Por definir")}</span><span>${icon("contact", 15)} ${escapeHTML(session.assigned_waiter?.full_name || "Sin asignar")}</span><span>${icon("clock-3", 15)} ${opened.date} · ${opened.time}</span></div>
                 <div class="account-summary-actions">
+                  ${items.length ? `<button class="ghost abono-button" type="button" data-abono-session="${session.id}">${icon("hand-coins",16)} Abonar</button>` : ""}
                   <button class="ghost" type="button" data-view-account="${session.id}">${icon("list-collapse", 16)} Ver desglose</button>
                   ${items.length ? `<button class="primary" type="button" data-charge-session="${session.id}">${icon("badge-dollar-sign", 16)} Cobrar</button>` : `<button class="ghost danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 16)} Liberar mesa</button>`}
                 </div>
@@ -6727,7 +6974,7 @@ const App = (() => {
             `;
           })
           .join("")
-      : emptyState("No hay cuentas abiertas", "Las mesas con consumos apareceran aqui.", "receipt-text");
+      : emptyState(accountSearch ? "No hay cuentas que coincidan" : "No hay cuentas abiertas", accountSearch ? "Busca por Mesa y número, o solo por el número." : "Las mesas con consumos apareceran aqui.", "receipt-text");
     if (state.activeAccountDetailId) renderAccountDetail();
     refreshIcons();
   };
@@ -7277,10 +7524,13 @@ const App = (() => {
     toast(`Cuenta movida a ${tableLabel(table)}.`, "ok", `moved-table:${sessionId}`);
   };
 
-  const closeSession = async (id) => {
+  const closeSession = async (id, checkout = null) => {
     const session = state.sessions.find((entry) => entry.id === id);
     if (!session) return null;
     const totals = sessionTotals(session);
+    if (checkout && (Number(checkout.totals.total) !== Number(totals.total) || checkout.paid !== sessionPaid(session))) {
+      toast("La cuenta cambió durante el cobro. Actualiza y revisa el saldo.", "error", "close-session-changed"); return null;
+    }
     if (isLocalWalkInSession(session)) {
       const closedAt = new Date().toISOString();
       const saved = {
@@ -7313,18 +7563,18 @@ const App = (() => {
     state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
     renderAdminLive();
     const closedAt = new Date().toISOString();
-    let saved = await retryQuiet(
-      () => state.sb.from("table_sessions").update({
-        status: "closed",
-        closed_at: closedAt,
-        subtotal: totals.subtotal,
-        discount: totals.discount,
-        tax: totals.tax,
-        service_fee: totals.serviceFee,
-        total: totals.total
-      }).eq("id", id).eq("status", "open").select("*").single(),
-      4
-    );
+    const closure = { status: "closed", closed_at: closedAt, subtotal: totals.subtotal,
+      discount: totals.discount, tax: totals.tax, service_fee: totals.serviceFee, total: totals.total };
+    let saved;
+    if (state.posFeatures?.abonos) {
+      const result = await retryQuiet(() => state.sb.rpc("replay_table_session_change", {
+        auth_token: state.authToken, p_session_id: id, p_patch: closure,
+        p_expected_status: "open", p_expected_paid: checkout?.paid ?? sessionPaid(session)
+      }), 4);
+      saved = result?.session || null;
+    } else {
+      saved = await retryQuiet(() => state.sb.from("table_sessions").update(closure).eq("id",id).eq("status","open").select("*").single(), 4);
+    }
     if (!saved) {
       const confirmed = await dbQuiet(state.sb.from("table_sessions").select("*").eq("id", id).maybeSingle(), null);
       if (confirmed?.status === "closed" && String(confirmed.closed_at || "") === closedAt) saved = confirmed;
@@ -7361,34 +7611,31 @@ const App = (() => {
     const issuedAt = new Date(invoice?.createdAt || Date.now());
     const payments = invoice?.payments || [];
     return `<!doctype html>
-      <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
+      <html lang="es"><head><meta charset="utf-8"><title>${isPaid ? "Factura" : "Pre-cuenta"} ${escapeHTML(receiptNumber)}</title>
       <style>
         @page { size: 80mm auto; margin: 3mm; }
-        * { box-sizing: border-box; color: #000; }
-        html { display: block; visibility: visible; min-height: 0; margin: 0; padding: 0; color: #000; background: #fff; }
-        body { display: block; visibility: visible; width: 72mm; max-width: 72mm; min-height: 0; margin: 0 auto; padding: 0 3mm; overflow-wrap: anywhere; color: #000; background: #fff; font: 700 10px/1.35 "Courier New", monospace; }
-        strong { color: #000; font-weight: 900; }
-        small { color: #000; font-size: 9px; font-weight: 700; }
-        .logo { margin: 2mm 0 0; text-align: center; font: 900 18px/1 Arial, sans-serif; letter-spacing: .5px; }
+        * { box-sizing: border-box; color: #000; font-weight: 800; }
+        body { width: 72mm; margin: 0 auto; color: #000; background: #fff; font: 800 12px/1.35 "Courier New", monospace; }
+        .logo { margin: 2mm 0 0; text-align: center; font: 900 22px/1 Arial, sans-serif; letter-spacing: .7px; }
         .subtitle, .center { text-align: center; }
         .subtitle { margin: 1mm 0 3mm; font-weight: 700; }
         .rule { margin: 2.5mm 0; border-top: 1px dashed #000; }
-        .meta, .totals { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 1mm 2mm; align-items: start; width: 100%; padding: 0 2mm; }
+        .meta, .totals { display: grid; grid-template-columns: 1fr auto; gap: 1mm 3mm; }
         .items { display: grid; gap: 2mm; }
-        .item { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 2mm; align-items: start; width: 100%; padding: 0 2mm; }
-        .meta > *, .totals > *, .item > * { min-width: 0; }
-        .meta strong { max-width: 30mm; overflow-wrap: anywhere; text-align: right; font-size: 9px; }
-        .totals strong, .item > strong { white-space: nowrap; text-align: right; font-size: 9px; }
-        .item small { display: block; }
-        .total { margin-top: 1.5mm; font-size: 13px; font-weight: 900; }
-        .totals strong.total { font-size: 12px; }
+        .item { display: grid; grid-template-columns: 1fr auto; gap: 2mm; }
+        .item small { display: block; font-weight: 800; }
+        strong { font-weight: 900; }
+        .meta > *, .totals > *, .item > * { min-width: 0; overflow-wrap: anywhere; }
+        .totals strong, .item > strong { white-space: nowrap; }
+        .meta, .totals, .item { grid-template-columns: minmax(0, 1fr) max-content; }
+        @media print { body { margin: 0 auto; padding: 0; width: 72mm; color: #000 !important; font-weight: 800 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+        .total { margin-top: 1.5mm; font-size: 16px; font-weight: 900; }
         .paid { padding: 1.5mm; border: 2px solid #000; text-align: center; font-weight: 900; }
         .footer { margin-top: 3mm; text-align: center; }
+        .devnex-credit { display: grid; justify-items: center; gap: 1mm; margin-top: 2.5mm; padding-top: 2.5mm; border-top: 1px dashed #000; text-align: center; font-size: 10px; }
+        .devnex-contact { display: inline-flex; align-items: center; gap: 1mm; }
+        .devnex-contact svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
         @media screen { body { padding: 8mm 4mm; box-shadow: 0 0 22px #bbb; } }
-        @media print {
-          html { display: block !important; visibility: visible !important; min-height: 0 !important; margin: 0 !important; padding: 0 !important; overflow: visible !important; }
-          body { display: block !important; visibility: visible !important; width: 72mm !important; max-width: 72mm !important; min-height: 0 !important; margin: 0 auto !important; padding: 0 3mm !important; overflow: visible !important; color: #000 !important; font-weight: 700 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-        }
       </style></head><body>
         <div class="logo">${escapeHTML(businessName)}</div>
         <div class="subtitle">FACTURA DE VENTA</div>
@@ -7413,12 +7660,15 @@ const App = (() => {
           ${totals.serviceFee ? `<span>Servicio</span><strong>${money(totals.serviceFee)}</strong>` : ""}
           ${chargedTip ? `<span>Propina voluntaria${invoice.tipPercentage ? ` (${Number(invoice.tipPercentage)}%)` : ""}</span><strong>${money(chargedTip)}</strong>` : ""}
           ${suggestedTip ? `<span>Propina voluntaria sugerida (${state.tipSettings.percentage}%)</span><strong>${money(suggestedTip)}</strong>` : ""}
+          ${(invoice?.prepayments?.length || sessionPaid(session)) ? `<span>Abonos previos</span><strong>−${money((invoice?.prepayments || sessionPayments(session)).reduce((sum,row) => sum + Number(row.amount || 0),0))}</strong><span>Saldo ${isPaid ? "cobrado al cierre" : "pendiente"}</span><strong>${money(invoice?.remainingPaid ?? Math.max(0,receiptTotal-sessionPaid(session)))}</strong>` : ""}
           <span class="total">${suggestedTip ? "TOTAL SUGERIDO" : "TOTAL"}</span><strong class="total">${money(receiptTotal)}</strong>
         </div>
         ${suggestedTip ? `<p class="center"><strong>La propina es voluntaria.</strong><br>El cliente puede pagar el consumo sin propina: ${money(baseTotal)}.</p>` : ""}
-        ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${invoice.paymentMethod === "cash" && Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
+        ${isPaid && invoice.prepayments?.length ? `<div class="rule"></div><div class="center">ABONOS REGISTRADOS</div>${invoice.prepayments.map((row) => `<div class="meta"><span>${escapeHTML(new Date(row.created_at).toLocaleString("es-CO"))} · ${escapeHTML(paymentMethodLabel(row.payment_method))}</span><strong>${money(row.amount)}</strong></div>`).join("")}` : ""}
+        ${isPaid ? `<div class="rule"></div><div class="paid">PAGADO</div><div class="meta" style="margin-top:2mm">${payments.map((payment) => `<span>${escapeHTML(paymentMethodLabel(payment.method))}</span><strong>${money(payment.amount)}</strong>`).join("")}${Number(invoice.cashReceived || 0) ? `<span>Recibido</span><strong>${money(invoice.cashReceived)}</strong><span>Cambio</span><strong>${money(invoice.changeDue)}</strong>` : ""}${invoice.reference ? `<span>Referencia</span><strong>${escapeHTML(invoice.reference)}</strong>` : ""}</div>` : ""}
         <div class="rule"></div>
         <div class="footer">Gracias por su compra<br><strong>${escapeHTML(businessName)}</strong></div>
+        ${isPaid ? `<div class="devnex-credit"><strong>Devnex Soluciones Tecnologicas - Devnex.tech</strong><span class="devnex-contact"><svg viewBox="0 0 24 24" aria-label="Instagram"><rect width="18" height="18" x="3" y="3" rx="5"></rect><circle cx="12" cy="12" r="4"></circle><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"></circle></svg>3246394689 <svg viewBox="0 0 24 24" aria-label="WhatsApp"><path d="M20.5 11.6a8.6 8.6 0 0 1-12.7 7.6L3 20.5l1.3-4.7a8.6 8.6 0 1 1 16.2-4.2Z"></path><path d="M8 7.5c-.8 1.2-.2 3.3 1.8 5.3s4.1 2.6 5.3 1.8l.5-1.7-2.2-1-1 1c-1.2-.5-2.6-1.9-3.1-3.1l1-1-1-2.2Z"></path></svg></span></div>` : ""}
       </body></html>`;
   };
 
@@ -7515,9 +7765,12 @@ const App = (() => {
     const manualTip = enabled && choice === "with" ? currencyInputNumber(form.tip_amount) : 0;
     const suggestedTip = tipAmountFor(baseTotal);
     const tip = enabled && choice === "with" ? (manualTip || suggestedTip) : 0;
-    const total = baseTotal + tip;
+    const activeSession = state.sessions.find((row) => row.id === form.session_id.value);
+    const paid = sessionPaid(activeSession);
+    const total = Math.max(0, baseTotal + tip - paid);
     state.activePaymentTip = tip;
     state.activePaymentTotal = total;
+    if ($("#paymentAbonoSummary")) $("#paymentAbonoSummary").textContent = paid ? "Consumo: " + money(baseTotal) + " · Abonos: −" + money(paid) + " · Saldo por cobrar: " + money(total) : "";
     if ($("#paymentTotal")) $("#paymentTotal").textContent = money(total);
     if ($("#paymentTotalHint")) $("#paymentTotalHint").textContent = enabled && !choice
       ? "Selecciona si el cliente paga con o sin propina para continuar."
@@ -7754,6 +8007,16 @@ const App = (() => {
       toast("Esta cuenta ya fue cobrada. Se retiro la copia atrasada de la pantalla.", "ok", `payment-already-recorded:${session.id}`);
       return;
     }
+    const checkoutPaid = sessionPaid(session);
+    const checkoutBase = integerMoney(sessionTotals(session).total);
+    if (checkoutPaid > checkoutBase) { toast("Los abonos superan el consumo actual. Revisa la cuenta antes de cobrar.", "error", "payment-credit"); return; }
+    const expectedBalance = Math.max(0, checkoutBase + Number(state.activePaymentTip || 0) - checkoutPaid);
+    if ((state.activePaymentBase != null && checkoutBase !== state.activePaymentBase) || expectedBalance !== integerMoney(state.activePaymentTotal)) {
+      state.activePaymentBase = checkoutBase; updatePaymentTipChoice();
+      const lines = $("#paymentSaleLines");
+      if (lines) lines.innerHTML = (session.session_items || []).filter((row) => row.status !== "cancelled").map((row) => '<div><span>' + row.quantity + ' × ' + escapeHTML(row.item_name) + '</span><strong>' + money(Number(row.quantity) * Number(row.unit_price)) + '</strong></div>').join('');
+      toast("La cuenta cambió en otra sesión. Revisa el saldo actualizado y confirma nuevamente.", "error", "payment-refreshed"); return;
+    }
     if (tipsEnabled() && !form.tip_choice?.value) {
       toast("Selecciona si el cliente paga con o sin propina.", "error", "tip-choice-required");
       form.querySelector('input[name="tip_choice"]')?.focus({ preventScroll: true });
@@ -7803,8 +8066,10 @@ const App = (() => {
       createdAt,
       payerName: session.payer_name || "",
       waiterName: state.currentUser?.full_name || session.assigned_waiter?.full_name || "",
-      paymentMethod: payment.method,
-      payments: payment.payments,
+      paymentMethod: aggregateAccountPayments(session, payment.payments).length > 1 ? "mixed" : (aggregateAccountPayments(session, payment.payments)[0]?.method || payment.method),
+      payments: aggregateAccountPayments(session, payment.payments),
+      prepayments: sessionPayments(session),
+      remainingPaid: integerMoney(state.activePaymentTotal),
       withTip: tipAmount > 0,
       tipPercentage,
       tipAmount,
@@ -7812,7 +8077,7 @@ const App = (() => {
       baseTotal: integerMoney(totals.total),
       reference: form.payment_reference.value.trim(),
       cashReceived: payment.method === "cash" ? currencyInputNumber(form.cash_received) : null,
-      changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - invoiceTotals.total : 0,
+      changeDue: payment.method === "cash" ? currencyInputNumber(form.cash_received) - integerMoney(state.activePaymentTotal) : 0,
       inventoryAdjustedOnConsumption: false,
       totals: invoiceTotals,
       items: (session.session_items || []).filter((item) => item.status !== "cancelled").map((item) => ({
@@ -7855,7 +8120,17 @@ const App = (() => {
       toast("No se pudo guardar el cobro en este equipo. Intenta de nuevo sin cerrar la aplicación.", "error", `payment-storage:${session.id}`);
       return;
     }
-    const closePromise = closeSession(session.id);
+    const currentCheckout = state.sessions.find((row) => row.id === session.id);
+    if (!currentCheckout || sessionPaid(currentCheckout) !== checkoutPaid || sessionTotals(currentCheckout).total !== totals.total) {
+      rollbackLocalPayment({ invoice, inventoryBefore, incomeReportBefore });
+      state.localSupabaseWrites = Math.max(0, state.localSupabaseWrites - 1);
+      receiptWindow?.close();
+      buttons.forEach((button) => { button.disabled = false; });
+      state.paymentProcessing = false;
+      toast("La cuenta cambió durante el cobro. Revisa el saldo y confirma nuevamente.", "error", "payment-changed-during-save");
+      return;
+    }
+    const closePromise = closeSession(session.id, { paid: checkoutPaid, totals });
     $("#paymentDialog")?.close();
     renderInventory();
     renderInventoryMovements();
@@ -8060,6 +8335,7 @@ const App = (() => {
     }
     const productCount = items.reduce((total, item) => total + Number(item.quantity || 0), 0);
     preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(sessionTotal(session))}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
+    if (session) preview.innerHTML += abonoRowsHtml(session) + (sessionPaid(session) ? `<div class="account-abono-summary">Saldo pendiente: ${money(sessionBalance(session))}</div>` : "");
     setTableConsumptionPreviewVisible(false);
   };
 
@@ -8930,6 +9206,8 @@ const App = (() => {
   };
 
   const bindAdmin = () => {
+    bindAccountFeatures();
+    $("#accountsSearch")?.addEventListener("input", () => renderAccounts());
     bindCurrencyInputs();
     $("#businessForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();

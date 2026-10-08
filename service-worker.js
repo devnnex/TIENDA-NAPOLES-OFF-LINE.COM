@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v24";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v25";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";

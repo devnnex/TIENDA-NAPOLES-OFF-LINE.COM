@@ -1,7 +1,16 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.12.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.13.exe` con Inno Setup 6.
+
+La versión 1.0.13 corrige únicamente la consulta del inventario de Offline:
+lee Apps Script aunque haya una escritura pendiente o en curso. El indicador
+cuenta solo cambios activos que afectan inventario. Las operaciones rechazadas
+conservan su registro y permiten mostrar las existencias actuales del backend.
+Los cambios locales pendientes se protegen por producto, incluida una carga inicial;
+una lectura anterior no pisa escrituras confirmadas mientras se consultaba.
+Conserva la consulta cada cinco segundos y la recuperación al volver internet.
+No requiere SQL ni cambios en Apps Script o BCA.
 
 La versión 1.0.12 limita el ajuste a la rapidez del inventario y al aviso visual
 histórico 406/PGRST116 de cuentas sin filas. Inventario consulta cada cinco segundos,

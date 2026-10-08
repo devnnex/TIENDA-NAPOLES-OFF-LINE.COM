@@ -2585,29 +2585,36 @@ const App = (() => {
     };
   };
 
-  const pendingInventoryProductIds = () => {
+  const isPendingInventoryJob = (job) => ["pending", "syncing"].includes(job.status)
+    && ["upsert_inventory", "set_inventory_stock", "adjust_inventory", "delete_inventory",
+      "sync_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].includes(job.action);
+
+  const pendingInventoryProductIds = (jobs = readAppsScriptOutbox()) => {
     const ids = new Set();
-    readAppsScriptOutbox().forEach((job) => {
+    jobs.filter(isPendingInventoryJob).forEach((job) => {
       if (["upsert_inventory", "set_inventory_stock", "delete_inventory"].includes(job.action)) {
         ids.add(String(job.payload?.item?.productId || job.payload?.productId || ""));
       }
       if (job.action === "adjust_inventory") ids.add(String(job.payload?.adjustment?.productId || ""));
+      if (job.action === "sync_inventory") (job.payload?.items || []).forEach((item) => ids.add(String(item.productId || "")));
       if (job.action === "record_sale") (job.payload?.invoice?.items || []).forEach((line) => ids.add(String(line.menu_item_id || "")));
     });
     ids.delete("");
     return ids;
   };
 
-  const applyRemoteInventoryItems = (items = [], { replace = false, preserveProductIds = new Set() } = {}) => {
+  const applyRemoteInventoryItems = (items = [], { replace = false, preserveProductIds = new Set(), baseline = null } = {}) => {
     if (!Array.isArray(items)) return;
     if (replace) {
       const remoteIds = new Set(items.map((item) => String(item?.productId || "")).filter(Boolean));
       Object.keys(state.inventoryMeta).forEach((productId) => {
-        if (!remoteIds.has(String(productId)) && !preserveProductIds.has(String(productId))) delete state.inventoryMeta[productId];
+        if (!remoteIds.has(String(productId)) && !preserveProductIds.has(String(productId))
+          && (!baseline || baseline.get(productId) === state.inventoryMeta[productId]?.updatedAt)) delete state.inventoryMeta[productId];
       });
     }
     items.forEach((remote) => {
       if (preserveProductIds.has(String(remote.productId || ""))) return;
+      if (baseline && baseline.get(remote.productId) !== state.inventoryMeta[remote.productId]?.updatedAt) return;
       const item = state.items.find((entry) => entry.id === remote.productId);
       if (!item) return;
       state.inventoryMeta[item.id] = {
@@ -2860,17 +2867,18 @@ const App = (() => {
     if (inventoryReadPromise) return inventoryReadPromise;
     inventoryReadPromise = (async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
-    if (readAppsScriptOutbox().some((job) => ["clear_inventory", "sync_inventory"].includes(job.action))) {
+    if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory" && isPendingInventoryJob(job))) {
       setInventorySyncStatus("Esperando cambios de inventario pendientes", "pending", "refresh-cw");
       return false;
     }
     try {
+      const baseline = new Map(Object.entries(state.inventoryMeta).map(([id, meta]) => [id, meta?.updatedAt]));
       const result = await appsScriptRequest("get_inventory");
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
       if (!Array.isArray(result.items)) throw new Error("El inventario remoto devolvió una respuesta inválida.");
-      applyRemoteInventoryItems(result.items, { replace: true, preserveProductIds: pendingInventoryProductIds() });
+      applyRemoteInventoryItems(result.items, { replace: true, preserveProductIds: pendingInventoryProductIds(), baseline });
       state.syncFresh.inventory = true;
-      const pending = readAppsScriptOutbox().length;
+      const pending = readAppsScriptOutbox().filter(isPendingInventoryJob).length;
       setInventorySyncStatus(pending ? `${pending} cambio${pending === 1 ? "" : "s"} pendiente${pending === 1 ? "" : "s"}` : "Inventario sincronizado", pending ? "pending" : "synced", pending ? "refresh-cw" : "cloud-check");
       void updateGlobalSyncStatus();
       return true;
@@ -2884,11 +2892,11 @@ const App = (() => {
   };
 
   const refreshRemoteStorageNow = async () => {
-    if (state.appsScriptOutboxBusy || state.remoteStorageSyncBusy || !isAppsScriptConfigured() || !state.currentUser) return false;
+    if (state.remoteStorageSyncBusy || !isAppsScriptConfigured() || !state.currentUser) return false;
     state.remoteStorageSyncBusy = true;
     try {
       if (readAppsScriptOutbox().length) {
-        await flushAppsScriptOutbox();
+        void flushAppsScriptOutbox();
       }
       const synced = await syncInventoryWithAppsScript();
       const purchasesOpen = Boolean($("#purchaseHistoryDialog")?.open);

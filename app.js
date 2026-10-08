@@ -2916,6 +2916,7 @@ const App = (() => {
     if (reconnectSyncPromise) return reconnectSyncPromise;
     reconnectSyncPromise = (async () => {
       if (state.page === "admin" && state.offlineLoginPending && !await refreshOfflineLogin()) return false;
+      void flushPeerRefreshes();
       const startedAt = performance.now();
       recordSyncEvent("sync-cycle-started", { destination: "all", action: reason });
       // Las lecturas independientes comienzan de inmediato. Una operación
@@ -4394,16 +4395,46 @@ const App = (() => {
     }, 12000);
   };
 
-  const notifyAdminPeers = (detail = {}) => {
-    if (!state.authToken || !state.currentUser) return;
-    const channel = state.adminBroadcastChannel;
-    if (!channel?.send) return;
-    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.users,"users-refresh"]]) {
-      if (enabled) {
-        try { Promise.resolve(channel.send({type:"broadcast",event,payload:{}})).catch(() => undefined); }
-        catch (_) { /* La consulta periódica recupera un canal desconectado. */ }
+  const pendingPeerRefreshes = new Set();
+  let peerRefreshSending = false;
+  let peerRefreshRetryTimer = null;
+  const flushPeerRefreshes = async () => {
+    if (peerRefreshSending || !navigator.onLine || !state.authToken || !state.currentUser || !pendingPeerRefreshes.size) return;
+    peerRefreshSending = true;
+    const events = [...pendingPeerRefreshes];
+    events.forEach((event) => pendingPeerRefreshes.delete(event));
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 2500);
+    let delivered = false;
+    try {
+      // La entrega HTTP confirma que Realtime recibió el aviso, incluso si el
+      // socket de este equipo se está reconectando. Solo transmite invalidaciones.
+      const response = await fetch(`${SUPABASE_CONFIG.url}/realtime/v1/api/broadcast`, {
+        method: "POST",
+        headers: { apikey: SUPABASE_CONFIG.anonKey, Authorization: `Bearer ${SUPABASE_CONFIG.anonKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: events.map((event) => ({ topic: "admin", event, payload: {}, private: false })) }),
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error("Aviso pendiente de entrega");
+      delivered = true;
+    } catch (_) {
+      events.forEach((event) => pendingPeerRefreshes.add(event));
+    } finally {
+      window.clearTimeout(timer);
+      peerRefreshSending = false;
+      if (pendingPeerRefreshes.size && navigator.onLine) {
+        window.clearTimeout(peerRefreshRetryTimer);
+        peerRefreshRetryTimer = window.setTimeout(() => void flushPeerRefreshes(), delivered ? 0 : 1000);
       }
     }
+  };
+
+  const notifyAdminPeers = (detail = {}) => {
+    if (!state.authToken || !state.currentUser) return;
+    for (const [enabled,event] of [[detail.operational,"refresh"],[detail.core,"core-refresh"],[detail.reports,"reports-refresh"],[detail.users,"users-refresh"]]) {
+      if (enabled) pendingPeerRefreshes.add(event);
+    }
+    void flushPeerRefreshes();
   };
 
   let adminRefreshPending = false;
@@ -11083,6 +11114,16 @@ const App = (() => {
       if (!document.hidden) void synchronizeAfterReconnect("foreground");
     });
     navigator.serviceWorker?.addEventListener("message", (event) => {
+      if (event.data?.type === "OFFLINE_MUTATION_CONFIRMED") {
+        const entity = event.data.entity || "";
+        notifyAdminPeers({
+          core: ["business_settings", "restaurant_tables", "menu_categories", "menu_items", "rpc:save_table_zones"].includes(entity),
+          operational: ["table_sessions", "session_items", "service_requests", "rpc:record_session_payment", "rpc:replay_table_session_change",
+            "rpc:acknowledge_service_requests", "rpc:resolve_bill", "rpc:create_service_request", "rpc:create_service_requests_batch"].includes(entity),
+          users: ["app_users", "rpc:save_user", "rpc:delete_user"].includes(entity)
+        });
+        return;
+      }
       if (event.data?.type === "OFFLINE_SESSION_REMAPPED") {
         applyOfflineSessionRemap(event.data);
         return;

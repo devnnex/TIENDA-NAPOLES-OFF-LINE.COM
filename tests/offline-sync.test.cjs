@@ -51,10 +51,11 @@ const indexedDB = {
 };
 
 const listeners = new Map();
+const confirmedMessages = [];
 const self = {
   location: { origin: "http://127.0.0.1:8765", hostname: "127.0.0.1" },
   registration: { sync: { register: async () => undefined } },
-  clients: { matchAll: async () => [] },
+  clients: { matchAll: async () => [{ postMessage: (message) => confirmedMessages.push(message) }] },
   skipWaiting: async () => undefined,
   addEventListener: (name, listener) => listeners.set(name, listener)
 };
@@ -1522,6 +1523,43 @@ test('84 no descarta un POST 406 sin prueba de su UUID y mesa',async()=>{
     };
     await flushAsAuthenticatedApp('valid-token');assert.equal((await api.listEntries())[0].status,'conflict');
   }
+});
+
+test('85 avisa a BCA al confirmar cada cambio sin esperar otra escritura lenta', async () => {
+  confirmedMessages.length = 0;
+  const first = pendingEntry({ entity: 'menu_categories', recordId: 'category-first', recordIds: ['category-first'],
+    url: endpoint('menu_categories'), payload: { id: 'category-first', name: 'Primera' },
+    body: JSON.stringify({ id: 'category-first', name: 'Primera' }), createdOrder: 1 });
+  const second = pendingEntry({ recordId: 'product-second', recordIds: ['product-second'],
+    payload: { id: 'product-second', name: 'Segundo' }, body: JSON.stringify({ id: 'product-second', name: 'Segundo' }), createdOrder: 2 });
+  await api.putEntry(first);
+  await api.putEntry(second);
+  let releaseSecond, secondStarted;
+  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
+  const enteredSecond = new Promise((resolve) => { secondStarted = resolve; });
+  remoteFetch = async (input) => {
+    if (input.url.includes('/menu_categories')) return Response.json({ id: 'category-first' });
+    secondStarted();
+    await secondGate;
+    return Response.json({ id: 'product-second' });
+  };
+  const flushing = api.flushQueue(true);
+  await enteredSecond;
+  assert.ok(confirmedMessages.some((message) => message.type === 'OFFLINE_MUTATION_CONFIRMED' && message.entity === 'menu_categories'),
+    'El aviso de la primera escritura ya llegó mientras la segunda sigue en curso.');
+  assert.equal(confirmedMessages.some((message) => message.type === 'OFFLINE_QUEUE_FLUSHED'), false);
+  releaseSecond();
+  await flushing;
+  assert.equal(confirmedMessages.filter((message) => message.type === 'OFFLINE_MUTATION_CONFIRMED').length, 2);
+});
+
+test('86 no anuncia como confirmado un cambio local que el servidor rechazó', async () => {
+  confirmedMessages.length = 0;
+  await api.putEntry(pendingEntry());
+  remoteFetch = async () => Response.json({ message: 'rechazado' }, { status: 400 });
+  await api.flushQueue(true);
+  assert.equal(confirmedMessages.some((message) => message.type === 'OFFLINE_MUTATION_CONFIRMED'), false);
+  assert.equal((await api.listEntries())[0].status, 'failed');
 });
 
 (async () => {

@@ -106,6 +106,7 @@ globalThis.refreshBackgroundReports = refreshBackgroundReports;`, context);
     loadInventoryMovements: () => { reconnectCalls.push("movements"); return reconnectReads.movements.promise; },
     loadIncomeReport: () => { reconnectCalls.push("sales"); return reconnectReads.sales.promise; },
     refreshBackgroundReports: () => { reconnectCalls.push("verify-revisions"); return Promise.resolve(false); },
+    flushPeerRefreshes: () => Promise.resolve(),
     isManager: () => true,
     canAccessAdminSection: () => true,
     isBoss: () => false,

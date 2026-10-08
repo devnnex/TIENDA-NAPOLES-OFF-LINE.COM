@@ -1,7 +1,15 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.13.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.14.exe` con Inno Setup 6.
+
+La versión 1.0.14 limita el ajuste a los avisos de Offline hacia BCA: cada
+escritura confirmada avisa sin esperar al resto de la cola. La entrega a
+Realtime se confirma por HTTP y reintenta si falla, incluso al volver internet.
+Marca, mesas, catálogo, cuentas, solicitudes, usuarios e informes usan los
+eventos que BCA ya escucha. Los avisos contienen únicamente invalidaciones;
+no publican cambios locales pendientes como si estuvieran guardados en el backend.
+No cambia BCA ni requiere SQL o cambios en Apps Script.
 
 La versión 1.0.13 corrige únicamente la consulta del inventario de Offline:
 lee Apps Script aunque haya una escritura pendiente o en curso. El indicador

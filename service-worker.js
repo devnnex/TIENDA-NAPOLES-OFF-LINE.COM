@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v25";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v26";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -1085,6 +1085,8 @@ const flushQueue = (force = false) => {
               : reconciledAs ? { reconciledAs } : {}) });
           scheduleConfirmedCleanup();
           confirmedAny = true;
+          // El aviso de esta escritura no espera otros envíos de la cola.
+          await notifyClients("OFFLINE_MUTATION_CONFIRMED", { entity: entry.entity, operationId: entry.operationId });
           syncLog("success", { operationId: entry.operationId, destination: "supabase", entity: entry.entity, attempts: entry.attempts, durationMs: Math.round(performance.now() - startedAt) });
           continue;
         }

@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261005-sync-repair-v8">
+    <link rel="stylesheet" href="style.css?v=20261008-song-sync-v1">
     <script src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="client">
@@ -54,6 +54,8 @@
         </button>
       </section>
 
+      <p class="song-turn-notice">🎵 Puedes pedir hasta 5 canciones por turno. Respeta el orden: otras mesas también esperan. El chat no recibe más solicitudes cuando completas tus 5 canciones. Solo se atenderán solicitudes de mesas ocupadas, verificadas por cámaras.</p>
+
       <section id="clientQueueStatus" class="client-queue-status" aria-live="polite" hidden></section>
       <section class="client-section">
         <div class="assistant-panel">
@@ -67,6 +69,7 @@
           <div class="assistant-chat" id="assistantChat"></div>
           <div class="typing-indicator client-typing-indicator" id="clientChatTyping" hidden><i></i><i></i><i></i><span>El administrador está escribiendo</span></div>
           <div class="assistant-suggestions" id="assistantSuggestions"></div>
+          <p class="song-limit-notice" id="songLimitNotice" role="alert" hidden>Ya solicitaste 5 canciones en este turno. Espera tu turno: otras mesas también pidieron canciones. No se enviarán más mensajes por el chat hasta que termine este turno.</p>
           <form class="assistant-form" id="assistantForm">
             <input id="assistantInput" name="message" type="text" autocomplete="off" placeholder="Ej: Quiero una canasta de cerveza">
             <button class="primary" type="submit" aria-label="Enviar mensaje"><i data-lucide="send"></i></button>
@@ -78,6 +81,6 @@
     </main>
 
     <script src="vendor/lucide.min.js"></script>
-    <script src="app.js?v=20261005-sync-badge-pin-v12"></script>
+    <script src="app.js?v=20261008-song-sync-v1"></script>
   </body>
 </html>

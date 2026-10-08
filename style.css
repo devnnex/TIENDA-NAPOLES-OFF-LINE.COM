@@ -927,6 +927,31 @@ button:hover, .primary:hover, .ghost:hover, .icon-btn:hover, .chip:hover {
 
 .assistant-song-hint svg { width: 16px; height: 16px; color: #ffcf70; }
 
+.song-turn-notice,
+.song-limit-notice {
+  margin: 0 1rem 1rem;
+  padding: .85rem 1rem;
+  border: 2px solid #a76b00;
+  border-radius: 12px;
+  background: #ffe45c;
+  color: #302000;
+  font-weight: 800;
+  line-height: 1.45;
+  box-shadow: 0 0 0 3px rgba(255, 216, 52, .22);
+  animation: song-notice-blink 1.4s ease-in-out infinite;
+}
+
+.song-limit-notice { margin: .6rem 0; background: #ffd12f; }
+.song-limit-notice[hidden] { display: none; }
+
+@keyframes song-notice-blink {
+  50% { background: #fff5a2; box-shadow: 0 0 0 6px rgba(255, 216, 52, .45); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .song-turn-notice, .song-limit-notice { animation: none; }
+}
+
 .assistant-chat {
   min-height: 190px;
   max-height: 340px;

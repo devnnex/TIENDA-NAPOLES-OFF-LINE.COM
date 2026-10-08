@@ -25,6 +25,7 @@ let responses={},calls=[];
 context.tableCode=table=>table.access_code||'qr-valid';
 context.dbQuiet=async (query,fallback)=>{try {const result=await query;return result?.error?fallback:result?.data;}catch{return fallback;}};
 context.renderClientQueue=()=>{};
+context.songTurnCount=()=>0;
 context.renderAccount=()=>{};
 context.refreshTableLock=()=>{};
 context.loadClientSessionItems=async()=>{};

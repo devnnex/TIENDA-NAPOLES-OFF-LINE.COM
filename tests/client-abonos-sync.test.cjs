@@ -24,6 +24,7 @@ const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {
 let responses={},calls=[];
 context.tableCode=table=>table.access_code||'qr-valid';
 context.dbQuiet=async (query,fallback)=>{try {const result=await query;return result?.error?fallback:result?.data;}catch{return fallback;}};
+context.readRealtimeData=query=>context.dbQuiet(query,null);
 context.renderClientQueue=()=>{};
 context.songTurnCount=()=>0;
 context.renderAccount=()=>{};

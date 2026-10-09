@@ -556,6 +556,9 @@ const App = (() => {
     tableLocked: false,
     qrLocked: false,
     clientChannel: null,
+    clientSubscribedTableId: "",
+    clientReconnectTimer: null,
+    clientRealtimeNeedsReconnect: false,
     clientPollTimer: null,
     clientSyncBusy: false,
     requestOutboxBusy: false,
@@ -980,7 +983,9 @@ const App = (() => {
       );
     }
     if (state.currentSession?.id !== session?.id) state.clientSnapshotSignature = "";
+    if (state.page === "client" && state.currentTable?.id !== tableId) return session;
     state.currentSession = session;
+    if (state.page === "client" && session) subscribeClient();
     return session;
   };
 
@@ -999,15 +1004,16 @@ const App = (() => {
   const hydrateSelectedTable = async (tableId) => {
     const table = state.currentTable;
     if (!table || table.id !== tableId) return null;
+    subscribeClient();
     const token = ++state.clientHydrationToken;
     state.tableAccountStatus = "checking";
     state.tableAccountTotal = 0;
     renderTablePicker();
-    const snapshot = await dbQuiet(state.sb.rpc("getClientTableState", {
+    const snapshot = await readRealtimeData(state.sb.rpc("getClientTableState", {
       table_id: table.id,
       table_access_code: tableCode(table),
       ensure_session: true
-    }), null);
+    }));
     if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
     if (snapshot?.session) {
       state.currentSession = snapshot.session;
@@ -1019,9 +1025,10 @@ const App = (() => {
       if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId || !session) return null;
       await loadClientSnapshot();
     }
-    await refreshClientPosData();
+    void refreshClientPosData();
     if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
     reconcilePendingBillsForTable(state.clientRequests);
+    renderClientQueue();
     refreshTableLock();
     renderAccount();
     renderBillChat();
@@ -1046,6 +1053,7 @@ const App = (() => {
   const loadClientRequests = async () => {
     if (!state.currentSession) {
       state.clientRequests = [];
+      renderClientQueue();
       return;
     }
     state.clientRequests = await db(
@@ -1056,6 +1064,7 @@ const App = (() => {
         .order("created_at", { ascending: false }),
       []
     );
+    renderClientQueue();
   };
 
   const dbQuiet = async (builder, fallback = null) => {
@@ -1066,6 +1075,18 @@ const App = (() => {
     } catch (error) {
       return fallback;
     }
+  };
+
+  const readRealtimeData = async (query) => {
+    let timeout;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const builder = controller && typeof query?.abortSignal === "function" ? query.abortSignal(controller.signal) : query;
+    try {
+      return await Promise.race([
+        dbQuiet(builder, null),
+        new Promise((resolve) => { timeout = window.setTimeout(() => { controller?.abort(); resolve(null); }, 8000); })
+      ]);
+    } finally { window.clearTimeout(timeout); }
   };
 
   let bootstrapPromise = null;
@@ -1147,17 +1168,18 @@ const App = (() => {
   };
 
   const loadClientSnapshot = async () => {
-    const posRead = refreshClientPosData();
-    if (!state.currentSession) { await posRead; return; }
-    const snapshot = await dbQuiet(
+    void refreshClientPosData();
+    if (!state.currentSession) return false;
+    const sessionId = state.currentSession.id;
+    const tableId = state.currentTable?.id;
+    const snapshot = await readRealtimeData(
       state.sb.rpc("getClientSnapshot", {
         session_id: state.currentSession.id,
         table_id: state.currentTable?.id || null,
         table_access_code: tableCode(state.currentTable)
-      }),
-      null
+      })
     );
-    await posRead;
+    if (state.currentSession?.id !== sessionId || state.currentTable?.id !== tableId) return false;
     if (!snapshot) {
       await Promise.all([loadClientSessionItems(), loadClientRequests()]);
       return true;
@@ -1170,6 +1192,7 @@ const App = (() => {
     state.clientSnapshotSignature = signature;
     state.sessionItems = snapshot.sessionItems || [];
     state.clientRequests = snapshot.requests || [];
+    renderClientQueue();
     refreshTableLock();
     return true;
   };
@@ -2409,7 +2432,7 @@ const App = (() => {
     void pollDrawerReceiver();
   };
 
-  const openCashDrawer = async () => {
+  const openCashDrawer = async ({ localOnly = false } = {}) => {
     if (!state.currentUser || !state.authToken || drawerOpenBusy) return false;
     drawerOpenBusy = true;
     try {
@@ -2422,6 +2445,7 @@ const App = (() => {
         drawerReceiverData = local;
         return await sendCashDrawerPulse(local.settings);
       }
+      if (localOnly) return false;
       if (state.posFeatures?.remote_drawer && navigator.onLine) {
         try { return await openRemoteCashDrawer(); }
         catch (error) { if (!local?.printers?.length) { toast(error.message, "error", "remote-drawer-failed"); return false; } }
@@ -3143,10 +3167,12 @@ const App = (() => {
 
   const assistantSay = (role, text) => {
     const thread = state.assistantThreads[state.assistantMode] || [];
-    thread.push({ role, text, local: true, created_at: new Date().toISOString() });
+    const message = { id: uid(), role, text, local: true, created_at: new Date().toISOString() };
+    thread.push(message);
     state.assistantThreads[state.assistantMode] = thread.slice(-40);
     state.assistantMessages = state.assistantThreads[state.assistantMode];
     renderAssistant();
+    return message;
   };
 
   const renderAssistant = () => {
@@ -3172,15 +3198,18 @@ const App = (() => {
     const activeThread = (state.assistantThreads[state.assistantMode] || [])
       .filter((message) => songMode || !state.adminChatActive || message.role !== "bot");
     const serverMessages = !songMode ? state.chatMessages.map((message) => ({
+      id: message.id,
       role: message.sender_type === "client" ? "user" : message.sender_type === "staff" ? "staff" : "system",
       text: message.body,
-      created_at: message.created_at
+      created_at: activeThread.find((local) => local.id === message.id)?.created_at || message.created_at
     })) : [];
     const hasJoinNotice = serverMessages.some((message) => message.role === "system" && normalizeText(message.text).includes("se unio al chat"));
     const localJoinNotice = !songMode && state.adminChatActive && state.adminChatNotice && !hasJoinNotice
       ? [{ role: "system", text: state.adminChatNotice, local: true, created_at: new Date().toISOString() }]
       : [];
-    const messages = [...serverMessages, ...activeThread, ...localJoinNotice].filter((message, index, values) => !message.local || !values.some((candidate) => !candidate.local && candidate.text === message.text && candidate.role === message.role));
+    const messages = [...serverMessages, ...activeThread, ...localJoinNotice]
+      .filter((message) => !message.local || !message.id || !serverMessages.some((candidate) => candidate.id === message.id))
+      .sort((left, right) => (Date.parse(left.created_at) || 0) - (Date.parse(right.created_at) || 0));
     const visibleMessages = messages.length
       ? messages
       : [{
@@ -3189,10 +3218,14 @@ const App = (() => {
             ? "Escribe el nombre exacto de la canción y, si lo conoces, también el artista. Enviaremos tu solicitud al equipo."
             : "Hola, soy tu agente de bar. Dime qué deseas pedir y enviaré la solicitud al mesero para que confirme contigo los detalles."
         }];
-    chat.innerHTML = visibleMessages
-      .map((message) => `<div class="assistant-message ${message.role}">${message.role === "staff" ? `<small>Administrador</small>` : ""}${escapeHTML(message.text)}</div>`)
-      .join("");
-    chat.scrollTop = chat.scrollHeight;
+    const renderSignature = JSON.stringify([state.assistantMode, visibleMessages.map((message) => [message.id, message.role, message.text])]);
+    if (renderSignature !== state.assistantRenderSignature) {
+      state.assistantRenderSignature = renderSignature;
+      chat.innerHTML = visibleMessages
+        .map((message) => `<div class="assistant-message ${message.role}">${message.role === "staff" ? `<small>Administrador</small>` : ""}${escapeHTML(message.text)}</div>`)
+        .join("");
+      chat.scrollTop = chat.scrollHeight;
+    }
     if (songMode) {
       suggestions.innerHTML = `<span class="assistant-song-hint">${icon("music", 16)} Ejemplo: Nombre de la canción — Artista</span>`;
     } else {
@@ -3378,14 +3411,36 @@ const App = (() => {
     p_auth_token: state.authToken || ""
   });
 
-  const loadChatMessages = async (sessionId = state.currentSession?.id, table = state.currentTable) => {
+  const finishClientChat = () => {
+    state.clientChatRevision = Number(state.clientChatRevision || 0) + 1;
+    state.chatMessages = [];
+    state.clientChatInitialized = true;
+    state.clientStaffMessageSoundIds.clear();
+    state.assistantThreads.bar = [{
+      role: "bot", local: true, created_at: new Date().toISOString(),
+      text: "La conversación ha finalizado. Gracias por comunicarte con nosotros. Puedes iniciar una nueva cuando lo necesites."
+    }];
+    state.assistantMessages = state.assistantThreads[state.assistantMode] || [];
+    state.adminChatActive = false;
+    state.adminChatNotice = "";
+    setPeerTyping(false, "staff");
+    renderAssistant();
+  };
+
+  const fetchChatMessages = async (sessionId, table) => {
     if (!sessionId) return false;
-    const result = await dbQuiet(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)), null);
+    const revision = Number(state.clientChatRevision || 0);
+    const result = await readRealtimeData(state.sb.rpc("listChatMessages", chatRpcPayload(sessionId, table)));
+    if (state.page === "client" && (String(state.currentSession?.id || "") !== String(sessionId) || state.currentTable?.id !== table?.id || revision !== Number(state.clientChatRevision || 0))) return false;
     const messages = Array.isArray(result) ? result : result?.messages;
     if (!Array.isArray(messages)) return false;
     const currentMessages = state.page === "client"
       ? state.chatMessages
       : state.adminChats.get(String(sessionId))?.messages || [];
+    if (state.page === "client" && !messages.length && state.adminChatActive && currentMessages.some((message) => !message.pending)) {
+      finishClientChat();
+      return true;
+    }
     const sortedMessages = mergeChatMessageList(currentMessages, messages);
     if (state.page === "client") {
       const currentSessionId = String(sessionId);
@@ -3429,10 +3484,28 @@ const App = (() => {
     return true;
   };
 
-  const persistChatMessage = async (senderType, body, { sessionId = state.currentSession?.id, table = state.currentTable } = {}) => {
+  const chatReads = new Map();
+  const loadChatMessages = (sessionId = state.currentSession?.id, table = state.currentTable) => {
+    if (!sessionId) return Promise.resolve(false);
+    const key = `${state.page}:${table?.id || ""}:${sessionId}`;
+    const active = chatReads.get(key);
+    if (active) { active.pending = true; return active.promise; }
+    const read = { pending: false, promise: null };
+    read.promise = fetchChatMessages(sessionId, table).finally(() => {
+      chatReads.delete(key);
+      const stillActive = state.page === "client"
+        ? state.currentSession?.id === sessionId && state.currentTable?.id === table?.id
+        : state.adminChats.has(String(sessionId));
+      if (read.pending && stillActive) window.setTimeout(() => void loadChatMessages(sessionId, table), 0);
+    });
+    chatReads.set(key, read);
+    return read.promise;
+  };
+
+  const persistChatMessage = async (senderType, body, { sessionId = state.currentSession?.id, table = state.currentTable, messageId: localMessageId } = {}) => {
     const clean = String(body || "").trim().replace(/\s+/g, " ").slice(0, 600);
     if (!clean || !sessionId) return null;
-    const messageId = uid();
+    const messageId = localMessageId || uid();
     const payload = {
       ...chatRpcPayload(sessionId, table),
       p_message_id: messageId,
@@ -3585,7 +3658,10 @@ const App = (() => {
       .subscribe((status) => {
         chat.connected = status === "SUBSCRIBED";
         renderAdminChat(chat.sessionId);
-        if (chat.connected) broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice }, chat.sessionId);
+        if (chat.connected) {
+          broadcastChatEvent("admin-presence", { active: true, role: "staff", notice: joinNotice }, chat.sessionId);
+          void loadChatMessages(chat.sessionId, chat.table);
+        }
       });
     window.clearInterval(chat.pollTimer);
     chat.pollTimer = window.setInterval(() => void loadChatMessages(chat.sessionId, chat.table), CHAT_SYNC_INTERVAL_MS);
@@ -3607,8 +3683,7 @@ const App = (() => {
       chat.element?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
       chat.element?.querySelector('input[name="message"]')?.focus();
       await loadChatMessages(sessionId, chat.table);
-      acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
-      return;
+      return true;
     }
     chat = { sessionId, tableId: request.table_id, table, requestIds: new Set(ids), messages: [], channel: null, pollTimer: null, element: null, connected: false, peerTyping: false, closing: false, confirming: false, minimized: false, initialized: false, unreadCount: 0, unreadBoundaryId: "" };
     state.adminChats.set(sessionId, chat);
@@ -3620,7 +3695,7 @@ const App = (() => {
     const joinAlreadyRegistered = chat.messages.some((message) => message.sender_type === "system" && normalizeText(message.body).includes("se unio al chat"));
     if (!joinAlreadyRegistered) void persistChatMessage("system", joinNotice, { sessionId: request.session_id, table });
     chat.element?.querySelector('input[name="message"]')?.focus();
-    acknowledgeRequestOptimistically(ids, { status: "acknowledged", acknowledged_by_user_id: state.currentUser?.id || null, acknowledged_at: new Date().toISOString() }, "No se pudo marcar el chat como atendido.");
+    return true;
   };
 
   const finishAdminChat = async (sessionId) => {
@@ -3636,12 +3711,16 @@ const App = (() => {
         toast("No se pudo finalizar el chat. Intenta nuevamente.", "error", `chat-close:${targetSessionId}`);
         return;
       }
-      const relatedIds = state.requests
-        .filter((request) => String(request.session_id || "") === targetSessionId && requestKind(request) === "chat")
-        .map((request) => request.id);
-      const requestIds = Array.from(new Set([...chat.requestIds, ...relatedIds]));
+      const knownRequests = new Map([...readPendingAdminRequests(), ...state.requests].map((request) => [request.id, request]));
+      const requestIds = [...chat.requestIds].filter((id) => {
+        const request = knownRequests.get(id);
+        return request && String(request.session_id || "") === targetSessionId && requestKind(request) === "chat";
+      });
       await broadcastChatEvent("chat-closed", {}, targetSessionId);
       state.requests = state.requests.map((request) => requestIds.includes(request.id) ? { ...request, status: "resolved" } : request);
+      rememberCompletedAdminRequests(requestIds);
+      persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
+      renderAdminLive();
       if (chat.channel) state.sb.removeChannel(chat.channel);
       window.clearInterval(chat.pollTimer);
       window.clearTimeout(state.adminChatTypingTimers.get(targetSessionId));
@@ -3713,11 +3792,11 @@ const App = (() => {
     const text = message.trim();
     if (!text) return;
     if (songTurnCount() >= 5) { showSongLimitNotice(); return; }
-    assistantSay("user", text);
+    const localMessage = assistantSay("user", text);
     if (state.currentTable) {
       const session = state.currentSession || await ensureOpenSession(state.currentTable.id);
       if (session) {
-        void persistChatMessage("client", text, { sessionId: session.id, table: state.currentTable }).then((saved) => {
+        void persistChatMessage("client", text, { sessionId: session.id, table: state.currentTable, messageId: localMessage?.id }).then((saved) => {
           if (saved) broadcastChatEvent("chat-refresh");
         });
         if (!state.adminChatActive) {
@@ -3992,31 +4071,52 @@ const App = (() => {
   };
 
   const subscribeClient = () => {
-    if (!state.currentSession) return;
+    if (!state.currentTable || !state.currentSession) {
+      clearInterval(state.clientPollTimer);
+      clearInterval(state.chatPollTimer);
+      window.clearTimeout(state.clientReconnectTimer);
+      const previous = state.clientChannel;
+      state.clientChannel = null;
+      state.clientSubscribedTableId = "";
+      state.clientLiveRefresh = null;
+      if (previous) state.sb.removeChannel(previous);
+      return;
+    }
+    const tableId = state.currentTable.id;
     const sessionId = String(state.currentSession.id);
     if (state.clientChatSoundSessionId !== sessionId) {
       state.clientChatSoundSessionId = sessionId;
       state.clientChatInitialized = false;
       state.clientStaffMessageSoundIds.clear();
     }
+    if (state.clientChannel && state.clientSubscribedTableId === tableId && !state.clientRealtimeNeedsReconnect) return;
     clearInterval(state.clientPollTimer);
-    if (state.clientChannel) state.sb.removeChannel(state.clientChannel);
+    window.clearTimeout(state.clientReconnectTimer);
+    const previous = state.clientChannel;
+    state.clientChannel = null;
+    if (previous) state.sb.removeChannel(previous);
     clearInterval(state.chatPollTimer);
+    let refreshPending = false;
     const refresh = async () => {
-      if (state.clientSyncBusy || !state.currentSession) return;
+      if (state.currentTable?.id !== tableId || !state.currentSession) return;
+      void loadChatMessages();
+      if (state.clientSyncBusy) { refreshPending = true; return; }
       state.clientSyncBusy = true;
       try {
         if (await loadClientSnapshot()) {
           renderAccount();
           renderBillChat();
         }
-        await loadChatMessages();
       } finally {
         state.clientSyncBusy = false;
+        if (refreshPending) { refreshPending = false; window.setTimeout(() => void refresh(), 0); }
       }
     };
-    state.clientChannel = state.sb
-      .channel(`table:${state.currentTable.id}`, { config: { broadcast: { self: false }, private: false } })
+    state.clientLiveRefresh = refresh;
+    state.clientSubscribedTableId = tableId;
+    state.clientRealtimeNeedsReconnect = false;
+    const channel = state.sb
+      .channel(`table:${tableId}`, { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refresh)
       .on("broadcast", { event: "chat-refresh" }, () => void loadChatMessages())
       .on("postgres_changes", { event: "*", schema: "public", table: "business_settings" }, () => void refreshCoreNow())
@@ -4027,6 +4127,7 @@ const App = (() => {
         if (String(payload?.sessionId) === String(state.currentSession?.id) && payload?.role === "staff") setPeerTyping(payload.typing, "staff");
       })
       .on("broadcast", { event: "admin-presence" }, ({ payload }) => {
+        if (payload?.sessionId && String(payload.sessionId) !== String(state.currentSession?.id)) return;
         if (payload?.active) {
           state.adminChatActive = true;
           state.adminChatNotice = payload.notice || "El administrador se unió al chat.";
@@ -4035,16 +4136,25 @@ const App = (() => {
           renderAssistant();
         }
       })
-      .on("broadcast", { event: "chat-closed" }, () => {
-        state.chatMessages = [];
-        state.clientChatInitialized = false;
-        state.clientStaffMessageSoundIds.clear();
-        state.assistantThreads.bar = [];
-        state.adminChatActive = false;
-        state.adminChatNotice = "";
-        assistantSay("bot", "La conversacion fue finalizada. Puedes iniciar una nueva cuando lo necesites.");
-      })
-      .subscribe();
+      .on("broadcast", { event: "chat-closed" }, ({ payload } = {}) => {
+        if (payload?.sessionId && String(payload.sessionId) !== String(state.currentSession?.id)) return;
+        finishClientChat();
+      });
+    state.clientChannel = channel;
+    channel.subscribe((status) => {
+      if (state.clientChannel !== channel || state.currentTable?.id !== tableId) return;
+      if (status === "SUBSCRIBED") {
+        state.clientRealtimeNeedsReconnect = false;
+        window.clearTimeout(state.clientReconnectTimer);
+        void refresh();
+      } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
+        state.clientRealtimeNeedsReconnect = true;
+        window.clearTimeout(state.clientReconnectTimer);
+        state.clientReconnectTimer = window.setTimeout(() => {
+          if (state.clientChannel === channel && state.currentTable?.id === tableId) subscribeClient();
+        }, 3000);
+      }
+    });
     state.clientPollTimer = setInterval(refresh, SYNC_INTERVAL_MS);
     state.chatPollTimer = setInterval(() => void loadChatMessages(), CHAT_SYNC_INTERVAL_MS);
     void loadChatMessages();
@@ -4084,7 +4194,7 @@ const App = (() => {
     bindClient();
     state.adminBroadcastChannel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
-      .on("broadcast", { event: "refresh" }, () => void refreshClientPosData())
+      .on("broadcast", { event: "refresh" }, () => { void state.clientLiveRefresh?.(); void refreshClientPosData(); })
       .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
       .subscribe();
     subscribeClient();
@@ -4097,6 +4207,10 @@ const App = (() => {
 
   const mergeOptimisticRequests = (requests = []) => requests.map((request) => {
     const optimistic = state.optimisticRequestStates.get(request.id);
+    if (optimistic && (request.status === "acknowledged" || request.acknowledged_at)) {
+      state.optimisticRequestStates.delete(request.id);
+      return request;
+    }
     return optimistic ? { ...request, ...optimistic } : request;
   });
 
@@ -4625,6 +4739,44 @@ const App = (() => {
     controller.postMessage({ type: "SET_SCOPED_ADMIN_READ", enabled }, [channel.port2]);
   });
 
+  const pendingAdminRequestsStorageKey = () => `napoles_pending_admin_requests_v1:${SUPABASE_CONFIG.url}`;
+
+  const rememberCompletedAdminRequests = (ids = []) => {
+    const completed = state.completedAdminRequestIds ||= new Set();
+    const key = `${pendingAdminRequestsStorageKey()}:completed`;
+    try {
+      const stored = JSON.parse(localStorage.getItem(key) || "[]");
+      if (Array.isArray(stored)) stored.filter((id) => typeof id === "string").forEach((id) => completed.add(id));
+    } catch (_) { /* La memoria conserva las confirmaciones de esta pantalla. */ }
+    let changed = false;
+    ids.forEach((id) => {
+      if (!completed.has(id)) { completed.add(id); changed = true; }
+    });
+    if (changed) {
+      try { localStorage.setItem(key, JSON.stringify([...completed])); } catch (_) { /* La confirmación remota sigue siendo válida. */ }
+    }
+    return completed;
+  };
+
+  const readPendingAdminRequests = () => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(pendingAdminRequestsStorageKey()) || "[]");
+      const completed = rememberCompletedAdminRequests();
+      return Array.isArray(stored) ? stored.filter((request) => request?.id && request.status === "pending" && !completed.has(request.id)) : [];
+    } catch (_) { return []; }
+  };
+
+  const persistPendingAdminRequests = (requests) => {
+    try {
+      const unique = [...new Map(requests.map((request) => [request.id, request])).values()];
+      const completed = rememberCompletedAdminRequests();
+      localStorage.setItem(pendingAdminRequestsStorageKey(), JSON.stringify(unique.filter((request) => request.status === "pending" && !completed.has(request.id))));
+    } catch (_) { /* La cola del servidor y la memoria siguen conservando las solicitudes. */ }
+  };
+
+  const compareRequestArrival = (a, b) =>
+    (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0) || String(a.id).localeCompare(String(b.id));
+
   const loadAdminData = async () => {
     const cachedSnapshot = readOfflineAdminSnapshot();
     const pendingScope = pendingAdminReadScope(cachedSnapshot, await getOfflineSyncStatus());
@@ -4634,7 +4786,8 @@ const App = (() => {
         state.optimisticSessionStates.set(entry.id, { mode: "remove", session: null, retainUntil: entry.retainUntil });
       }
     });
-    const remoteSnapshot = await dbQuiet(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }), null);
+    const remoteSnapshot = await readRealtimeData(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }));
+    if (remoteSnapshot && (!Array.isArray(remoteSnapshot.requests) || !Array.isArray(remoteSnapshot.sessions))) return false;
     const snapshot = remoteSnapshot ? mergePendingAdminRows(remoteSnapshot, cachedSnapshot, pendingScope) : null;
     if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
@@ -4642,13 +4795,43 @@ const App = (() => {
       state.syncFresh.operational = false;
       // Una RPC fallida y un GET vacío por RLS no prueban que se borraron las cuentas.
       if (cachedSnapshot && !state.sessions.length && !state.requests.length) {
-        state.requests = mergeOptimisticRequests(cachedSnapshot.requests || []);
+        const completed = rememberCompletedAdminRequests();
+        state.requests = mergeOptimisticRequests((cachedSnapshot.requests || []).filter((request) => request.status !== "pending" || !completed.has(request.id)));
         state.sessions = mergeOptimisticSessions(cachedSnapshot.sessions || []);
       }
       return false;
     }
     state.syncFresh.operational = !pendingScope.sessionIds.size && !pendingScope.requestIds.size;
-    const requests = mergeOptimisticRequests(snapshot.requests || []);
+    if (!Array.isArray(snapshot.requests) || !Array.isArray(snapshot.sessions)) return false;
+    const livePending = new Set(state.requests.filter((request) => request.status === "pending").map((request) => request.id));
+    const knownPending = new Map([...readPendingAdminRequests(), ...state.requests.filter((request) => request.status === "pending")].map((request) => [request.id, request]));
+    const incoming = new Map(snapshot.requests.map((request) => [request.id, request]));
+    // Una omisión del snapshot no confirma que alguien haya aceptado la solicitud.
+    const missingIds = [...knownPending.keys()].filter((id) => !pendingScope.requestIds.has(id) && (!incoming.has(id) || !livePending.has(id)));
+    for (let offset = 0; offset < missingIds.length; offset += 100) {
+      const confirmed = await dbQuiet(state.sb.from("service_requests").select("*").in("id", missingIds.slice(offset, offset + 100)), null);
+      if (Array.isArray(confirmed)) confirmed.forEach((request) => incoming.set(request.id, request));
+    }
+    // Al recargar, la caché sola no prueba que una solicitud siga pendiente.
+    knownPending.forEach((request, id) => {
+      if (!livePending.has(id) && !incoming.has(id)) knownPending.delete(id);
+    });
+    const completed = rememberCompletedAdminRequests([...incoming.values()].filter((request) => ["acknowledged", "resolved"].includes(request.status) || request.acknowledged_at).map((request) => request.id));
+    completed.forEach((id) => knownPending.delete(id));
+    incoming.forEach((request, id) => {
+      if (request.status === "pending" && completed.has(id)) return;
+      const previous = knownPending.get(id);
+      const accepted = ["acknowledged", "resolved"].includes(request.status) || Boolean(request.acknowledged_at);
+      knownPending.set(id, {
+        ...previous, ...request,
+        restaurant_tables: request.restaurant_tables || previous?.restaurant_tables,
+        status: previous && !accepted ? "pending" : request.status
+      });
+    });
+    const merged = [...knownPending.values()].sort(compareRequestArrival);
+    const requests = mergeOptimisticRequests(merged);
+    const inFlightPending = merged.filter((request) => request.status === "pending" && state.optimisticRequestStates.has(request.id));
+    persistPendingAdminRequests([...requests, ...inFlightPending]);
     const sessions = mergeOptimisticSessions(snapshot.sessions || []);
     const signature = JSON.stringify([requests,sessions]);
     if (signature === state.adminSnapshotSignature) return false;
@@ -4878,7 +5061,7 @@ const App = (() => {
         if (wasVisible) setTableConsumptionPreviewVisible(true);
       }
       toast("Abono guardado: " + money(amount) + ". Saldo: " + money(sessionBalance(session)), "ok", "abono:" + id);
-      if (form.payment_method.value === "cash") void openCashDrawer();
+      if (form.payment_method.value === "cash") void openCashDrawer({ localOnly: true });
     } catch (error) {
       toast(error?.message || "No se pudo confirmar el abono. Revisa el registro antes de volver a intentarlo.", "error", "abono-failed");
     } finally { delete form.dataset.saving; button.disabled = false; }
@@ -4912,10 +5095,15 @@ const App = (() => {
     const box = $("#clientQueueStatus"); if (!box) return;
     const rows = state.clientQueuePositions || [];
     const groups = new Map(); rows.forEach((row) => groups.set(row.kind, row));
-    box.hidden = !groups.size;
+    const attending = (state.clientRequests || []).filter((request) =>
+      request.status === "acknowledged" && request.table_id === state.currentTable?.id
+      && request.session_id === state.currentSession?.id && requestKind(request) !== "chat");
+    box.hidden = !groups.size && !attending.length;
     box.innerHTML = [...groups].map(([kind,row]) => '<div><strong>' + (kind === "song" ? "Canciones" : "Solicitudes")
       + ': turno ' + Number(row.position) + '</strong><small>' + (Number(row.position) === 1 ? 'Tu mesa es la siguiente en el orden de llegada.' : 'Hay ' + (Number(row.position)-1) + ' turno(s) antes del tuyo.')
       + (kind === "song" ? ' · ' + rows.filter((entry) => entry.kind === "song").length + '/5 canciones en este turno.' : '') + '</small></div>').join('');
+    const labels = { waiter: "de mesero", song: "de canción", bill: "de cuenta", other: "de atención" };
+    box.innerHTML += attending.map((request) => `<div data-attending-request="${escapeHTML(request.id)}"><strong>Te estamos atendiendo</strong><small>Tu solicitud ${labels[requestKind(request)] || "de atención"} está siendo atendida en este momento.</small></div>`).join("");
   };
   const bindAccountFeatures = () => {
     $("#abonoForm")?.addEventListener("submit", (event) => { event.preventDefault(); void recordAbono(event.currentTarget); });
@@ -4966,19 +5154,9 @@ const App = (() => {
     });
 
   const groupedActiveRequests = () => {
-    const groups = new Map();
-    [...activeRequests()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id))).forEach((request) => {
-      const kind = requestKind(request);
-      const key = `${request.table_id}:${request.session_id || "no-session"}:${kind}`;
-      if (!groups.has(key)) {
-        groups.set(key, { ...request, kind, request_ids: [], count: 0, latest_message: request.message || "" });
-      }
-      const group = groups.get(key);
-      group.request_ids.push(request.id);
-      group.count += 1;
-      if (kind === "song" && group.count > 1) { group.message += "\n" + (request.message || ""); group.latest_message = group.message; }
-    });
-    return Array.from(groups.values());
+    return [...activeRequests()].sort((left, right) => compareRequestArrival(right, left)).map((request) => ({
+      ...request, kind: requestKind(request), request_ids: [request.id], count: 1, latest_message: request.message || ""
+    }));
   };
 
   const renderAlerts = () => {
@@ -5010,13 +5188,7 @@ const App = (() => {
                   <p>${prettyDateTime(request.created_at)}</p>
                 </div>
                 ${request.count > 1 ? `<strong class="alert-count" aria-label="${request.count} llamados">${request.count}</strong>` : ""}
-                ${
-                  request.request_type === "bill"
-                    ? `<button class="primary" data-send-bill="${request.request_ids.join(",")}">${icon("send", 17)} Enviar cuenta</button>`
-                    : request.kind === "chat"
-                      ? `<button class="primary" data-open-chat="${request.request_ids.join(",")}">${icon("messages-square", 17)} Abrir chat</button>`
-                      : `<button class="primary" data-accept-request="${request.request_ids.join(",")}">${icon("check", 17)} Aceptar</button>`
-                }
+                <button class="primary" data-accept-request="${request.request_ids.join(",")}">${icon("check", 17)} Aceptar</button>
               </article>
             `
       )
@@ -7131,7 +7303,7 @@ const App = (() => {
         ${items.length ? `<button class="ghost small" type="button" data-add-manual="${session.id}">${icon("plus", 15)} Consumo</button>` : `<button class="ghost small danger-text" type="button" data-close-session="${session.id}">${icon("door-open", 15)} Liberar mesa</button>`}
         ${session.sale_channel === "walk_in" || !session.table_id ? "" : `<button class="ghost small" type="button" data-move-session="${session.id}">${icon("replace", 15)} Cambiar mesa</button>`}
         ${items.length ? `<button class="ghost small" type="button" data-print-session="${session.id}">${icon("printer", 15)} Imprimir pre-cuenta</button>` : ""}
-        ${billRequest ? `<button class="ghost small" type="button" data-send-bill="${billRequest.id}">${icon("send", 15)} ${billRequest.status === "acknowledged" ? "Reenviar" : "Enviar cuenta"}</button>` : ""}
+        ${billRequest ? `<button class="ghost small" type="button" data-send-bill="${billRequest.id}">${icon("send", 15)} ${billRequest.status === "acknowledged" ? "Reenviar" : "Aceptar"}</button>` : ""}
         ${items.length ? `<button class="primary small invoice-close" type="button" data-charge-session="${session.id}">${icon("badge-dollar-sign", 18)} Cobrar y facturar</button>` : ""}
       </div>`;
     refreshIcons();
@@ -7625,18 +7797,28 @@ const App = (() => {
         persist,
         4
       );
-      ids.forEach((id) => state.optimisticRequestStates.delete(id));
-      if (!saved || !saved.length) {
-        const originalMap = new Map(originals.map((request) => [request.id, request]));
-        state.requests = state.requests.map((request) => originalMap.get(request.id) || request);
-        renderAdminLive();
-        toast(failureMessage, "error", `request-write-failed:${ids.join(":")}`);
-        return;
-      }
-      const savedMap = new Map(saved.map((request) => [request.id, request]));
-      state.requests = state.requests.map((request) => savedMap.has(request.id)
-        ? { ...request, ...savedMap.get(request.id), restaurant_tables: request.restaurant_tables }
-        : request);
+      const savedMap = new Map((Array.isArray(saved) ? saved : []).map((request) => [request.id, request]));
+      const restored = new Map(state.requests.map((request) => [request.id, request]));
+      const completed = rememberCompletedAdminRequests();
+      originals.forEach((request) => {
+        const confirmed = savedMap.get(request.id);
+        if (confirmed?.status === "acknowledged" || confirmed?.acknowledged_at) {
+          // Mantener la aceptación hasta que el snapshot también la confirme.
+          state.optimisticRequestStates.set(request.id, { ...optimistic, ...confirmed });
+          restored.set(request.id, { ...request, ...confirmed, restaurant_tables: request.restaurant_tables });
+        } else if (completed.has(request.id)) {
+          state.optimisticRequestStates.delete(request.id);
+          if (restored.get(request.id)?.status === "pending") restored.delete(request.id);
+        } else {
+          state.optimisticRequestStates.delete(request.id);
+          restored.set(request.id, request);
+        }
+      });
+      state.requests = [...restored.values()].sort(compareRequestArrival);
+      const confirmedIds = new Set(originals.filter((request) => completed.has(request.id) || savedMap.get(request.id)?.status === "acknowledged" || savedMap.get(request.id)?.acknowledged_at).map((request) => request.id));
+      rememberCompletedAdminRequests([...confirmedIds]);
+      persistPendingAdminRequests([...readPendingAdminRequests().filter((request) => !confirmedIds.has(request.id)), ...state.requests.filter((request) => request.status === "pending")]);
+      if (confirmedIds.size !== originals.length) toast(failureMessage, "error", `request-write-failed:${ids.join(":")}`);
       renderAdminLive();
     })();
   };
@@ -7644,6 +7826,13 @@ const App = (() => {
   const acceptRequest = async (ids) => {
     stopAlarm();
     const idList = String(ids || "").split(",").filter(Boolean);
+    const request = state.requests.find((entry) => idList.includes(entry.id));
+    if (!request || idList.some((id) => state.optimisticRequestStates.has(id))) return;
+    if (request.request_type === "bill") {
+      await sendBillToClient(ids);
+      return;
+    }
+    if (requestKind(request) === "chat" && !await openAdminChat(ids)) return;
     const sessionIds = [...new Set(state.requests.filter((request) => idList.includes(request.id)).map((request) => request.session_id).filter(Boolean))];
     if (sessionIds.length && state.currentUser?.id) {
       state.sessions = state.sessions.map((session) => {
@@ -7789,6 +7978,7 @@ const App = (() => {
     }
     const originalSessions = state.sessions;
     const originalRequests = state.requests;
+    const belongsToClosingTable = (request) => session.table_id ? request.table_id === session.table_id : request.session_id === id;
     state.optimisticSessionStates.set(id, {
       mode: "remove",
       session,
@@ -7797,7 +7987,7 @@ const App = (() => {
       retainUntil: Date.now() + 30_000
     });
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
-    state.requests = state.requests.map((request) => request.session_id === id ? { ...request, status: "resolved" } : request);
+    state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
     renderAdminLive();
     const closedAt = new Date().toISOString();
     const closure = { status: "closed", closed_at: closedAt, subtotal: totals.subtotal,
@@ -7819,7 +8009,9 @@ const App = (() => {
     if (!saved) {
       state.optimisticSessionStates.delete(id);
       state.sessions = originalSessions;
-      state.requests = originalRequests;
+      const originalMap = new Map(originalRequests.map((request) => [request.id, request]));
+      state.requests = state.requests.map((request) => belongsToClosingTable(request) && originalMap.has(request.id) ? originalMap.get(request.id) : request);
+      persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
       renderAdmin();
       toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
       return null;
@@ -7829,7 +8021,10 @@ const App = (() => {
       session: { ...session, ...saved },
       retainUntil: Date.now() + 30_000
     });
-    await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq("session_id", id), null);
+    await dbQuiet(state.sb.from("service_requests").update({ status: "resolved" }).eq(session.table_id ? "table_id" : "session_id", session.table_id || id), null);
+    state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
+    rememberCompletedAdminRequests([...originalRequests, ...readPendingAdminRequests(), ...state.requests].filter(belongsToClosingTable).map((request) => request.id));
+    persistPendingAdminRequests([...readPendingAdminRequests().filter((request) => !belongsToClosingTable(request)), ...state.requests]);
     return { session, saved, totals };
   };
 
@@ -8374,9 +8569,9 @@ const App = (() => {
     renderIncomeReport();
     renderTips();
     buttons.forEach((button) => { button.disabled = false; });
-    // Toda venta guardada localmente abre la caja, con o sin recibo.
+    // Toda venta guardada localmente abre la caja de este equipo, con o sin recibo.
     // La orden usa el controlador existente y no espera la sincronizacion.
-    void openCashDrawer();
+    void openCashDrawer({ localOnly: true });
     if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;
@@ -10188,7 +10383,10 @@ const App = (() => {
         });
       })
       .subscribe((status) => {
-        if (status === "SUBSCRIBED") setRealtimeStatus("En vivo", "live");
+        if (status === "SUBSCRIBED") {
+          setRealtimeStatus("En vivo", "live");
+          void refreshAdminNow();
+        }
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           setRealtimeStatus("Respaldo cada 1,5 segundos", "fallback");
         }
@@ -11156,6 +11354,19 @@ const App = (() => {
     void refreshAdminNow();
   };
 
+  const resumeRealtimeReception = () => {
+    if (document.hidden) return;
+    if (state.page === "client" && state.currentTable) {
+      subscribeClient();
+      void state.clientLiveRefresh?.();
+      if (!state.currentSession) void hydrateSelectedTable(state.currentTable.id);
+    }
+    if (state.page === "admin" && state.authToken) {
+      void refreshAdminNow();
+      state.adminChats.forEach((chat) => void loadChatMessages(chat.sessionId, chat.table));
+    }
+  };
+
   const init = async () => {
     document.addEventListener("wheel", (event) => {
       const input = event.target instanceof Element ? event.target.closest('input[type="number"]') : null;
@@ -11232,6 +11443,10 @@ const App = (() => {
       refreshIcons();
       return;
     }
+    window.addEventListener("online", resumeRealtimeReception);
+    window.addEventListener("focus", resumeRealtimeReception);
+    window.addEventListener("pageshow", resumeRealtimeReception);
+    document.addEventListener("visibilitychange", resumeRealtimeReception);
     if (state.page === "client") {
       window.addEventListener("online", () => {
         flushRequestOutbox();

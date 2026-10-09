@@ -13,13 +13,15 @@ const section = (start, end) => {
 };
 
 const setup = ({ method = 'cash', validPayment = true, validStock = true, savedLocally = true,
-  received = 100, duplicate = false, drawerAccepted = true, beforeDurableSave = null } = {}) => {
+  received = 100, duplicate = false, drawerAccepted = true, beforeDurableSave = null, device = 'bridge', online = true } = {}) => {
   const calls = [];
   const session = { id: 'session-1', table_id: 'table-1', session_items: [
     { id: 'line-1', menu_item_id: 'product-1', item_name: 'Producto', quantity: 1, unit_price: 100, status: 'served' }
   ] };
   const state = { paymentProcessing: false, sessions: [session], invoiceHistory: duplicate ? [{ sessionId: session.id }] : [],
     authToken: 'valid-token', activePaymentTotal: 100, inventoryMeta: {}, localSupabaseWrites: 0, currentUser: { id: 'staff-1' } };
+  state.posFeatures = { remote_drawer: true };
+  state.sb = { rpc: async (name) => { calls.push(name); return { data: { command: { id: 'remote-command', status: 'accepted' } } }; } };
   const buttons = [{ value: 'save', disabled: false }, { value: 'print', disabled: false }];
   const form = { session_id: { value: session.id }, cash_received: { value: received, focus() {} },
     payment_reference: { value: '' }, querySelector: () => buttons[0] };
@@ -37,11 +39,15 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
     $$: () => buttons,
     window: {
       open: () => { calls.push('popup'); return popup; },
-      posCashDrawer: { open: async (request) => {
+      posCashDrawer: device === 'bridge' ? { open: async (request) => {
         assert.equal(request.source, 'tienda-napoles-pos');
         calls.push('drawer'); return drawerAccepted;
-      } }
+      } } : null
     },
+    navigator: { userAgent: device === 'mobile' ? 'Android' : 'Windows', onLine: online }, setTimeout: callback => callback(),
+    cashDrawerRequest: async () => { if (device === 'controller') return { settings: { printer: 'POS' }, printers: ['POS'] }; throw Error('No local drawer'); },
+    sendCashDrawerPulse: async () => { calls.push('drawer'); return true; },
+    dbQuiet: async query => (await query).data,
     toast: () => {}, tipsEnabled: () => false,
     paymentFromForm: () => validPayment ? { method, payments: [{ method, amount: state.activePaymentTotal }] } : null,
     currencyInputNumber: (input) => Number(input?.value || 0), integerMoney: (value) => Number(value),
@@ -66,7 +72,7 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
   vm.runInContext(section("  const sessionPayments =", "  const abonoRowsHtml ="), context);
   vm.runInContext(section('  const openLocalCashDrawer =', '  const getAppsScriptUrl =')
     + section('  const bindPaymentConfirmShortcut =', '  const renderConsumptionSelection =')
-    + ';globalThis.api = {processPayment, bindPaymentConfirmShortcut};', context);
+    + ';globalThis.api = {processPayment, bindPaymentConfirmShortcut, openCashDrawer};', context);
   return { context, state, form, buttons, dialog, listeners, calls, finishClose };
 };
 
@@ -90,6 +96,26 @@ for (const method of ['cash', 'transfer', 'breb', 'mixed']) {
     });
   }
 }
+
+for (const device of ['mobile', 'desktop', 'controller']) for (const online of [true, false]) {
+  test(`cobro desde ${device}, online=${online}: abre exclusivamente la caja local`, async () => {
+    const app = setup({ device, online });
+    const saving = app.context.api.processPayment(app.form, { value: 'print' });
+    await new Promise(setImmediate);
+    assert.equal(app.calls.filter(call => call === 'drawer').length, device === 'controller' ? 1 : 0);
+    assert.equal(app.calls.includes('request_pos_drawer'), false);
+    assert.equal(app.calls.filter(call => call === 'print').length, 1);
+    assert.equal(app.state.invoiceHistory.length, 1);
+    app.finishClose({ saved: { id: 'session-1' } });
+    await saving;
+  });
+}
+
+test('la apertura manual explícita conserva su comportamiento', async () => {
+  const app = setup({ device: 'mobile' });
+  assert.equal(await app.context.api.openCashDrawer(), true);
+  assert.equal(app.calls.filter(call => call === 'request_pos_drawer').length, 1);
+});
 
 for (const options of [{ validPayment: false }, { validStock: false }, { received: 99 }, { savedLocally: false }, { duplicate: true }]) {
   test(`un cobro rechazado no abre la caja ni imprime: ${JSON.stringify(options)}`, async () => {

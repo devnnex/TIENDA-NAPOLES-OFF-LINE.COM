@@ -1,17 +1,17 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 const source=fs.readFileSync(path.join(__dirname,'../app.js'),'utf8');
-const from=source.indexOf('  const loadAdminData ='),to=source.indexOf(source.includes('  const setScopedCoreRead =')?'  const setScopedCoreRead =':'  const mergePendingCoreData =',from);
+const from=source.indexOf('  const pendingAdminRequestsStorageKey ='),to=source.indexOf(source.includes('  const setScopedCoreRead =')?'  const setScopedCoreRead =':'  const mergePendingCoreData =',from);
 assert.ok(from>0&&to>from);
 const account={id:'account-a',status:'open',session_items:[{id:'item-a',quantity:2,unit_price:10000,item_name:'Anterior'}],session_payments:[]};
 let remote=null,restReads=0;
 const cached={sessions:[account],requests:[]};
 const state={authToken:'valid',sessions:[account],requests:[],syncFresh:{},optimisticSessionStates:new Map(),sb:{rpc:async()=>({data:remote}),from:()=>{restReads++;throw Error('Un GET vacío no reemplaza una RPC autorizada.');}}};
-const context=vm.createContext({state,Date,navigator:{onLine:true},
+const context=vm.createContext({state,Date,navigator:{onLine:true},SUPABASE_CONFIG:{url:'test'},localStorage:{getItem:()=>null,setItem(){}},
  readOfflineAdminSnapshot:()=>cached,getOfflineSyncStatus:async()=>({blockingRecords:[]}),
  pendingAdminReadScope:()=>({safe:true,sessionIds:new Set(),requestIds:new Set(),closedIds:new Set()}),
  setScopedAdminRead:async()=>true,mergePendingAdminRows:s=>s,
  mergeOptimisticRequests:r=>r,mergeOptimisticSessions:r=>r,persistOfflineAdminSnapshot(){},
- dbQuiet:async q=>(await q)?.data});
+ dbQuiet:async q=>(await q)?.data,readRealtimeData:async q=>(await q)?.data});
 vm.runInContext(source.slice(from,to)+';globalThis.read=loadAdminData;',context);
 (async()=>{
  assert.equal(await context.read(),false);

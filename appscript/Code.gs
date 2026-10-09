@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.11.0",
+  version: "2.12.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -18,6 +18,7 @@ var APP = {
   },
   sheets: {
     config: "Configuracion",
+    shifts: "Turnos_Caja",
     inventory: "Inventario",
     audit: "Auditoria",
     sales: "Ventas",
@@ -29,6 +30,7 @@ var APP = {
 };
 
 var HEADERS = {
+  shifts: ["operation_id", "shift_id", "fecha_turno", "inicio_minutos", "cierre_minutos", "base_inicial", "base_actual", "version", "creado_en", "actualizado_en", "usuario", "operacion", "importe"],
   inventory: [
     "product_id", "siglas", "producto", "categoria", "unidad", "costo_unitario",
     "precio_venta", "existencia", "stock_minimo", "disponible", "actualizado_en",
@@ -153,6 +155,14 @@ function apiRequest(payloadText) {
     else if (request.action === "get_inventory_movements") {
       requireSection_(user, "movements");
       result = getInventoryMovements_(payload.limit, payload.cursor, payload.revision);
+    }
+    else if (request.action === "get_sales_shift") {
+      requireSection_(user, "income");
+      result = getSalesShift_();
+    }
+    else if (request.action === "save_sales_shift") {
+      requireSection_(user, "income");
+      result = saveSalesShift_(payload, user);
     }
     else if (request.action === "get_income_report") {
       requireSection_(user, "income");
@@ -292,6 +302,7 @@ function ensureAllSheets_(spreadsheet) {
   ensureSheet_(spreadsheet, APP.sheets.config, ["Clave", "Valor", "Descripcion"]);
   ensureSheet_(spreadsheet, APP.sheets.inventory, HEADERS.inventory);
   ensureSheet_(spreadsheet, APP.sheets.audit, HEADERS.audit);
+  ensureSheet_(spreadsheet, APP.sheets.shifts, HEADERS.shifts);
   ensureSheet_(spreadsheet, APP.sheets.sales, HEADERS.sales);
   ensureSheet_(spreadsheet, APP.sheets.details, HEADERS.details);
   ensureSheet_(spreadsheet, APP.sheets.payments, HEADERS.payments);
@@ -399,6 +410,61 @@ function updateInventoryMovementCost_(movementId, unitCost, user) {
   });
 }
 
+function salesShiftFromRow_(row) {
+  if (!row || !row[1]) return null;
+  return { id: String(row[1]), date: row[2] instanceof Date ? Utilities.formatDate(row[2], "America/Bogota", "yyyy-MM-dd") : String(row[2]),
+    startMinutes: Number(row[3]), endMinutes: Number(row[4]), initialBase: Number(row[5]), base: Number(row[6]), version: Number(row[7]),
+    createdAt: row[8] instanceof Date ? row[8].toISOString() : String(row[8]), updatedAt: row[9] instanceof Date ? row[9].toISOString() : String(row[9]), updatedBy: String(row[10]) };
+}
+
+function getSalesShift_() {
+  var sheet = getSpreadsheet_().getSheetByName(APP.sheets.shifts);
+  return { shift: sheet && sheet.getLastRow() > 1 ? salesShiftFromRow_(sheet.getRange(sheet.getLastRow(), 1, 1, HEADERS.shifts.length).getValues()[0]) : null };
+}
+
+function saveSalesShift_(payload, user) {
+  return withScriptLock_(function () {
+    var sheet = ensureSheet_(getSpreadsheet_(), APP.sheets.shifts, HEADERS.shifts);
+    var current = getSalesShift_().shift;
+    if (!/^[a-zA-Z0-9-]{16,80}$/.test(String(payload.id || ""))) throw new Error("Identificador de operación inválido.");
+    // Cada operación se registra una sola vez, incluso si se perdió la respuesta o se reenvía desde Offline.
+    if (sheet.getLastRow() > 1 && sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).createTextFinder(payload.id).matchEntireCell(true).findNext()) {
+      return { shift: current, duplicate: true };
+    }
+    var conflict = function (message) { return { ok: false, retryable: false, shift: current, error: message }; };
+    if (String(payload.expectedId || "") !== String(current && current.id || "") || Number(payload.expectedVersion || 0) !== Number(current && current.version || 0)) {
+      return conflict("Otro equipo actualizó el turno o su base. Revisa el saldo actual y vuelve a guardar.");
+    }
+    var action = String(payload.action || ""), amount = Number(payload.amount), now = new Date().toISOString();
+    if (["new", "replace", "add"].indexOf(action) < 0 || !Number.isSafeInteger(amount) || amount < 0 || amount > 999999999999 || (action === "add" && amount === 0)) {
+      return conflict("Escribe un valor válido en pesos colombianos.");
+    }
+    var saved;
+    if (action === "new") {
+      var date = String(payload.date || ""), start = Number(payload.startMinutes), end = Number(payload.endMinutes);
+      var midnight = Date.parse(date + "T00:00:00-05:00");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !isFinite(midnight) || Utilities.formatDate(new Date(midnight), "America/Bogota", "yyyy-MM-dd") !== date
+        || !Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < 0 || start >= 1440 || end >= 1440 || start === end) {
+        return conflict("La fecha y las horas del turno no son válidas.");
+      }
+      if (current) {
+        var previousEnd = Date.parse(current.date + "T00:00:00-05:00") + current.endMinutes * 60000 + (current.endMinutes < current.startMinutes ? 86400000 : 0);
+        if (Date.now() < previousEnd || midnight + start * 60000 < previousEnd) return conflict("El nuevo turno no puede solaparse con el turno anterior.");
+      }
+      saved = { id: payload.id, date: date, startMinutes: start, endMinutes: end, base: amount, initialBase: amount, version: 1, createdAt: now, updatedAt: now };
+    } else {
+      if (!current) return conflict("Primero registra un turno.");
+      saved = Object.assign({}, current, { base: action === "add" ? current.base + amount : amount, version: current.version + 1, updatedAt: now });
+      if (!Number.isSafeInteger(saved.base) || saved.base > 999999999999) return conflict("El saldo base supera el valor permitido.");
+    }
+    saved.updatedBy = String(user.full_name || user.username || "Equipo");
+    sheet.appendRow([payload.id, saved.id, saved.date, saved.startMinutes, saved.endMinutes, saved.initialBase, saved.base, saved.version,
+      saved.createdAt, saved.updatedAt, saved.updatedBy, action, amount]);
+    SpreadsheetApp.flush();
+    return { shift: saved };
+  });
+}
+
 function getIncomeReport_(filters) {
   var spreadsheet = getSpreadsheet_();
   var timezone = getTimezone_();
@@ -413,6 +479,9 @@ function getIncomeReport_(filters) {
     dateFrom = dateTo;
     dateTo = swap;
   }
+  var intervalStart = filters.startAt ? Date.parse(filters.startAt) : null;
+  var intervalEnd = filters.endAt ? Date.parse(filters.endAt) : null;
+  if ((filters.startAt || filters.endAt) && (!isFinite(intervalStart) || !isFinite(intervalEnd) || intervalStart === null || intervalEnd === null || intervalStart >= intervalEnd)) throw new Error("Horario de ventas inválido.");
   var methodFilter = String(filters.paymentMethod || "all").toLowerCase();
   var query = normalizeSearch_(filters.query || "");
   var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
@@ -491,6 +560,8 @@ function getIncomeReport_(filters) {
     if (!saleId) return;
     var dateKey = dateValueToKey_(row[5], timezone);
     if (!dateKey || dateKey < dateFrom || dateKey > dateTo) return;
+    var saleTime = new Date(row[5]).getTime();
+    if (intervalStart !== null && (!isFinite(saleTime) || saleTime < intervalStart || saleTime >= intervalEnd)) return;
     var total = asNumber_(row[12]);
     var payments = paymentsBySale[saleId] || [];
     if (!payments.length && row[13]) payments = [{ method: String(row[13]).toLowerCase(), amount: total, reference: String(row[14] || "") }];
@@ -552,7 +623,7 @@ function getIncomeReport_(filters) {
       return { stale: true, records: [] };
     }
     records.forEach(function (record) { delete record.sheetRow; });
-    return { records: records, generatedAt: new Date().toISOString() };
+    return { records: records, intervalApplied: true, generatedAt: new Date().toISOString() };
   }
   totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
   var totalRecords = records.length;
@@ -560,7 +631,8 @@ function getIncomeReport_(filters) {
   var recordRows = records.map(function (record) { return { row: record.sheetRow, saleId: record.saleId }; });
   records.forEach(function (record) { delete record.sheetRow; });
   return {
-    filters: { dateFrom: dateFrom, dateTo: dateTo, paymentMethod: methodFilter, query: String(filters.query || "") },
+    filters: { dateFrom: dateFrom, dateTo: dateTo, paymentMethod: methodFilter, query: String(filters.query || ""), startAt: filters.startAt || "", endAt: filters.endAt || "" },
+    intervalApplied: true,
     totals: totals,
     records: records.slice(0, limit),
     recordRows: recordRows,

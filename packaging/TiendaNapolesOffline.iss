@@ -31,6 +31,7 @@ Source: "..\offline-login-vault.cs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\admin.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\index.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\app.js"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\sales-shift.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\service-worker.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\style.css"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\manifest.webmanifest"; DestDir: "{app}"; Flags: ignoreversion

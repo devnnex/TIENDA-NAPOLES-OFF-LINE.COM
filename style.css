@@ -5270,3 +5270,27 @@ body[data-page="admin"] { overflow-x: hidden; }
 .client-queue-status { display:grid; gap:.65rem; margin:1rem 0; padding:1rem; background:#eef4ff; border:1px solid #b6cef4; border-radius:16px; }
 .client-queue-status[hidden] { display:none; }
 .client-queue-status > div { display:grid; gap:.3rem; }
+
+/* Turno de ventas y base compartida. */
+.sales-shift-base { display: flex; align-items: center; gap: .8rem; margin: 0 0 1rem; padding: .85rem 1rem; max-width: 100%; text-align: left; color: #6d28d9; background: #f5f0ff; border: 1px solid #ddd0f8; border-radius: 16px; cursor: pointer; }
+.sales-shift-base > span { display: grid; gap: .18rem; }
+.sales-shift-base strong { font-size: 1.45rem; letter-spacing: -.025em; }
+.sales-shift-base small { font-size: .74rem; color: #6d4d91; line-height: 1.4; }
+.sales-shift-base:focus-visible, .sales-shift-action:focus-visible { outline: 3px solid #c4b5fd; outline-offset: 3px; }
+.sales-shift-modal { width: min(540px, calc(100vw - 1.5rem)); max-height: calc(100dvh - 1.5rem); }
+.sales-shift-card { width: 100%; min-height: 540px; display: flex; flex-direction: column; gap: .9rem; padding: 1.6rem; box-sizing: border-box; }
+.sales-shift-card .section-head { margin: 0; }
+.sales-shift-card h2 { margin: .25rem 0 0; font-size: 1.5rem; }
+.sales-shift-card .eyebrow { color: #7c3aed; }
+.sales-shift-row, .sales-shift-hours { display: grid; grid-template-columns: 1fr 1fr; gap: .85rem; }
+.sales-shift-card label { display: grid; gap: .4rem; min-width: 0; font-size: .82rem; font-weight: 700; }
+.sales-shift-card input, .sales-shift-card select { width: 100%; min-width: 0; height: 44px; border-radius: 10px; }
+.sales-shift-card input.sales-shift-amount { height: 56px; font-size: 1.5rem; font-weight: 800; color: #6d28d9; background: #faf7ff; border-color: #ddd0f8; }
+.sales-shift-hours label > span { display: grid; grid-template-columns: minmax(0, 1fr) 76px; gap: .35rem; }
+.sales-shift-hint { margin: 0; font-size: .78rem; line-height: 1.5; color: #667085; }
+.sales-shift-error { min-height: 1rem; margin: 0; font-size: .8rem; line-height: 1.4; color: #b42318; }
+.sales-shift-actions { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; margin-top: auto; }
+.sales-shift-action { display: flex; justify-content: center; align-items: center; gap: .45rem; min-height: 44px; padding: .65rem; border: 1px solid #7c3aed; border-radius: 12px; background: #7c3aed; color: #fff; font: inherit; font-weight: 750; cursor: pointer; }
+.sales-shift-action:hover { background: #6d28d9; }
+.sales-shift-action:disabled { opacity: .6; cursor: wait; }
+@media (max-width: 560px) { .sales-shift-card { min-height: 0; padding: 1.1rem; } .sales-shift-card h2 { font-size: 1.25rem; } }

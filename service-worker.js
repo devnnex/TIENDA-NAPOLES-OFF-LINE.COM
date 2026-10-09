@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v27";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v28";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -9,7 +9,7 @@ const MAX_RETRY_DELAY_MS = 30_000;
 const BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
 const DYNAMIC_BRAND_ASSETS = new Set(["pwa-manifest.webmanifest", "pwa-icon-192.png", "pwa-icon-512.png"]);
 const APP_SHELL = [
-  "./", "./index.html", "./admin.html", "./app.js", "./style.css",
+  "./", "./index.html", "./admin.html", "./app.js", "./sales-shift.js", "./style.css",
   "./manifest.webmanifest", "./pwa-icon.svg", "./tienda-napoles.ico", "./sound/alarm.mp3",
   "./sound/receipt-received.mp3", "./images/check.png", "./images/mesero.png",
   "./vendor/supabase-js.min.js", "./vendor/lucide.min.js",
@@ -1188,7 +1188,7 @@ const networkFirst = async (request) => {
   }
   const cache = await caches.open(OFFLINE_CACHE);
   try {
-    const response = await fetch(request);
+    const response = await fetch(request, { cache: "no-store" });
     if (response.ok) await cache.put(request, response.clone());
     return response;
   } catch (error) {

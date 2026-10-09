@@ -112,10 +112,11 @@ function device(server, page = 'client') {
     + section('pendingAdminRequestsStorageKey', 'mergePendingCoreData')
     + section('pendingAdminReadScope', 'pendingAdminRequestsStorageKey')
     + block('  let adminRefreshPending =', '  const startAdminPolling =')
+    + section('startAdminPolling', 'pendingAdminReadScope')
     + section('subscribeAdmin', 'tableFromScannedValue')
     + section('resumeRealtimeReception', 'init')
     + ';globalThis.api = { hydrateSelectedTable, subscribeClient, loadChatMessages, persistChatMessage, '
-    + 'broadcastChatEvent, resumeRealtimeReception, subscribeAdmin, refreshAdminNow, readRealtimeData, renderClientQueue };', context);
+    + 'broadcastChatEvent, resumeRealtimeReception, subscribeAdmin, refreshAdminNow, readRealtimeData, renderClientQueue, startAdminPolling };', context);
   return {
     state, api: context.api, document, sounds, queueBox, renders: () => renders,
     async advance(ms) {
@@ -149,6 +150,20 @@ function device(server, page = 'client') {
   assert.equal(first.state.clientChannel, originalChannel, 'Revisar la sesión conserva una conexión saludable.');
 
   admin.api.subscribeAdmin();
+  admin.api.startAdminPolling();
+  const initialAdminChannel = admin.state.adminBroadcastChannel;
+  admin.api.subscribeAdmin();
+  assert.equal(admin.state.adminBroadcastChannel, initialAdminChannel);
+  initialAdminChannel.active = false;
+  initialAdminChannel.status('CHANNEL_ERROR');
+  server.requests.push({ id: 'disconnected-request', table_id: 'table-a', session_id: 'session-a', status: 'pending', request_type: 'waiter' });
+  await admin.advance(1500);
+  assert.ok(admin.state.requests.some(row => row.id === 'disconnected-request'), 'El respaldo recibe solicitudes incluso con WebSocket desconectado.');
+  await admin.advance(1500);
+  assert.notEqual(admin.state.adminBroadcastChannel, initialAdminChannel, 'El canal del administrador se reconstruye sin recargar.');
+  assert.equal(admin.state.subscriptions.length, 1, 'La reconexión no acumula canales.');
+  server.requests = [];
+  admin.state.requests = [];
   const adminChat = { sessionId: 'session-a', table: { id: 'table-a' }, messages: [], channel: server.channel('table:table-a') };
   admin.state.adminChats.set('session-a', adminChat);
   await admin.api.persistChatMessage('staff', 'Respuesta en vivo', { sessionId: 'session-a', table: adminChat.table });

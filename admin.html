@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261008-song-sync-v1">
+    <link rel="stylesheet" href="style.css?v=20261008-shifts-realtime-v2">
     <script src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="admin">
@@ -433,6 +433,8 @@
           </form>
           <div class="income-filter-summary" id="incomeFilterSummary" aria-live="polite"></div>
         </div>
+
+        <button class="sales-shift-base" id="salesShiftBase" type="button" aria-label="Ver o editar el turno y saldo base"></button>
 
         <div class="income-kpis" id="incomeKpis"></div>
 
@@ -857,6 +859,24 @@
 
     <section class="admin-chat-dock" id="adminChatDock" aria-label="Chats activos" aria-live="polite"></section>
 
+    <dialog class="modal sales-shift-modal" id="salesShiftDialog" aria-labelledby="salesShiftTitle">
+      <form class="modal-card sales-shift-card" id="salesShiftForm">
+        <div class="section-head"><div><span class="eyebrow">Caja compartida</span><h2 id="salesShiftTitle">Turno y saldo base</h2></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
+        <div class="sales-shift-row">
+          <label>Fecha del turno<input name="date" type="date" required></label>
+          <label>Operación<select name="action"><option value="new">Abrir nuevo turno</option><option value="replace">Actualizar base</option><option value="add">Agregar base</option></select></label>
+        </div>
+        <label><span id="salesShiftAmountLabel">Saldo base inicial</span><input class="sales-shift-amount" name="amount" type="text" inputmode="numeric" data-currency-input autocomplete="off" value="0" required></label>
+        <div class="sales-shift-hours">
+          <label>Hora de inicio<span><input name="start_time" type="text" inputmode="numeric" placeholder="Hora" maxlength="5" autocomplete="off" required aria-label="Hora de inicio"><select name="start_period" aria-label="AM o PM del inicio"><option>AM</option><option selected>PM</option></select></span></label>
+          <label>Hora de cierre<span><input name="end_time" type="text" inputmode="numeric" placeholder="Hora" maxlength="5" autocomplete="off" required aria-label="Hora de cierre"><select name="end_period" aria-label="AM o PM del cierre"><option selected>AM</option><option>PM</option></select></span></label>
+        </div>
+        <p class="sales-shift-hint" id="salesShiftHint">Si el cierre es anterior al inicio, termina al día siguiente. Horario de Colombia.</p>
+        <p class="sales-shift-error" id="salesShiftError" role="alert"></p>
+        <div class="modal-actions sales-shift-actions"><button class="sales-shift-action" type="button" data-close-dialog>Cancelar</button><button class="sales-shift-action" type="submit"><i data-lucide="save"></i> Guardar</button></div>
+      </form>
+    </dialog>
+
     <dialog class="modal income-edit-modal" id="incomeEditDialog">
       <form class="modal-card" id="incomeEditForm">
         <input type="hidden" name="sale_id">
@@ -887,6 +907,7 @@
     <script src="vendor/lucide.min.js"></script>
     <script src="vendor/qrcode.min.js"></script>
     <script src="vendor/jspdf.umd.min.js"></script>
-    <script src="app.js?v=20261008-song-sync-v1"></script>
+    <script src="sales-shift.js"></script>
+    <script src="app.js?v=20261008-shifts-realtime-v2"></script>
   </body>
 </html>

@@ -5294,3 +5294,32 @@ body[data-page="admin"] { overflow-x: hidden; }
 .sales-shift-action:hover { background: #6d28d9; }
 .sales-shift-action:disabled { opacity: .6; cursor: wait; }
 @media (max-width: 560px) { .sales-shift-card { min-height: 0; padding: 1.1rem; } .sales-shift-card h2 { font-size: 1.25rem; } }
+
+/* Ajustes puntuales de venta individual, consumo y edición de pagos. */
+.compact-table-tile.walk-in-table { background: #e5efff; border-color: #8cb4f5; color: #143d7a; }
+.compact-table-tile.walk-in-table .table-furniture-icon { grid-column: 1 / -1; justify-self: center; color: #1764d9; }
+.compact-table-tile.walk-in-table small { color: #143d7a; white-space: normal; }
+.consumption-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 3fr); gap: 1rem; align-items: start; }
+.consumption-layout.without-consumption-preview { grid-template-columns: minmax(0, 1fr); }
+.consumption-entry-panel { display: grid; gap: 1rem; min-width: 0; }
+#consumptionDialog #viewTableConsumption { display: none; }
+#consumptionDialog #tableConsumptionPreview { max-height: min(70dvh, 680px); color: #000; font-size: calc(1rem + 2px); font-weight: 800; }
+body[data-user-role="waiter"] #consumptionDialog #tableConsumptionPreview:not([hidden]) { display: grid !important; }
+#consumptionDialog .table-consumption-preview-head { flex-wrap: wrap; gap: .4rem; }
+#consumptionDialog .table-consumption-preview-title { flex-wrap: wrap; }
+#consumptionDialog .table-consumption-preview-title > small { color: #000; font-size: calc(.68rem + 2px); }
+#consumptionDialog .table-consumption-preview-lines > div { align-items: start; gap: .4rem; color: #000; font-size: calc(.79rem + 2px); font-weight: 800; }
+#consumptionDialog .table-consumption-preview-lines strong { color: #000; }
+#consumptionDialog .table-consumption-item time { color: #000; font-size: calc(.66rem + 2px); font-weight: 800; }
+.consumption-just-added { border-radius: 8px; animation: consumptionAddedFlash .55s ease-in-out 4; }
+@keyframes consumptionAddedFlash { 0%, 100% { background: transparent; } 50% { background: #a7edbf; box-shadow: 0 0 0 4px #a7edbf; } }
+.income-edit-payments { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .6rem; padding: .8rem; border: 1px solid #d5deeb; border-radius: 14px; }
+.income-edit-payments[hidden] { display: none; }
+.income-edit-payments > strong, .income-edit-payments > small { grid-column: 1 / -1; }
+.income-edit-payments .is-unbalanced { color: #b42318; }
+#receiptResultDialog[open], #receiptResultDialog .modal-card { animation: none; }
+@media (max-width: 640px) {
+  .consumption-layout { grid-template-columns: minmax(0, 1fr); }
+  #consumptionDialog #tableConsumptionPreview { max-height: 220px; }
+  .income-edit-payments { grid-template-columns: minmax(0, 1fr); }
+}

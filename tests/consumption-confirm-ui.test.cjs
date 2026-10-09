@@ -33,11 +33,17 @@ const section = (start, end) => {
   const search = { value: "", closest: () => ({}) };
   let clicks = 0;
   const submit = { disabled: false, click() { clicks += 1; } };
-  const state = { consumptionDrafts: [draft] };
+  const state = { consumptionDrafts: [draft], sessions: [{ id: "mesa-1" }] };
+  let finishFlash;
+  const addedRow = { dataset: { consumptionItem: "item-new" }, classList: { add(name) { this.added = name; } } };
   let batchResult;
   let now = 1000;
   const context = vm.createContext({
     state, document, Date: { now: () => now },
+    window: { setTimeout(callback, delay) { assert.equal(delay, 2200); finishFlash = callback; } },
+    $$: () => [addedRow],
+    renderTableConsumptionPreview: () => undefined,
+    renderLastConsumptionTime: () => undefined,
     $: (selector) => ({
       "#consumptionDialog": dialog, "#consumptionForm": form,
       "#consumptionSubmitButton": submit, "#consumptionProductSearch": search
@@ -54,21 +60,28 @@ globalThis.confirmConsumptionSelection = confirmConsumptionSelection;
 globalThis.bindConsumptionConfirmShortcut = bindConsumptionConfirmShortcut;`, context);
 
   const saved = context.confirmConsumptionSelection(form);
-  assert.equal(dialog.open, false, "El modal se cierra al confirmar, sin esperar la red.");
+  assert.equal(dialog.open, true, "La lista sigue abierta mientras se confirma el guardado.");
+  assert.equal(form.inert, true, "No permite otro consumo durante el guardado.");
   assert.equal(form.dataset.localSubmitInProgress, "1");
-  batchResult({ sessionId: "mesa-1" });
+  assert.equal(await context.confirmConsumptionSelection(form), null, "Una segunda confirmación no duplica el consumo.");
+  batchResult({ sessionId: "mesa-1", items: [{ id: "item-new" }] });
+  await new Promise(setImmediate);
+  assert.equal(dialog.open, true, "La lista sigue abierta durante el parpadeo verde.");
+  assert.equal(addedRow.classList.added, "consumption-just-added");
+  finishFlash();
   assert.equal(await saved, "mesa-1");
   assert.equal(dialog.open, false, "El modal permanece cerrado tras guardar.");
   assert.equal(state.consumptionDrafts.length, 0);
   assert.equal(form.dataset.localSubmitInProgress, undefined);
+  assert.equal(form.inert, false);
 
   state.consumptionDrafts = [draft];
   dialog.open = true;
   const failed = context.confirmConsumptionSelection(form);
-  assert.equal(dialog.open, false);
+  assert.equal(dialog.open, true);
   batchResult(null);
   assert.equal(await failed, null);
-  assert.equal(dialog.open, true, "Un fallo restaura la seleccion y reabre el modal.");
+  assert.equal(dialog.open, true, "Un fallo conserva la selección y el modal abierto.");
   assert.equal(state.consumptionDrafts.length, 1);
 
   context.bindConsumptionConfirmShortcut();

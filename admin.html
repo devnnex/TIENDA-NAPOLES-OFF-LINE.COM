@@ -522,11 +522,6 @@
             </div>
             <div class="compact-tables-grid" id="waiterTablesGrid"></div>
           </article>
-          <article class="walk-in-sale-card">
-            <span class="walk-in-icon"><i data-lucide="shopping-bag"></i></span>
-            <div><span class="eyebrow">Venta rápida</span><h3>Cliente individual</h3><p>Para una compra que no ocupa mesa, barra ni matera.</p></div>
-            <button class="primary" id="newWalkInSale" type="button"><i data-lucide="plus"></i> Nueva venta individual</button>
-          </article>
         </div>
       </section>
 
@@ -611,13 +606,15 @@
             <i data-lucide="x"></i>
           </button>
         </div>
+        <div class="consumption-layout" id="consumptionLayout">
+          <div class="table-consumption-preview" id="tableConsumptionPreview" hidden></div>
+          <div class="consumption-entry-panel">
         <div class="table-session-actions" id="tableSessionActions" hidden>
           <button class="ghost" id="viewTableConsumption" type="button"><i data-lucide="receipt-text"></i> Ver consumo</button>
           <button class="ghost abono-button" id="abonoTableAccount" type="button"><i data-lucide="hand-coins"></i> Abonar</button>
           <button class="primary" id="chargeTableAccount" type="button"><i data-lucide="badge-dollar-sign"></i> Cobrar cuenta</button>
           <button class="ghost danger-text" id="releaseEmptyTable" type="button" hidden><i data-lucide="door-open"></i> Liberar mesa</button>
         </div>
-        <div class="table-consumption-preview" id="tableConsumptionPreview" hidden></div>
         <div class="product-picker-field">
           <label for="consumptionProductSearch">Producto</label>
           <div class="product-combobox" id="consumptionProductCombobox">
@@ -653,6 +650,8 @@
           <button class="ghost" type="button" data-cancel-consumption>Cancelar</button>
           <button class="ghost" id="consumptionQueueButton" type="button"><i data-lucide="list-plus"></i> Añadir a selección</button>
           <button class="primary" id="consumptionSubmitButton" type="submit"><i data-lucide="check"></i> <span>Confirmar selección</span></button>
+        </div>
+          </div>
         </div>
       </form>
     </dialog>
@@ -881,7 +880,14 @@
       <form class="modal-card" id="incomeEditForm">
         <input type="hidden" name="sale_id">
         <div class="section-head"><div><span class="eyebrow">Correccion auditada</span><h2>Editar venta cerrada</h2></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
-        <div class="form-grid"><label>Origen / mesa<input name="table" type="text" maxlength="80" required></label><label>Responsable<input name="payer" type="text" maxlength="100"></label><label>Vendido por<input name="waiter" type="text" maxlength="100"></label><label>Fecha y hora<input name="date" type="datetime-local" required></label><label>Medio de pago<select name="payment_method"><option value="cash">Efectivo</option><option value="transfer">Transferencia</option><option value="breb">Bre-B</option><option value="mixed">Conservar pago mixto</option></select></label><label>Referencia<input name="reference" type="text" maxlength="100"></label></div>
+        <div class="form-grid"><label>Origen / mesa<input name="table" type="text" maxlength="80" required></label><label>Responsable<input name="payer" type="text" maxlength="100"></label><label>Vendido por<input name="waiter" type="text" maxlength="100"></label><label>Fecha y hora<input name="date" type="datetime-local" required></label><label>Medio de pago<select name="payment_method"><option value="cash">Efectivo</option><option value="transfer">Transferencia</option><option value="breb">Bre-B</option><option value="mixed">Mixto</option></select></label><label>Referencia<input name="reference" type="text" maxlength="100"></label></div>
+        <div class="income-edit-payments" id="incomeEditPayments" hidden>
+          <strong>Distribución del pago mixto</strong>
+          <label>Efectivo<input name="edit_payment_cash" type="text" inputmode="numeric" data-currency-input value="$0" disabled></label>
+          <label>Transferencia<input name="edit_payment_transfer" type="text" inputmode="numeric" data-currency-input value="$0" disabled></label>
+          <label>Bre-B<input name="edit_payment_breb" type="text" inputmode="numeric" data-currency-input value="$0" disabled></label>
+          <small id="incomeEditPaymentBalance" role="status" aria-live="polite"></small>
+        </div>
         <div class="income-edit-lines" id="incomeEditLines"></div>
         <div class="modal-actions"><button class="ghost" type="button" data-close-dialog>Cancelar</button><button class="primary" type="submit"><i data-lucide="save"></i> Guardar correccion</button></div>
       </form>

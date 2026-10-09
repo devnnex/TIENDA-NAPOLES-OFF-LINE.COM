@@ -4212,12 +4212,13 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
   border-top: 1px solid rgba(255, 255, 255, .1);
 }
 
-#consumptionDialog { width: min(calc(100vw - 1.5rem), 1020px); max-width: none; overflow: hidden; }
+#consumptionDialog { width: min(calc(100vw - 1.5rem), 1360px); max-width: none; overflow: hidden; }
 #consumptionDialog .modal-card {
   width: 100%;
   max-width: none;
-  min-height: min(88dvh, 760px);
-  max-height: min(96dvh, 940px);
+  min-height: min(88dvh, 980px);
+  max-height: min(96dvh, 1120px);
+  grid-template-rows: auto minmax(0, 1fr);
   padding-bottom: 1.2rem;
   overflow-x: hidden;
   overflow-y: auto;
@@ -5299,16 +5300,18 @@ body[data-page="admin"] { overflow-x: hidden; }
 .compact-table-tile.walk-in-table { background: #e5efff; border-color: #8cb4f5; color: #143d7a; }
 .compact-table-tile.walk-in-table .table-furniture-icon { grid-column: 1 / -1; justify-self: center; color: #1764d9; }
 .compact-table-tile.walk-in-table small { color: #143d7a; white-space: normal; }
-.consumption-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 3fr); gap: 1rem; align-items: start; }
+.consumption-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 3fr); gap: 1rem; align-items: stretch; }
 .consumption-layout.without-consumption-preview { grid-template-columns: minmax(0, 1fr); }
-.consumption-entry-panel { display: grid; gap: 1rem; min-width: 0; }
+.consumption-entry-panel { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+#consumptionDialog .consumption-entry-panel > .modal-actions { margin-top: auto; }
 #consumptionDialog #viewTableConsumption { display: none; }
-#consumptionDialog #tableConsumptionPreview { max-height: min(70dvh, 680px); color: #000; font-size: calc(1rem + 2px); font-weight: 800; }
+#consumptionDialog #tableConsumptionPreview { align-self: start; max-height: min(76dvh, 880px); color: #000; font-size: calc(1rem + 2px); font-weight: 800; }
 body[data-user-role="waiter"] #consumptionDialog #tableConsumptionPreview:not([hidden]) { display: grid !important; }
 #consumptionDialog .table-consumption-preview-head { flex-wrap: wrap; gap: .4rem; }
 #consumptionDialog .table-consumption-preview-title { flex-wrap: wrap; }
 #consumptionDialog .table-consumption-preview-title > small { color: #000; font-size: calc(.68rem + 2px); }
-#consumptionDialog .table-consumption-preview-lines > div { align-items: start; gap: .4rem; color: #000; font-size: calc(.79rem + 2px); font-weight: 800; }
+#consumptionDialog .table-consumption-preview-lines { gap: .65rem; }
+#consumptionDialog .table-consumption-preview-lines > div { align-items: start; gap: .7rem; padding: .45rem 0; border-bottom: 1px solid #e6e8ec; color: #000; font-size: calc(.79rem + 2px); font-weight: 800; }
 #consumptionDialog .table-consumption-preview-lines strong { color: #000; }
 #consumptionDialog .table-consumption-item time { color: #000; font-size: calc(.66rem + 2px); font-weight: 800; }
 .consumption-just-added { border-radius: 8px; animation: consumptionAddedFlash .55s ease-in-out 4; }

@@ -646,7 +646,8 @@ const App = (() => {
 
   const toast = (message, type = "ok", key = `${type}:${message}`) => {
     const now = Date.now();
-    const cooldown = type === "error" ? 15000 : 3000;
+    const stockNotice = type === "error" && String(key).startsWith("payment-stock:");
+    const cooldown = stockNotice ? 5000 : type === "error" ? 15000 : 3000;
     if (state.visibleToastKeys.has(key)) return;
     if (now - Number(state.toastLastShown.get(key) || 0) < cooldown) return;
     state.visibleToastKeys.add(key);
@@ -659,25 +660,36 @@ const App = (() => {
     }
     const item = document.createElement("div");
     const clientNotice = state.page === "client";
-    item.className = `system-modal ${type}${clientNotice && type === "ok" ? " client-notification" : ""}`;
+    item.className = `system-modal ${type}${clientNotice && type === "ok" ? " client-notification" : ""}${stockNotice ? " stock-warning" : ""}`;
     const iconName = type === "error" ? "circle-alert" : "badge-check";
     item.innerHTML = `
       <div class="system-modal-icon">${icon(iconName, 24)}</div>
       <div>
-        <strong>${type === "error" ? "Atencion" : "Listo"}</strong>
+        <strong>${stockNotice ? "Stock insuficiente" : type === "error" ? "Atencion" : "Listo"}</strong>
         <p>${message}</p>
       </div>
     `;
     box.appendChild(item);
+    if (stockNotice) {
+      item.setAttribute("role", "alert");
+      item.setAttribute("aria-live", "assertive");
+      if (typeof item.showPopover === "function") {
+        item.setAttribute("popover", "manual");
+        item.showPopover();
+      } else {
+        const dialogs = document.querySelectorAll("dialog[open]");
+        dialogs[dialogs.length - 1]?.appendChild(item);
+      }
+    }
     refreshIcons();
     setTimeout(() => {
-      if (clientNotice) { item.remove(); state.visibleToastKeys.delete(key); return; }
+      if (clientNotice || stockNotice) { item.remove(); state.visibleToastKeys.delete(key); return; }
       item.classList.add("leaving");
       setTimeout(() => {
         item.remove();
         state.visibleToastKeys.delete(key);
       }, 220);
-    }, clientNotice ? 5000 : type === "error" ? 5600 : 3600);
+    }, clientNotice || stockNotice ? 5000 : type === "error" ? 5600 : 3600);
   };
 
   const isConfigured = () => Boolean(

@@ -5400,3 +5400,11 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 .client-queue-badge-stats > span { padding: .35rem .6rem; border: 1px solid #dce6f1; border-radius: 9px; background: rgba(255, 255, 255, .85); font-size: .75rem; color: #53647a; }
 .client-queue-badge-stats b { color: #26364c; font-weight: 650; }
 .client-queue-badge > small { color: #63748a; font-size: .73rem; line-height: 1.45; }
+
+/* El bloqueo por stock se muestra en la capa superior de los modales. */
+.system-modal.stock-warning { position: fixed; inset: 0; z-index: 2147483647; margin: auto; height: fit-content; pointer-events: none; border: 2px solid #e35757; background: #fff1f1; animation: stockWarningFlash .9s ease-in-out infinite; }
+.system-modal.stock-warning strong { color: #9f1d1d; }
+.system-modal.stock-warning p { color: #542828; }
+.system-modal.stock-warning::backdrop { background: transparent; pointer-events: none; }
+@keyframes stockWarningFlash { 0%, 100% { background: #fff1f1; box-shadow: 0 20px 60px rgba(114, 24, 24, .22); } 50% { background: #ffd7d7; box-shadow: 0 20px 60px rgba(114, 24, 24, .36), 0 0 0 5px rgba(227, 87, 87, .2); } }
+@media (prefers-reduced-motion: reduce) { .system-modal.stock-warning { animation: none; } }

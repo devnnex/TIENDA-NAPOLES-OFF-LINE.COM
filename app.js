@@ -8691,7 +8691,7 @@ const App = (() => {
     $("#paymentTotal").textContent = money(total);
     const paymentLines = $("#paymentSaleLines");
     if (paymentLines) paymentLines.innerHTML = activeItems.length
-      ? activeItems.map((item) => `<div><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("")
+      ? activeItems.map((item) => `<div class="${quickSale && state.individualProductFlashes?.get(item) > Date.now() ? "consumption-just-added" : ""}"><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("")
       : '<p class="payment-empty-sale">Agrega el producto para continuar con el cobro.</p>';
     const addItemButton = $("#paymentAddItem");
     if (addItemButton) {
@@ -9046,7 +9046,7 @@ const App = (() => {
     count.textContent = `${drafts.length} ${drafts.length === 1 ? "producto" : "productos"}`;
     total.textContent = money(drafts.reduce((sum, draft) => sum + draft.quantity * draft.unitPrice, 0));
     if (priceWarning) priceWarning.hidden = !hasEditedPrice;
-    lines.innerHTML = drafts.map((draft, index) => `<div><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong${canEditPrice ? ` class="consumption-draft-price" data-edit-consumption-draft="${index}" title="Doble clic para editar el precio unitario"` : ""}>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
+    lines.innerHTML = drafts.map((draft, index) => `<div class="${state.individualProductFlashes?.get(draft) > Date.now() ? "consumption-just-added" : ""}"><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong${canEditPrice ? ` class="consumption-draft-price" data-edit-consumption-draft="${index}" title="Doble clic para editar el precio unitario"` : ""}>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
     const form = $("#consumptionForm");
     if (form) form.quantity.required = drafts.length === 0;
     refreshIcons();
@@ -9130,6 +9130,10 @@ const App = (() => {
     if (!form || form.session_item_id.value) return false;
     const draft = currentConsumptionDraft(form);
     if (!draft) return false;
+    if (form.quick_checkout?.value === "1") {
+      state.individualProductFlashes ||= new WeakMap();
+      state.individualProductFlashes.set(draft, Date.now() + 2200);
+    }
     state.consumptionDrafts.push(draft);
     clearConsumptionEntry(form);
     renderConsumptionSelection();
@@ -9458,7 +9462,11 @@ const App = (() => {
       }
       dialog?.close();
       clearConsumptionEntry(form);
-      if (quickCheckout) openPaymentDialog(sessionId);
+      if (quickCheckout) {
+        state.individualProductFlashes ||= new WeakMap();
+        (result.items || []).forEach((item) => state.individualProductFlashes.set(item, Date.now() + 2200));
+        openPaymentDialog(sessionId);
+      }
       return sessionId;
     } catch (error) {
       if (!confirmed) { state.consumptionDrafts = drafts; renderConsumptionSelection(); }

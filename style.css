@@ -5338,3 +5338,11 @@ body[data-user-role="waiter"] #consumptionDialog #tableConsumptionPreview:not([h
   #consumptionDialog #viewTableConsumption:not([hidden]) { display: flex; justify-content: center; gap: .5rem; width: 100%; min-height: 44px; border-color: #cbd8ea; background: #f2f6fc; color: #244c7c; }
   .income-edit-payments { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Avisos temporales del cliente. */
+body[data-page="client"] .client-queue-status { padding: 0; border: 0; background: transparent; }
+body[data-page="client"] .client-queue-status > div { padding: .85rem 1rem; border-radius: 14px; }
+body[data-page="client"] .client-notification { color: #145b35; background: #e6f8ed; border: 1px solid #96d8b1; animation: clientNoticeFlash 1s ease-in-out infinite; }
+body[data-page="client"] .system-modal.client-notification p { color: #245b3b; }
+@keyframes clientNoticeFlash { 0%, 100% { background-color: #e6f8ed; box-shadow: 0 0 0 0 rgba(72, 174, 110, 0); } 50% { background-color: #c8efd6; box-shadow: 0 0 0 3px rgba(72, 174, 110, .18); } }
+@media (prefers-reduced-motion: reduce) { body[data-page="client"] .client-notification { animation: none; } }

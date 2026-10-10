@@ -658,7 +658,8 @@ const App = (() => {
       document.body.appendChild(box);
     }
     const item = document.createElement("div");
-    item.className = `system-modal ${type}`;
+    const clientNotice = state.page === "client";
+    item.className = `system-modal ${type}${clientNotice && type === "ok" ? " client-notification" : ""}`;
     const iconName = type === "error" ? "circle-alert" : "badge-check";
     item.innerHTML = `
       <div class="system-modal-icon">${icon(iconName, 24)}</div>
@@ -670,12 +671,13 @@ const App = (() => {
     box.appendChild(item);
     refreshIcons();
     setTimeout(() => {
+      if (clientNotice) { item.remove(); state.visibleToastKeys.delete(key); return; }
       item.classList.add("leaving");
       setTimeout(() => {
         item.remove();
         state.visibleToastKeys.delete(key);
       }, 220);
-    }, type === "error" ? 5600 : 3600);
+    }, clientNotice ? 5000 : type === "error" ? 5600 : 3600);
   };
 
   const isConfigured = () => Boolean(
@@ -5140,18 +5142,85 @@ const App = (() => {
   };
   const renderClientQueue = () => {
     const box = $("#clientQueueStatus"); if (!box) return;
+    const now = Date.now();
+    const scope = JSON.stringify([state.currentTable?.id || "", state.currentSession?.id || ""]);
+    const storageKey = "napoles_client_notices:" + scope;
+    if (state.clientNoticeScope !== scope) {
+      window.clearTimeout(state.clientNoticeTimer);
+      state.clientNoticeScope = scope;
+      state.clientNotices = new Map();
+      state.clientNoticeStatuses = new Map();
+      let seen = [];
+      try { seen = JSON.parse(sessionStorage.getItem(storageKey) || "[]"); } catch (_) { /* Memoria disponible sin almacenamiento. */ }
+      state.clientNoticeSeen = new Set(Array.isArray(seen) ? seen : []);
+    }
+    const notices = state.clientNotices;
+    const seen = state.clientNoticeSeen;
     const rows = state.clientQueuePositions || [];
-    const groups = new Map(); rows.forEach((row) => groups.set(row.kind, row));
-    const attending = (state.clientRequests || []).filter((request) =>
-      request.status === "acknowledged" && request.table_id === state.currentTable?.id
-      && request.session_id === state.currentSession?.id && requestKind(request) !== "chat");
-    box.hidden = !groups.size && !attending.length;
-    box.innerHTML = [...groups].map(([kind,row]) => '<div><strong>' + (kind === "song" ? "Canciones" : "Solicitudes")
-      + ': turno ' + Number(row.position) + '</strong><small>' + (Number(row.position) === 1 ? 'Tu mesa es la siguiente en el orden de llegada.' : 'Hay ' + (Number(row.position)-1) + ' turno(s) antes del tuyo.')
-      + (kind === "song" ? ' · ' + rows.filter((entry) => entry.kind === "song").length + '/5 canciones en este turno.' : '') + '</small></div>').join('');
+    const groups = new Map();
+    rows.forEach((row) => {
+      if (!groups.has(row.kind)) groups.set(row.kind, []);
+      groups.get(row.kind).push(row);
+    });
+    groups.forEach((entries, kind) => {
+      const key = "queue:" + kind;
+      const row = entries[0];
+      const token = key + ":" + entries.map((entry) => entry.id).sort().join(",") + ":" + row.position;
+      if (!seen.has(token)) {
+        seen.add(token);
+        notices.set(key, { token, kind, row, count: entries.length, expiresAt: now + 5000 });
+      } else if (notices.get(key)?.token !== token) notices.delete(key);
+    });
+    const requests = (state.clientRequests || []).filter((request) =>
+      request.table_id === state.currentTable?.id && request.session_id === state.currentSession?.id);
+    const attending = requests.filter((request) => request.status === "acknowledged");
+    const newKinds = new Map();
+    attending.forEach((request) => {
+      const token = "accepted:" + request.id;
+      if (seen.has(token)) return;
+      seen.add(token);
+      const acknowledgedAt = Date.parse(request.acknowledged_at || request.updated_at || "");
+      const previousStatus = state.clientNoticeStatuses.get(request.id);
+      if (previousStatus !== "pending" && previousStatus !== "sending"
+        && Number.isFinite(acknowledgedAt) && now - acknowledgedAt >= 5000) return;
+      const kind = requestKind(request);
+      newKinds.set(kind, request.id);
+      if (kind === "chat") return; // El chat conserva su aviso de conexion.
+      const key = "attending:" + kind;
+      const notice = notices.get(key) || { kind, requestIds: new Set() };
+      notice.requestIds.add(request.id);
+      notice.expiresAt = now + 5000;
+      notices.set(key, notice);
+    });
+    requests.forEach((request) => state.clientNoticeStatuses.set(request.id, request.status));
+    newKinds.forEach((id) => void playClientChatReceipt(id));
+    try { sessionStorage.setItem(storageKey, JSON.stringify([...seen].slice(-500))); } catch (_) { /* Evita repetir avisos en memoria. */ }
+    const attendingIds = new Set(attending.map((request) => request.id));
+    notices.forEach((notice, key) => {
+      if (notice.requestIds) {
+        notice.requestIds = new Set([...notice.requestIds].filter((id) => attendingIds.has(id)));
+      }
+      if (notice.expiresAt <= now || (notice.requestIds && !notice.requestIds.size)
+        || (!notice.requestIds && !groups.has(notice.kind))) notices.delete(key);
+    });
     const labels = { waiter: "de mesero", song: "de canción", bill: "de cuenta", other: "de atención" };
-    box.innerHTML += attending.map((request) => `<div data-attending-request="${escapeHTML(request.id)}"><strong>Te estamos atendiendo</strong><small>Tu solicitud ${labels[requestKind(request)] || "de atención"} está siendo atendida en este momento.</small></div>`).join("");
+    box.hidden = !notices.size;
+    const markup = [...notices.values()].map((notice) => {
+      if (notice.requestIds) {
+        const ids = [...notice.requestIds];
+        return `<div class="client-notification" data-attending-request="${escapeHTML(ids[0])}"><strong>Te estamos atendiendo${ids.length > 1 ? " (" + ids.length + ")" : ""}</strong><small>Tu solicitud ${labels[notice.kind] || "de atención"} está siendo atendida en este momento.</small></div>`;
+      }
+      const { kind, row, count } = notice;
+      return '<div class="client-notification"><strong>' + (kind === "song" ? "Canciones" : "Solicitudes" + (count > 1 ? " (" + count + ")" : ""))
+        + ': turno ' + Number(row.position) + '</strong><small>' + (Number(row.position) === 1 ? 'Tu mesa es la siguiente en el orden de llegada.' : 'Hay ' + (Number(row.position) - 1) + ' turno(s) antes del tuyo.')
+        + (kind === "song" ? ' · ' + count + '/5 canciones en este turno.' : '') + '</small></div>';
+    }).join('');
+    if (state.clientNoticeMarkup !== markup) { state.clientNoticeMarkup = markup; box.innerHTML = markup; }
+    window.clearTimeout(state.clientNoticeTimer);
+    if (notices.size) state.clientNoticeTimer = window.setTimeout(renderClientQueue,
+      Math.max(1, Math.min(...[...notices.values()].map((notice) => notice.expiresAt)) - now));
   };
+
   const bindAccountFeatures = () => {
     $("#abonoForm")?.addEventListener("submit", (event) => { event.preventDefault(); void recordAbono(event.currentTarget); });
     document.addEventListener("click", (event) => {
@@ -5201,9 +5270,19 @@ const App = (() => {
     });
 
   const groupedActiveRequests = () => {
-    return [...activeRequests()].sort((left, right) => compareRequestArrival(right, left)).map((request) => ({
-      ...request, kind: requestKind(request), request_ids: [request.id], count: 1, latest_message: request.message || ""
-    }));
+    const groups = new Map();
+    [...activeRequests()].sort((left, right) => compareRequestArrival(right, left)).forEach((request) => {
+      const kind = requestKind(request);
+      const key = JSON.stringify([request.table_id, kind]);
+      const group = groups.get(key);
+      if (group) {
+        group.request_ids.push(request.id);
+        group.count += 1;
+      } else {
+        groups.set(key, { ...request, kind, request_ids: [request.id], count: 1, latest_message: request.message || "" });
+      }
+    });
+    return [...groups.values()];
   };
 
   const renderAlerts = () => {
@@ -5213,7 +5292,7 @@ const App = (() => {
     const visibleAlerts = state.alertFilter === "all"
       ? alerts
       : alerts.filter((request) => request.kind === state.alertFilter);
-    const renderSignature = `${state.alertFilter}:${visibleAlerts.map((request) => `${request.id}:${request.count}:${request.latest_message}`).join("|")}`;
+    const renderSignature = `${state.alertFilter}:${visibleAlerts.map((request) => `${request.request_ids.join(",")}:${request.count}:${request.latest_message}`).join("|")}`;
     box.classList.toggle("has-alerts", alerts.length > 0);
     const alertCards = visibleAlerts
       .map(

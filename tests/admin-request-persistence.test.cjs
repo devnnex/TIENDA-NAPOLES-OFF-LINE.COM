@@ -125,13 +125,16 @@ function harness(storage = new Map()) {
   h.backend.snapshot = { requests: [chat, second, first], sessions: [] };
   await h.api.loadAdminData();
   assert.deepEqual([...h.ids()], ['first', 'second', 'chat']);
-  assert.equal(h.api.groupedActiveRequests().length, 3, 'Dos solicitudes de la misma mesa y tipo conservan tarjetas individuales.');
-  assert.deepEqual([...h.api.groupedActiveRequests()].map(row => row.id), ['chat', 'second', 'first'], 'Las tarjetas del admin muestran primero la solicitud más reciente.');
+  assert.equal(h.api.groupedActiveRequests().length, 2, 'Las solicitudes de la misma mesa y categoria comparten tarjeta.');
+  assert.deepEqual([...h.api.groupedActiveRequests()].map(row => row.id), ['chat', 'second'], 'Los grupos muestran primero la solicitud mas reciente.');
+  assert.equal(h.api.groupedActiveRequests()[1].count, 2);
+  assert.deepEqual([...h.api.groupedActiveRequests()[1].request_ids], ['second', 'first']);
   h.api.renderAlerts();
-  assert.equal((h.alerts.innerHTML.match(/data-accept-request=/g) || []).length, 3);
+  assert.equal((h.alerts.innerHTML.match(/data-accept-request=/g) || []).length, 2);
   h.state.alertFilter = 'waiter';
   h.api.renderAlerts();
-  assert.ok(h.alerts.innerHTML.indexOf('data-alert-card="second"') < h.alerts.innerHTML.indexOf('data-alert-card="first"'), 'El filtro por tipo muestra primero la solicitud más reciente.');
+  assert.ok(h.alerts.innerHTML.includes('data-accept-request="second,first"'), 'El boton acepta todas las solicitudes de la tarjeta.');
+  assert.ok(!h.alerts.innerHTML.includes('data-alert-card="first"'), 'La repeticion no agrega otra tarjeta.');
   assert.ok(!h.alerts.innerHTML.includes('data-alert-card="chat"'));
 
   h.backend.snapshot = { requests: [second], sessions: [] };
@@ -202,12 +205,23 @@ function harness(storage = new Map()) {
   await tick();
   assert.deepEqual([...accept.ids()], ['second'], 'Aceptar sin poder guardar restaura la solicitud.');
 
+  const groupedAccept = harness();
+  groupedAccept.backend.rows = [first, second].map(row => ({ ...row }));
+  groupedAccept.backend.snapshot.requests = groupedAccept.backend.rows.map(row => ({ ...row }));
+  await groupedAccept.api.loadAdminData();
+  await groupedAccept.api.acceptRequest(groupedAccept.api.groupedActiveRequests()[0].request_ids.join(','));
+  await tick();
+  assert.deepEqual([...groupedAccept.ids()], [], 'Aceptar una tarjeta retira todas sus repeticiones confirmadas.');
+  assert.ok(groupedAccept.backend.rows.every(row => row.status === 'acknowledged'));
+  await groupedAccept.api.loadAdminData();
+  assert.deepEqual([...groupedAccept.ids()], [], 'El grupo aceptado no reaparece con un snapshot viejo.');
+
   const partial = harness();
   partial.backend.rows = [first, second].map(row => ({ ...row }));
   partial.backend.snapshot.requests = partial.backend.rows.map(row => ({ ...row }));
   await partial.api.loadAdminData();
   partial.backend.savedIds = ['first'];
-  partial.api.acknowledgeRequestOptimistically(['first', 'second'], { status: 'acknowledged', acknowledged_at: new Date().toISOString() }, 'falló');
+  await partial.api.acceptRequest(partial.api.groupedActiveRequests()[0].request_ids.join(','));
   await tick();
   assert.deepEqual([...partial.ids()], ['second'], 'Una escritura parcial restaura las solicitudes no confirmadas.');
 

@@ -2328,7 +2328,11 @@ const App = (() => {
     if (button) button.disabled = true;
     try {
       await cashDrawerRequest("POST", settings);
-      if (save) { localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(settings)); void pollDrawerReceiver(); }
+      if (save) {
+        localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(settings));
+        drawerReceiverData = null; drawerReceiverCheckedAt = 0; drawerReceiverRegisteredAt = 0;
+        void pollDrawerReceiver();
+      }
       $("#cashDrawerDialog")?.close();
       toast("Orden de apertura enviada a la impresora POS.", "ok", "cash-drawer-opened");
       return true;
@@ -2378,8 +2382,8 @@ const App = (() => {
     drawerSignalReady = new Promise((resolve) => {
       const timer = window.setTimeout(() => resolve(false), 2000);
       drawerSignalChannel = state.sb.channel("tienda-napoles-drawer-control", { config: { broadcast: { self: false } } })
-        .on("broadcast", { event: "wake" }, () => void pollDrawerReceiver())
-        .on("broadcast", { event: "open" }, () => void pollDrawerReceiver())
+        .on("broadcast", { event: "wake" }, () => void pollDrawerReceiver({ urgent: true }))
+        .on("broadcast", { event: "open" }, () => void pollDrawerReceiver({ urgent: true }))
         .subscribe((status) => {
           if (status === "SUBSCRIBED") { window.clearTimeout(timer); resolve(true); }
           else if (["CHANNEL_ERROR","TIMED_OUT","CLOSED"].includes(status)) { window.clearTimeout(timer); resolve(false); }
@@ -2389,21 +2393,32 @@ const App = (() => {
   };
   let drawerReceiverBusy = false;
   let drawerReceiverData = null;
+  let drawerReceiverCheckedAt = 0;
+  let drawerReceiverRegisteredAt = 0;
+  let drawerReceiverRegisteredAuth = "";
+  let drawerReceiverQueued = false;
   let drawerOpenBusy = false;
-  const pollDrawerReceiver = async () => {
-    if (!canHostCashDrawer() || drawerReceiverBusy || !state.authToken || !state.currentUser || !navigator.onLine || !state.posFeatures?.remote_drawer) return;
+  const pollDrawerReceiver = async ({ urgent = false } = {}) => {
+    if (!canHostCashDrawer() || !state.authToken || !state.currentUser || !navigator.onLine || !state.posFeatures?.remote_drawer) return;
+    if (drawerReceiverBusy) { if (urgent) drawerReceiverQueued = true; return; }
     drawerReceiverBusy = true;
     void prepareDrawerSignal();
     const receiverAuth = state.authToken;
     try {
-      const local = await cashDrawerRequest("GET");
+      const local = drawerReceiverData?.deviceId && Date.now() - drawerReceiverCheckedAt < 30000
+        ? drawerReceiverData : await cashDrawerRequest("GET");
       if (!local.settings) { try { local.settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {} }
       if (!local.deviceId || !local.secret || !local.settings?.printer || !local.printers?.includes(local.settings.printer)) { drawerReceiverData = null; return; }
+      if (local !== drawerReceiverData) { drawerReceiverCheckedAt = Date.now(); drawerReceiverRegisteredAt = 0; }
       drawerReceiverData = local;
       localStorage.setItem(CASH_DRAWER_SETTINGS_KEY, JSON.stringify(local.settings));
-      const registered = await dbQuiet(state.sb.rpc("register_pos_drawer", { auth_token: state.authToken,
-        p_device_id: local.deviceId, p_secret: local.secret, p_label: local.settings.printer }), null);
-      if (!registered?.ok) return;
+      if (drawerReceiverRegisteredAuth !== receiverAuth || Date.now() - drawerReceiverRegisteredAt >= 4000) {
+        const registered = await dbQuiet(state.sb.rpc("register_pos_drawer", { auth_token: receiverAuth,
+          p_device_id: local.deviceId, p_secret: local.secret, p_label: local.settings.printer }), null);
+        if (!registered?.ok) return;
+        drawerReceiverRegisteredAuth = receiverAuth;
+        drawerReceiverRegisteredAt = Date.now();
+      }
       const next = await dbQuiet(state.sb.rpc("claim_pos_drawer", { auth_token: state.authToken, p_device_id: local.deviceId, p_secret: local.secret }), null);
       if (!next?.command?.id) return;
       if (state.authToken !== receiverAuth || !state.currentUser) return;
@@ -2415,23 +2430,31 @@ const App = (() => {
         p_secret: local.secret, p_command_id: next.command.id, p_accepted: accepted, p_error: error }), 3);
       if (!accepted) toast(error, "error", "drawer-command:" + next.command.id);
     } catch (_) { drawerReceiverData = null; }
-    finally { drawerReceiverBusy = false; }
+    finally {
+      drawerReceiverBusy = false;
+      if (drawerReceiverQueued) { drawerReceiverQueued = false; void pollDrawerReceiver({ urgent: true }); }
+    }
   };
   const openRemoteCashDrawer = async () => {
     const id = uid();
-    const signalReady = await prepareDrawerSignal();
-    if (signalReady) { await drawerSignalChannel.send({ type: "broadcast", event: "wake", payload: {} }); await new Promise((resolve) => setTimeout(resolve, 350)); }
+    const signal = prepareDrawerSignal();
+    const notifyReceiver = (event, payload = {}) => {
+      void signal.then((ready) => ready && drawerSignalChannel?.send({ type: "broadcast", event, payload })).catch(() => {});
+    };
+    notifyReceiver("wake");
     let data = null, error = null;
     for (let attempt = 0; attempt < 4; attempt++) {
       ({ data, error } = await state.sb.rpc("request_pos_drawer", { auth_token: state.authToken, p_command_id: id, p_device_id: drawerReceiverData?.deviceId || null }));
-      if (data?.command?.id || !signalReady || !/No hay una caja conectada/i.test(error?.message || "")) break;
-      await new Promise((resolve) => setTimeout(resolve, 550));
+      if (data?.command?.id || !/No hay una caja conectada/i.test(error?.message || "")) break;
+      if (!await signal) break;
+      notifyReceiver("wake");
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
     if (error || !data?.command?.id) throw new Error(error?.message || "No hay una caja conectada.");
-    if (signalReady) await drawerSignalChannel.send({ type: "broadcast", event: "open", payload: { deviceId: data.command.device_id } });
+    notifyReceiver("open", { deviceId: data.command.device_id });
     toast("Orden enviada a " + (data.device || "la caja conectada") + ". Esperando confirmación…", "ok", "remote-drawer:" + id);
-    for (let attempt = 0; attempt < 12; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 650));
+    for (let attempt = 0; attempt < 16; attempt++) {
+      if (attempt) await new Promise((resolve) => setTimeout(resolve, attempt < 5 ? 200 : 650));
       const result = await dbQuiet(state.sb.rpc("get_pos_drawer_command", { auth_token: state.authToken, p_command_id: id }), null);
       if (result?.command?.status === "accepted") { toast("El PC de la caja confirmó la orden de apertura.", "ok", "remote-drawer:" + id); return true; }
       if (["failed","expired"].includes(result?.command?.status)) throw new Error(result.command.error || "La caja no pudo recibir la orden. Comprueba el PC conectado.");
@@ -2451,6 +2474,9 @@ const App = (() => {
     try {
       if (window.posCashDrawer?.open) return await openLocalCashDrawer();
       if (drawerReceiverData?.settings) return await sendCashDrawerPulse(drawerReceiverData.settings);
+      let savedSettings = null;
+      try { savedSettings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {}
+      if (canHostCashDrawer() && savedSettings?.printer) return await sendCashDrawerPulse(savedSettings);
       let local = null;
       if (canHostCashDrawer()) { try { local = await cashDrawerRequest("GET"); } catch (_) {} }
       if (local && !local.settings) { try { local.settings = JSON.parse(localStorage.getItem(CASH_DRAWER_SETTINGS_KEY) || "null"); } catch (_) {} }
@@ -5169,15 +5195,6 @@ const App = (() => {
       if (!groups.has(row.kind)) groups.set(row.kind, []);
       groups.get(row.kind).push(row);
     });
-    groups.forEach((entries, kind) => {
-      const key = "queue:" + kind;
-      const row = entries[0];
-      const token = key + ":" + entries.map((entry) => entry.id).sort().join(",") + ":" + row.position;
-      if (!seen.has(token)) {
-        seen.add(token);
-        notices.set(key, { token, kind, row, count: entries.length, expiresAt: now + 5000 });
-      } else if (notices.get(key)?.token !== token) notices.delete(key);
-    });
     const requests = (state.clientRequests || []).filter((request) =>
       request.table_id === state.currentTable?.id && request.session_id === state.currentSession?.id);
     const attending = requests.filter((request) => request.status === "acknowledged");
@@ -5211,17 +5228,25 @@ const App = (() => {
         || (!notice.requestIds && !groups.has(notice.kind))) notices.delete(key);
     });
     const labels = { waiter: "de mesero", song: "de canción", bill: "de cuenta", other: "de atención" };
-    box.hidden = !notices.size;
-    const markup = [...notices.values()].map((notice) => {
+    const songCount = songTurnCount();
+    const songPosition = groups.get("song")?.[0]?.position;
+    const turnDetail = (position) => Number(position) === 1
+      ? "Tu mesa es la siguiente en el orden de llegada."
+      : "Hay " + (Number(position) - 1) + " turno(s) antes del tuyo.";
+    const badges = [...groups].filter(([kind]) => kind !== "song").map(([kind, entries]) =>
+      '<div class="client-queue-badge" data-queue-kind="' + escapeHTML(kind) + '"><div class="client-queue-badge-head"><span>Atención · ' + entries.length + ' solicitud(es)</span><strong>Turno <b>' + Number(entries[0].position) + '</b></strong></div><small>' + turnDetail(entries[0].position) + '</small></div>');
+    if (state.currentTable) badges.unshift('<div class="client-queue-badge is-song" data-queue-kind="song"><div class="client-queue-badge-head"><span>♫ Música</span>'
+      + (songPosition ? '<strong>Turno <b>' + Number(songPosition) + '</b></strong>' : '<strong>Tu mesa</strong>')
+      + '</div><div class="client-queue-badge-stats"><span><b>' + songCount + '/5</b> canciones</span><span><b>' + Math.max(0, 5 - songCount) + '</b> disponibles</span></div><small>'
+      + (songPosition ? turnDetail(songPosition) : songCount ? 'Tu posición aparecerá al confirmarse el envío.' : 'Puedes solicitar hasta 5 canciones por turno.') + '</small></div>');
+    const markup = badges.join('') + [...notices.values()].map((notice) => {
       if (notice.requestIds) {
         const ids = [...notice.requestIds];
         return `<div class="client-notification" data-attending-request="${escapeHTML(ids[0])}"><strong>Te estamos atendiendo${ids.length > 1 ? " (" + ids.length + ")" : ""}</strong><small>Tu solicitud ${labels[notice.kind] || "de atención"} está siendo atendida en este momento.</small></div>`;
       }
-      const { kind, row, count } = notice;
-      return '<div class="client-notification"><strong>' + (kind === "song" ? "Canciones" : "Solicitudes" + (count > 1 ? " (" + count + ")" : ""))
-        + ': turno ' + Number(row.position) + '</strong><small>' + (Number(row.position) === 1 ? 'Tu mesa es la siguiente en el orden de llegada.' : 'Hay ' + (Number(row.position) - 1) + ' turno(s) antes del tuyo.')
-        + (kind === "song" ? ' · ' + count + '/5 canciones en este turno.' : '') + '</small></div>';
+      return '';
     }).join('');
+    box.hidden = !markup;
     if (state.clientNoticeMarkup !== markup) { state.clientNoticeMarkup = markup; box.innerHTML = markup; }
     window.clearTimeout(state.clientNoticeTimer);
     if (notices.size) state.clientNoticeTimer = window.setTimeout(renderClientQueue,
@@ -9004,6 +9029,8 @@ const App = (() => {
       toast("La cuenta cambió durante el cobro. Revisa el saldo y confirma nuevamente.", "error", "payment-changed-during-save");
       return;
     }
+    // El pulso sale al confirmar el guardado, antes de reconstruir la interfaz.
+    void openCashDrawer({ localOnly: true });
     const closePromise = closeSession(session.id, { paid: checkoutPaid, totals });
     $("#paymentDialog")?.close();
     renderInventory();
@@ -9011,9 +9038,6 @@ const App = (() => {
     renderIncomeReport();
     renderTips();
     buttons.forEach((button) => { button.disabled = false; });
-    // Toda venta guardada localmente abre la caja de este equipo, con o sin recibo.
-    // La orden usa el controlador existente y no espera la sincronizacion.
-    void openCashDrawer({ localOnly: true });
     if (shouldPrint) printThermalReceipt(session, invoice, receiptWindow);
     toast(`Pago registrado por ${paymentMethodLabel(payment.method)}. Factura ${invoice.number}.`, "ok", `paid:${session.id}`);
     state.paymentProcessing = false;

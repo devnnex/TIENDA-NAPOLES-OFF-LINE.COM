@@ -59,7 +59,7 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
     flushDurableWrites: async () => { calls.push('storage'); beforeDurableSave?.(state); return savedLocally; },
     closeSession: () => { calls.push('remote-close'); return closePromise; },
     rollbackLocalPayment: () => { calls.push('rollback'); },
-    renderInventory: () => {}, renderInventoryMovements: () => {}, renderIncomeReport: () => {}, renderTips: () => {},
+    renderInventory: () => calls.push('render-inventory'), renderInventoryMovements: () => {}, renderIncomeReport: () => {}, renderTips: () => {},
     printThermalReceipt: (paidSession, invoice, receiptWindow) => {
       assert.equal(paidSession.id, session.id);
       assert.equal(invoice.sessionId, session.id);
@@ -86,6 +86,7 @@ for (const method of ['cash', 'transfer', 'breb', 'mixed']) {
       assert.equal(app.calls.filter((call) => call === 'print').length, action === 'print' ? 1 : 0);
       assert.equal(app.calls.includes('popup'), action === 'print');
       assert.ok(app.calls.indexOf('storage') < app.calls.indexOf('drawer'));
+      assert.ok(app.calls.indexOf('drawer') < app.calls.indexOf('render-inventory'), 'El pulso sale antes de reconstruir la interfaz.');
       assert.equal(app.dialog.open, false);
       assert.equal(app.state.invoiceHistory.length, 1);
       // El hardware actua sin esperar la confirmacion remota, tambien offline.

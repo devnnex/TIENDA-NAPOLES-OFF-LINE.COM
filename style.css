@@ -5390,3 +5390,13 @@ body[data-page="client"] .system-modal.client-notification p { color: #245b3b; }
 .client-cover-image[hidden] { display: none; }
 .client-hero.has-cover::before { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; background: linear-gradient(180deg, rgba(12, 13, 17, .40), rgba(12, 13, 17, .88)); }
 .client-hero.has-cover > .topbar, .client-hero.has-cover > .hero-copy { position: relative; z-index: 2; }
+
+/* Turno y oportunidades visibles mientras las notificaciones caducan. */
+body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem; padding: .85rem 1rem; border: 1px solid #d7e3ef; border-radius: 16px; background: linear-gradient(135deg, #fff, #f1f6fc); box-shadow: 0 5px 18px rgba(28, 55, 88, .07); color: #26364c; }
+.client-queue-badge-head, .client-queue-badge-stats { display: flex; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap; }
+.client-queue-badge-head > span { font-size: .76rem; font-weight: 650; letter-spacing: .03em; }
+.client-queue-badge-head > strong { padding: .3rem .65rem; border-radius: 999px; background: #e5eefb; color: #2456a4; font-size: .75rem; font-weight: 600; }
+.client-queue-badge-head b { font-size: .95rem; }
+.client-queue-badge-stats > span { padding: .35rem .6rem; border: 1px solid #dce6f1; border-radius: 9px; background: rgba(255, 255, 255, .85); font-size: .75rem; color: #53647a; }
+.client-queue-badge-stats b { color: #26364c; font-weight: 650; }
+.client-queue-badge > small { color: #63748a; font-size: .73rem; line-height: 1.45; }

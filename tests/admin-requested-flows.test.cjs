@@ -99,7 +99,7 @@ test('Editar venta guarda los nuevos medios e importes y rechaza un mixto que no
     appsScriptRequest: async (action, payload) => { sent.push(payload.invoice); return { ok: true }; },
     readAppsScriptOutbox: () => [], enqueueAppsScriptJob: (action, payload) => sent.push(payload.invoice),
     persistInvoiceHistory() {}, loadIncomeReport: async () => {}, renderIncomeReport() {}, $: () => ({ close() {} }) });
-  vm.runInContext(section('saveIncomeEdit', 'exportIncomeCsv') + ';globalThis.save = saveIncomeEdit;', context);
+  vm.runInContext(section('incomeTotalsFromRecords', 'localIncomeRecords') + section('replaceEditedIncomeRecord', 'exportIncomeCsv') + ';globalThis.save = saveIncomeEdit;', context);
   await context.save(form);
   assert.deepEqual(JSON.parse(JSON.stringify(sent[0].payments)), [{ method: 'transfer', amount: 4000 }, { method: 'breb', amount: 6000 }]);
   state.incomeReport = { records: [record] };

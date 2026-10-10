@@ -43,6 +43,7 @@ const section = (start, end) => {
     window: { setTimeout(callback, delay) { assert.equal(delay, 2200); finishFlash = callback; } },
     $$: () => [addedRow],
     renderTableConsumptionPreview: () => undefined,
+    setTableConsumptionPreviewVisible: (visible) => assert.equal(visible, true, "Abre el desglose para mostrar el consumo agregado."),
     renderLastConsumptionTime: () => undefined,
     $: (selector) => ({
       "#consumptionDialog": dialog, "#consumptionForm": form,

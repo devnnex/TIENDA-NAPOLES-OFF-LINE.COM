@@ -6997,6 +6997,7 @@ const App = (() => {
       if (!force && matchesCache && typeof cached.report.revision === "string") {
         try {
           const status = await readAppsScriptStatus();
+          if (requestId !== state.incomeRequestId) return false;
           if (status?.ok && Object.prototype.hasOwnProperty.call(status, "historyRevision")
             && String(status.historyRevision || "") === cached.report.revision) {
             state.incomeReport = mergeIncomeReport(cached.report, filters);
@@ -7333,6 +7334,25 @@ const App = (() => {
     toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
   };
 
+  const replaceEditedIncomeRecord = (previous, next) => {
+    const report = state.incomeReport;
+    if (!report?.records?.some((entry) => String(entry.saleId) === String(previous.saleId))) return;
+    const before = incomeTotalsFromRecords([previous]);
+    const after = incomeTotalsFromRecords([next]);
+    const totals = { ...(report.totals || incomeTotalsFromRecords(report.records)) };
+    Object.keys(after).forEach((key) => {
+      if (key !== "averageTicket") totals[key] = Number(totals[key] || 0) - Number(before[key] || 0) + Number(after[key] || 0);
+    });
+    totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
+    const update = (records) => records.map((entry) => String(entry.saleId) === String(previous.saleId) ? next : entry);
+    state.incomeReport = {
+      ...report,
+      totals,
+      records: update(report.records),
+      ...(report.allLocalRecords ? { allLocalRecords: update(report.allLocalRecords) } : {})
+    };
+  };
+
   const saveIncomeEdit = async (form) => {
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(form.sale_id.value));
     if (!record) return;
@@ -7379,6 +7399,8 @@ const App = (() => {
       totals: { subtotal, discount: 0, tax: 0, serviceFee: 0, total },
       items
     };
+    state.incomeRequestId += 1;
+    state.incomeLoading = false;
     const jobs = readAppsScriptOutbox();
     const pendingSaleIndex = jobs.findIndex((job) => job.action === "record_sale"
       && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(record.saleId));
@@ -7390,7 +7412,7 @@ const App = (() => {
       writeAppsScriptOutbox(jobs);
       void flushAppsScriptOutbox();
     } else {
-      enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}`);
+      enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}:${uid()}`);
     }
     const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
     if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
@@ -7407,6 +7429,9 @@ const App = (() => {
       isMixed: corrected.paymentMethod === "mixed",
       reference: corrected.reference,
       subtotal,
+      discount: 0,
+      tax: 0,
+      service: 0,
       total,
       cost: correctedCost,
       profit: total - correctedCost,
@@ -7421,10 +7446,7 @@ const App = (() => {
         profit: item.quantity * (item.unit_price - item.unit_cost)
       }))
     };
-    state.incomeReport = {
-      ...state.incomeReport,
-      records: (state.incomeReport?.records || []).map((entry) => String(entry.saleId) === String(record.saleId) ? correctedRecord : entry)
-    };
+    replaceEditedIncomeRecord(record, correctedRecord);
     $("#incomeEditDialog")?.close();
     renderIncomeReport();
     toast("Venta corregida. Se sincronizara automaticamente.", "ok", `income-edited:${record.saleId}`);
@@ -8914,12 +8936,12 @@ const App = (() => {
   const setTableConsumptionPreviewVisible = (visible) => {
     const preview = $("#tableConsumptionPreview");
     const button = $("#viewTableConsumption");
-    if (!preview || !button || button.hidden) return;
-    visible = true;
-    preview.hidden = false;
+    if (!preview || !button) return;
+    visible = !window.matchMedia("(max-width: 640px)").matches || visible;
+    preview.hidden = !visible;
     button.innerHTML = visible
-      ? `${icon("list-x", 17)} Esconder lista`
-      : `${icon("receipt-text", 17)} Ver consumo`;
+      ? `${icon("list-x", 17)} Ocultar desglose`
+      : `${icon("receipt-text", 17)} Ver desglose`;
     button.setAttribute("aria-expanded", String(visible));
     refreshIcons();
   };
@@ -8962,17 +8984,18 @@ const App = (() => {
     const viewButton = $("#viewTableConsumption");
     const chargeButton = $("#chargeTableAccount");
     const releaseButton = $("#releaseEmptyTable");
-    if (viewButton) viewButton.hidden = emptyAccount;
+    if (viewButton) viewButton.hidden = emptyAccount || !session || isLocalWalkInSession(session);
     if (chargeButton) chargeButton.hidden = emptyAccount;
     if (releaseButton) releaseButton.hidden = !emptyAccount;
     actions.classList.toggle("is-single", emptyAccount);
     const quickCheckout = $("#consumptionForm")?.quick_checkout.value === "1";
-    preview.hidden = quickCheckout;
+    const previewWasVisible = $("#consumptionDialog")?.open && !preview.hidden;
+    preview.hidden = quickCheckout || (window.matchMedia("(max-width: 640px)").matches && !previewWasVisible);
     $("#consumptionLayout")?.classList.toggle("without-consumption-preview", quickCheckout);
     const productCount = items.reduce((total, item) => total + Number(item.quantity || 0), 0);
     preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(session ? sessionTotal(session) : 0)}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div data-consumption-item="${escapeHTML(item.id)}"><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
     if (session) preview.innerHTML += abonoRowsHtml(session) + (sessionPaid(session) ? `<div class="account-abono-summary">Saldo pendiente: ${money(sessionBalance(session))}</div>` : "");
-    if (!quickCheckout) setTableConsumptionPreviewVisible(true);
+    if (!quickCheckout) setTableConsumptionPreviewVisible(Boolean(previewWasVisible));
   };
 
   const addConsumptionBatch = async (form, drafts) => {
@@ -9209,6 +9232,7 @@ const App = (() => {
       if (!quickCheckout && dialog?.open) {
         const session = state.sessions.find((entry) => entry.id === sessionId);
         renderTableConsumptionPreview(session);
+        setTableConsumptionPreviewVisible(true);
         renderLastConsumptionTime(session);
         const addedIds = new Set((result.items || []).map((item) => String(item.id)));
         $$('[data-consumption-item]', $("#tableConsumptionPreview")).forEach((row) => {
@@ -10247,6 +10271,11 @@ const App = (() => {
       else showWaiterTableOptions();
     });
     document.addEventListener("pointerdown", (event) => {
+      if (event.button === 0 && event.target.closest('#consumptionDialog [data-cancel-consumption]')) {
+        event.preventDefault();
+        cancelConsumption();
+        return;
+      }
       if (!event.target.closest("#waiterTableCombobox")) closeWaiterTableOptions();
     });
     // La lista ocupa espacio en el modal. Cerrarla en pointerdown mueve

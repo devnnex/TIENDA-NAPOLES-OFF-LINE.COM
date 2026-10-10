@@ -10540,7 +10540,9 @@ const App = (() => {
     document.addEventListener("pointerdown", (event) => {
       if (event.button === 0 && event.target.closest('#consumptionDialog [data-cancel-consumption]')) {
         event.preventDefault();
-        cancelConsumption();
+        // En tactil el modal debe seguir abierto hasta el clic para que
+        // al soltar el dedo no se active una mesa que estaba debajo.
+        if (event.pointerType !== "touch") cancelConsumption();
         return;
       }
       if (!event.target.closest("#waiterTableCombobox")) closeWaiterTableOptions();

@@ -522,7 +522,6 @@ const App = (() => {
     serviceTableZoneFilter: "all",
     outdoorTableDraftIds: null,
     outdoorTableDraftDirty: false,
-    sectionRenderTimer: null,
     pwaBrandSignature: "",
     pwaBrandSyncToken: 0,
     pwaManifestObjectUrl: "",
@@ -709,7 +708,9 @@ const App = (() => {
     iconRefreshScheduled = true;
     window.requestAnimationFrame(() => {
       iconRefreshScheduled = false;
-      window.lucide?.createIcons();
+      window.lucide?.createIcons({
+        root: { querySelectorAll: (selector) => document.querySelectorAll(`${selector}:not(svg)`) }
+      });
     });
   };
 
@@ -918,39 +919,41 @@ const App = (() => {
       link.hidden = !canAccessAdminSection(target) || (link.hasAttribute("data-tip-feature") && !tipsEnabled());
       link.classList.toggle("active", target === section);
     });
-    clearTimeout(state.sectionRenderTimer);
-    state.sectionRenderTimer = window.setTimeout(() => {
-      if (state.activeAdminSection !== section) return;
-      if (section === "dashboard") {
-        renderAlerts();
-        renderTables();
+    if (section === "dashboard") {
+      renderAlerts();
+      renderTables();
+    }
+    if (section === "accounts") renderAccounts();
+    if (section === "tips") renderTips();
+    if (section === "service") renderServiceTables();
+    if (section === "menu") {
+      renderMenuManager();
+      renderTableManager();
+      renderTableFormQr();
+    }
+    if (section === "inventory") renderInventory();
+    if (section === "movements") {
+      renderInventoryMovements();
+      if (!state.syncFresh.movements) void loadInventoryMovements();
+    }
+    if (section === "income") {
+        if (enteringIncome) {
+        const previousRange = state.incomeReport?.filters;
+        const todayRange = incomeRangeDates("today");
+        setIncomeRange("today", false);
+        if (!previousRange || ["dateFrom", "dateTo", "startAt", "endAt"].some((key) =>
+          String(previousRange[key] || "") !== String(todayRange[key] || ""))) state.incomeReport = null;
       }
-      if (section === "accounts") renderAccounts();
-      if (section === "tips") renderTips();
-      if (section === "service") renderServiceTables();
-      if (section === "menu") {
-        renderTableManager();
-        renderTableFormQr();
-      }
-      if (section === "inventory") renderInventory();
-      if (section === "movements") {
-        renderInventoryMovements();
-        if (!state.syncFresh.movements) void loadInventoryMovements();
-      }
-      if (section === "income") {
-        state.incomeSaleTypeSnapshot = null;
-        if (enteringIncome) { setIncomeRange("today", false); state.incomeReport = null; }
-        renderSalesShift();
-        initializeIncomeFilters();
-        renderIncomeReport();
-        if (!state.incomeReport) void loadIncomeReport();
-        else void refreshBackgroundReports();
-      }
-      if (section === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
-      if (section === "users") renderUsers();
-      if (section === "assistant") renderAdminAi();
-      refreshIcons();
-    }, 60);
+      renderSalesShift();
+      initializeIncomeFilters();
+      renderIncomeReport();
+      if (!state.incomeReport) void loadIncomeReport();
+      else void refreshBackgroundReports();
+    }
+    if (section === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
+    if (section === "users") renderUsers();
+    if (section === "assistant") renderAdminAi();
+    refreshIcons();
   };
 
   const findTableFromUrl = () => {
@@ -6876,6 +6879,26 @@ const App = (() => {
     }
   };
 
+  const previewIncomeSearch = () => {
+    const filters = incomeFiltersFromForm();
+    const snapshot = state.incomeSaleTypeSnapshot;
+    if (!snapshot || snapshot.key !== incomeSaleTypeFiltersKey({ ...filters, query: "" })
+      || !Array.isArray(snapshot.report.records)
+      || snapshot.report.records.length < Number(snapshot.report.totalRecords || 0)) return false;
+    const query = normalizeText(filters.query || "");
+    const records = snapshot.report.records.filter((record) => !query || normalizeText([
+      record.invoice, record.table, record.payer, record.waiter, record.reference,
+      (record.items || []).map((item) => item.name).join(" ")
+    ].join(" ")).includes(query));
+    const ids = new Set(records.map((record) => String(record.saleId)));
+    state.incomeReport = mergeIncomeReport({ ...snapshot.report, records,
+      totals: incomeTotalsFromRecords(records), totalRecords: records.length,
+      recordRows: (snapshot.report.recordRows || []).filter((row) => ids.has(String(row.saleId))),
+      nextIndex: records.length, truncated: false }, filters);
+    renderIncomeReport();
+    return true;
+  };
+
   const incomePaymentLabel = (method) => ({
     cash: "Efectivo",
     transfer: "Transferencia",
@@ -7228,7 +7251,7 @@ const App = (() => {
           if (requestId !== state.incomeRequestId) return false;
           if (status?.ok && Object.prototype.hasOwnProperty.call(status, "historyRevision")
             && String(status.historyRevision || "") === cached.report.revision) {
-            if (filters.saleType && filters.saleType !== incomeFiltersFromForm().saleType) {
+            if (JSON.stringify(filters) !== JSON.stringify(incomeFiltersFromForm())) {
               state.incomeReloadRequested = true;
               return false;
             }
@@ -7250,7 +7273,7 @@ const App = (() => {
       if (requestId !== state.incomeRequestId) return false;
       if (filters.saleType && filters.saleType !== "all") result = await completeIncomeSaleTypeReport(result, filters, requestId);
       if (requestId !== state.incomeRequestId) return false;
-      if (filters.saleType && filters.saleType !== incomeFiltersFromForm().saleType) {
+      if (JSON.stringify(filters) !== JSON.stringify(incomeFiltersFromForm())) {
         state.incomeReloadRequested = true;
         return false;
       }
@@ -10274,7 +10297,8 @@ const App = (() => {
     });
     $("#incomeSearch")?.addEventListener("input", () => {
       clearTimeout(state.incomeSearchTimer);
-      state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 400);
+      const previewed = previewIncomeSearch();
+      state.incomeSearchTimer = window.setTimeout(() => void loadIncomeReport({ background: previewed }), previewed ? 150 : 0);
     });
     $("#incomePaymentMethod")?.addEventListener("change", () => void loadIncomeReport());
     $("#incomeSaleType")?.addEventListener("change", applyIncomeSaleTypeFilter);
@@ -11852,6 +11876,7 @@ const App = (() => {
     }
     const pendingScan = new URLSearchParams(location.search).get("scan") || "";
     await waitForAdminLogin();
+    const bootstrapReady = loadBootstrap();
     const cachedPins = readLocalJson(USER_CREDENTIALS_CACHE_KEY, {});
     state.userCredentialPins = cachedPins && typeof cachedPins === "object" && !Array.isArray(cachedPins) ? cachedPins : {};
     loadInventoryStore();
@@ -11859,7 +11884,8 @@ const App = (() => {
     state.soundEnabled = localStorage.getItem("waiter_alarm_enabled") !== "0";
     if (state.soundEnabled) localStorage.setItem("waiter_alarm_enabled", "1");
     const initialSection = pendingScan ? "service" : (location.hash.replace("#", "") || "dashboard");
-    renderAdmin();
+    renderAdminShell();
+    renderBusinessForm();
     renderUsers();
     showAdminSection(initialSection);
     updateAlarmButton();
@@ -11870,10 +11896,11 @@ const App = (() => {
     startAdminPolling();
     startAlarmLoop();
     setLoading(false);
-    await loadBootstrap();
-    await ensurePresetCategories();
-    renderAdmin();
-    showAdminSection(initialSection);
+    await bootstrapReady;
+    void ensurePresetCategories();
+    renderAdminShell();
+    renderBusinessForm();
+    showAdminSection(state.activeAdminSection || initialSection);
     renderTableFormQr();
     initRemoteStorage();
     startRemoteStoragePolling();
@@ -11914,10 +11941,10 @@ const App = (() => {
       input.blur();
     }, { capture: true, passive: false });
     state.page = document.body.dataset.page || "";
+    const pwaReady = registerPwa();
     await hydrateDurableLocalState();
     await recoverInterruptedAppsScriptJobs();
-    await registerPwa();
-    await waitForPwaController();
+    if (!navigator.serviceWorker?.controller && await pwaReady) await waitForPwaController();
     reportNetworkStatus();
     navigator.serviceWorker?.ready.then(startOfflineSyncPulse).catch(() => undefined);
     window.addEventListener("online", () => {

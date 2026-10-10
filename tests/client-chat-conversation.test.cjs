@@ -39,7 +39,7 @@ function harness() {
       } } };
     } }
   };
-  const sent = [];
+  const sent = [], notifications = [];
   let gate = null, release;
   const context = vm.createContext({
     state, Date: clock, console, uid: () => `local-${++serial}`,
@@ -47,6 +47,8 @@ function harness() {
     normalizeText: value => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase(),
     icon: () => '', escapeHTML: value => String(value), refreshIcons() {},
     tableCode: () => 'code', songTurnCount: () => 0, broadcastChatEvent() {},
+    tableLabel: () => 'Mesa 1', polishGuestText: text => text,
+    createServiceNotification: async (type, message) => { notifications.push({ type, message }); },
     retryQuiet: async factory => (await factory())?.data || null
   });
   vm.runInContext(section('assistantSay', 'activateSongRequestMode')
@@ -54,7 +56,7 @@ function harness() {
     + section('handleAssistantMessage', 'handleSongRequest')
     + ';globalThis.api = { assistantSay, renderAssistant, persistChatMessage, handleAssistantMessage };', context);
   return {
-    api: context.api, state, chat, sent, renders: () => renders,
+    api: context.api, state, chat, sent, notifications, renders: () => renders,
     advance: seconds => { now += seconds * 1000; },
     pause: () => { gate = new Promise(resolve => { release = resolve; }); },
     release: () => { release(); gate = null; }
@@ -90,6 +92,7 @@ function harness() {
   repeating.pause();
   await repeating.api.handleAssistantMessage('Gracias');
   await repeating.api.handleAssistantMessage('Gracias');
+  assert.equal(repeating.notifications.length, 2, 'Cada mensaje repetido genera una solicitud aunque el chat siga activo.');
   assert.equal((repeating.chat.innerHTML.match(/>Gracias<\/div>/g) || []).length, 3, 'Repetir el mismo texto conserva cada envío como un mensaje distinto.');
   assert.deepEqual(repeating.sent.map(payload => payload.p_message_id), ['local-1', 'local-2'], 'La confirmación remota usa el ID del mensaje mostrado inmediatamente.');
   repeating.release();

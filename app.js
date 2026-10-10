@@ -3335,7 +3335,7 @@ const App = (() => {
       writeRequestOutbox(outbox);
     }
     window.clearTimeout(state.requestOutboxTimer);
-    state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 0);
+    void flushRequestOutbox();
   };
 
   const signalRequestArrival = async (attempt = 0, requestIds = []) => {
@@ -3427,7 +3427,7 @@ const App = (() => {
       state.requestOutboxBusy = false;
       if (readRequestOutbox().length) {
         window.clearTimeout(state.requestOutboxTimer);
-        state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 350);
+        state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 0);
       }
     }
   };
@@ -3870,12 +3870,10 @@ const App = (() => {
         void persistChatMessage("client", text, { sessionId: session.id, table: state.currentTable, messageId: localMessage?.id }).then((saved) => {
           if (saved) broadcastChatEvent("chat-refresh");
         });
-        if (!state.adminChatActive) {
-          await createServiceNotification(
-            "other",
-            `${tableLabel(state.currentTable)} escribió en el chat: ${polishGuestText(text)}`
-          );
-        }
+        await createServiceNotification(
+          "other",
+          `${tableLabel(state.currentTable)} escribió en el chat: ${polishGuestText(text)}`
+        );
       }
     }
     if (state.adminChatActive) return;

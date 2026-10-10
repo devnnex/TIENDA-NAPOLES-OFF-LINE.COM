@@ -4447,7 +4447,7 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
 
 /* Navegación operativa, contador y perfil compacto */
 .admin-sidebar nav a { min-width: 0; }
-.service-nav-link { position: relative; }
+.dashboard-nav-link { position: relative; }
 .nav-request-badge {
   display: inline-grid;
   place-items: center;
@@ -5383,3 +5383,9 @@ body[data-page="client"] .system-modal.client-notification p { color: #245b3b; }
 .alert-card .alert-request-list li:last-child { border-bottom: 0; }
 .alert-card .alert-request-list p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; font-weight: 400; line-height: 1.45; }
 .alert-card .alert-request-list time { display: block; margin-top: .15rem; color: #667085; font-size: .68rem; }
+
+/* Portada completa, con su proporcion original y sin texto superpuesto. */
+.client-hero.has-cover { min-height: 0; align-content: start; gap: 1rem; background: #24272d; }
+.client-cover-image { display: block; width: 100%; height: auto; object-fit: contain; }
+.client-cover-image[hidden] { display: none; }
+.client-hero.has-cover .hero-copy { padding: 0 .25rem 1.4rem; }

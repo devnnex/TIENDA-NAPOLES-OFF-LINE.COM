@@ -1610,8 +1610,14 @@ const App = (() => {
       }
     });
     const cover = $(".client-hero");
-    if (cover && state.business?.cover_url) {
-      cover.style.backgroundImage = `linear-gradient(180deg, rgba(12,13,17,.40), rgba(12,13,17,.88)), url('${state.business.cover_url}')`;
+    const coverImage = $("#clientCoverImage");
+    if (cover && coverImage) {
+      const coverUrl = state.business?.cover_url || "";
+      cover.classList.toggle("has-cover", Boolean(coverUrl));
+      coverImage.hidden = !coverUrl;
+      coverImage.alt = `Portada de ${state.business?.business_name || "nuestro negocio"}`;
+      if (coverUrl && coverImage.getAttribute("src") !== coverUrl) coverImage.src = coverUrl;
+      if (!coverUrl) coverImage.removeAttribute("src");
     }
     if (state.business) void syncPwaBranding();
   };

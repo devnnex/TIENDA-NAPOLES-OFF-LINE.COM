@@ -5278,12 +5278,20 @@ const App = (() => {
       const group = groups.get(key);
       if (group) {
         group.request_ids.push(request.id);
+        group.entries.push(request);
         group.count += 1;
       } else {
-        groups.set(key, { ...request, kind, request_ids: [request.id], count: 1, latest_message: request.message || "" });
+        groups.set(key, { ...request, kind, request_ids: [request.id], entries: [request], count: 1, latest_message: request.message || "" });
       }
     });
     return [...groups.values()];
+  };
+
+  const requestGroupDetailsHtml = (request) => {
+    if (!["song", "chat"].includes(request.kind) || request.count < 2) return "";
+    const key = JSON.stringify([request.table_id, request.kind]);
+    const entries = [...request.entries].reverse();
+    return `<details class="alert-request-details" data-request-group="${escapeHTML(key)}"><summary>Ver desglose (${request.count})</summary><ol class="alert-request-list">${entries.map((entry) => `<li data-request-entry="${escapeHTML(entry.id)}"><p>${escapeHTML(entry.message || "Sin mensaje")}</p><time datetime="${escapeHTML(entry.created_at || "")}">${escapeHTML(prettyDateTime(entry.created_at))}</time></li>`).join("")}</ol></details>`;
   };
 
   const renderAlerts = () => {
@@ -5293,7 +5301,8 @@ const App = (() => {
     const visibleAlerts = state.alertFilter === "all"
       ? alerts
       : alerts.filter((request) => request.kind === state.alertFilter);
-    const renderSignature = `${state.alertFilter}:${visibleAlerts.map((request) => `${request.request_ids.join(",")}:${request.count}:${request.latest_message}`).join("|")}`;
+    const renderSignature = JSON.stringify([state.alertFilter, visibleAlerts.map((request) =>
+      [request.kind, request.request_ids, request.entries.map((entry) => [entry.id, entry.message, entry.created_at])])]);
     box.classList.toggle("has-alerts", alerts.length > 0);
     const alertCards = visibleAlerts
       .map(
@@ -5313,6 +5322,7 @@ const App = (() => {
                   <h3><mark class="alert-table-name">${escapeHTML(tableLabel(request.restaurant_tables))}</mark></h3>
                   ${request.message && !parseBillMessage(request.message) ? `<p>${escapeHTML(request.message)}</p>` : ""}
                   <p>${prettyDateTime(request.created_at)}</p>
+                  ${requestGroupDetailsHtml(request)}
                 </div>
                 ${request.count > 1 ? `<strong class="alert-count" aria-label="${request.count} llamados">${request.count}</strong>` : ""}
                 <button class="primary" data-accept-request="${request.request_ids.join(",")}">${icon("check", 17)} Aceptar</button>
@@ -5323,10 +5333,18 @@ const App = (() => {
 
     $("#floatingAlerts")?.remove();
     if (renderSignature !== state.alertRenderSignature) {
+      const expanded = new Map([...(box.querySelectorAll?.(".alert-request-details[open]") || [])]
+        .map((details) => [details.dataset.requestGroup, details.querySelector(".alert-request-list")?.scrollTop || 0]));
       state.alertRenderSignature = renderSignature;
       box.innerHTML = visibleAlerts.length
         ? alertCards
         : emptyState("Sin solicitudes en este filtro", "Las nuevas solicitudes se acumularan aqui.", "bell");
+      (box.querySelectorAll?.(".alert-request-details") || []).forEach((details) => {
+        if (!expanded.has(details.dataset.requestGroup)) return;
+        details.open = true;
+        const list = details.querySelector(".alert-request-list");
+        if (list) list.scrollTop = expanded.get(details.dataset.requestGroup);
+      });
     }
 
     const signature = requestSignature();
@@ -9184,7 +9202,7 @@ const App = (() => {
     preview.hidden = quickCheckout || (window.matchMedia("(max-width: 640px)").matches && !previewWasVisible);
     $("#consumptionLayout")?.classList.toggle("without-consumption-preview", quickCheckout);
     const productCount = items.reduce((total, item) => total + Number(item.quantity || 0), 0);
-    preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(session ? sessionTotal(session) : 0)}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<div data-consumption-item="${escapeHTML(item.id)}"><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
+    preview.innerHTML = `<div class="table-consumption-preview-head"><span class="table-consumption-preview-title"><span>Consumo actual</span><small>${productCount.toLocaleString("es-CO")} ${productCount === 1 ? "producto" : "productos"}</small></span><strong>${money(session ? sessionTotal(session) : 0)}</strong></div><div class="table-consumption-preview-lines">${items.map((item) => { const formatted = formatConsumptionTimestamp(item.created_at); return `<button class="table-consumption-edit" type="button" data-consumption-item="${escapeHTML(item.id)}" data-edit-consumption="${escapeHTML(item.id)}" data-session-id="${escapeHTML(session.id)}" aria-label="Editar ${escapeHTML(item.item_name)}" aria-pressed="${$("#consumptionForm")?.session_item_id.value === item.id}"><span class="table-consumption-item"><span>${Number(item.quantity || 0)} × ${escapeHTML(item.item_name)}</span>${formatted ? `<time datetime="${escapeHTML(item.created_at)}">${escapeHTML(formatted)}</time>` : ""}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></button>`; }).join("") || "<small>Sin consumos registrados.</small>"}</div>`;
     if (session) preview.innerHTML += abonoRowsHtml(session) + (sessionPaid(session) ? `<div class="account-abono-summary">Saldo pendiente: ${money(sessionBalance(session))}</div>` : "");
     if (!quickCheckout) setTableConsumptionPreviewVisible(Boolean(previewWasVisible));
   };
@@ -9539,7 +9557,12 @@ const App = (() => {
     const item = session?.session_items?.find((entry) => entry.id === itemId);
     const form = $("#consumptionForm");
     const dialog = $("#consumptionDialog");
-    if (!session || !item || !form || !dialog) return;
+    if (!session || !item || item.status === "cancelled" || !form || !dialog || form.dataset.localSubmitInProgress === "1") return;
+    const keepPreview = dialog.open && !$("#tableConsumptionPreview")?.hidden && form.session_id.value === session.id;
+    if (keepPreview && state.consumptionDrafts.length) {
+      toast("Confirma o elimina la seleccion pendiente antes de editar un consumo.", "error", "pending-items-before-edit");
+      return;
+    }
     form.reset();
     form.session_id.value = session.id;
     form.session_item_id.value = item.id;
@@ -9548,10 +9571,10 @@ const App = (() => {
     form.quantity.required = true;
     applyConsumptionRoleRestrictions(form);
     state.consumptionDrafts = [];
+    state.consumptionDraftEditIndex = -1;
     renderConsumptionSelection();
-    if ($("#tableSessionActions")) $("#tableSessionActions").hidden = true;
-    if ($("#tableConsumptionPreview")) $("#tableConsumptionPreview").hidden = true;
-    $("#consumptionLayout")?.classList.add("without-consumption-preview");
+    if (!keepPreview && $("#tableConsumptionPreview")) $("#tableConsumptionPreview").hidden = true;
+    $("#consumptionLayout")?.classList.toggle("without-consumption-preview", !keepPreview);
     if ($("#consumptionQueueButton")) $("#consumptionQueueButton").hidden = true;
     if ($("#consumptionEyebrow")) $("#consumptionEyebrow").textContent = "Consumo";
     if ($("#consumptionDialogTitle")) $("#consumptionDialogTitle").textContent = "Editar consumo";
@@ -9567,10 +9590,14 @@ const App = (() => {
     if (optionalFields) optionalFields.open = true;
     const product = state.items.find((entry) => entry.id === item.menu_item_id);
     const productSearch = $("#consumptionProductSearch");
-    if (productSearch) productSearch.value = product ? `${inventoryFor(product).code} · ${product.name}` : "";
-    renderConsumptionProductOptions(product?.name || "");
+    if (productSearch) productSearch.value = product ? `${inventoryFor(product).code} · ${product.name}` : item.item_name || "";
+    renderConsumptionProductOptions(product?.name || item.item_name || "");
     closeConsumptionProductOptions();
-    dialog.showModal();
+    if (keepPreview) renderTableConsumptionPreview(session);
+    if ($("#tableSessionActions")) $("#tableSessionActions").hidden = true;
+    if (!dialog.open) dialog.showModal();
+    form.quantity.focus({ preventScroll: true });
+    form.quantity.select();
     refreshIcons();
   };
 

@@ -4254,10 +4254,10 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
 .table-session-actions button { width: 100%; justify-content: center; }
 .table-consumption-preview { display: grid; gap: .55rem; max-height: 240px; overflow-y: auto; padding: .75rem; border: 1px solid rgba(240, 90, 40, .2); border-radius: 14px; background: #fffaf7; }
 .table-consumption-preview-head,
-.table-consumption-preview-lines > div { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.table-consumption-preview-lines > :is(div, .table-consumption-edit) { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .table-consumption-preview-head { padding-bottom: .5rem; border-bottom: 1px dashed rgba(18, 24, 31, .16); }
 .table-consumption-preview-lines { display: grid; gap: .42rem; }
-.table-consumption-preview-lines > div { color: #4f5967; font-size: .79rem; }
+.table-consumption-preview-lines > :is(div, .table-consumption-edit) { color: #4f5967; font-size: .79rem; }
 .table-consumption-preview-lines strong { color: #17191f; white-space: nowrap; }
 .table-consumption-preview-title { display: inline-flex; align-items: baseline; gap: .45rem; min-width: 0; }
 .table-consumption-preview-title > small { color: #7a8492; font-size: .68rem; font-weight: 750; white-space: nowrap; }
@@ -5326,9 +5326,9 @@ body[data-user-role="waiter"] #consumptionDialog #tableConsumptionPreview:not([h
   #consumptionDialog .table-consumption-preview-title > small { color: #64748b; font-size: .75rem; font-weight: 400; }
   #consumptionDialog .table-consumption-preview-lines { gap: 0; }
   #consumptionDialog .table-consumption-item { min-width: 0; overflow-wrap: anywhere; }
-  #consumptionDialog .table-consumption-preview-lines > div { align-items: start; gap: .75rem; padding: .8rem 0; border-bottom: 1px solid #edf1f5; color: #263447; font-size: .9rem; font-weight: 450; line-height: 1.5; }
+  #consumptionDialog .table-consumption-preview-lines > :is(div, .table-consumption-edit) { align-items: start; gap: .75rem; padding: .8rem 0; border-bottom: 1px solid #edf1f5; color: #263447; font-size: .9rem; font-weight: 450; line-height: 1.5; }
   #consumptionDialog .table-consumption-preview-lines strong { color: #20334b; font-weight: 600; font-variant-numeric: tabular-nums; }
-  #consumptionDialog .table-consumption-preview-lines > div:last-child { border-bottom: 0; }
+  #consumptionDialog .table-consumption-preview-lines > :is(div, .table-consumption-edit):last-child { border-bottom: 0; }
   #consumptionDialog .table-consumption-item time { color: #718096; font-size: .75rem; font-weight: 400; line-height: 1.4; }
 }
 .consumption-just-added { border-radius: 8px; animation: consumptionAddedFlash .55s ease-in-out 4; }
@@ -5371,3 +5371,15 @@ body[data-page="client"] .system-modal.client-notification p { color: #245b3b; }
 .income-sale-type[data-sale-type="walk_in"] { color: #2456a4; background: #e9f1ff; }
 #businessForm .brand-asset-preview { width: 100%; height: 140px; object-fit: cover; border-radius: 12px; border: 1px solid #e1e7ef; }
 #businessForm [data-upload-box="logo_url"] .brand-asset-preview { object-fit: contain; background: #f8fafc; }
+
+/* Edicion del consumo guardado y detalle de solicitudes agrupadas. */
+:where(#consumptionDialog) .table-consumption-edit { width: 100%; min-height: 0; padding: 0; border: 0; border-radius: 8px; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+#consumptionDialog .table-consumption-edit:hover, #consumptionDialog .table-consumption-edit[aria-pressed="true"] { background: #fff0e6; }
+#consumptionDialog .table-consumption-edit:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.alert-card .alert-request-details { min-width: 0; margin-top: .5rem; }
+.alert-card .alert-request-details summary { width: fit-content; padding: .3rem 0; font-size: .78rem; font-weight: 650; cursor: pointer; }
+.alert-card .alert-request-list { max-height: 220px; overflow-y: auto; overscroll-behavior: contain; margin: .4rem 0 0; padding: .55rem .7rem .55rem 1.8rem; border: 1px solid rgba(18, 24, 31, .12); border-radius: 10px; background: rgba(255, 255, 255, .75); }
+.alert-card .alert-request-list li { padding: .45rem .15rem; border-bottom: 1px solid rgba(18, 24, 31, .08); }
+.alert-card .alert-request-list li:last-child { border-bottom: 0; }
+.alert-card .alert-request-list p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; font-weight: 400; line-height: 1.45; }
+.alert-card .alert-request-list time { display: block; margin-top: .15rem; color: #667085; font-size: .68rem; }

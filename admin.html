@@ -418,6 +418,15 @@
             <label class="income-search">Buscar factura, mesa, producto o responsable
               <span><i data-lucide="search"></i><input id="incomeSearch" name="query" type="search" autocomplete="off" placeholder="Ej. TN-2026, Mesa 4, cerveza..."></span>
             </label>
+            <label>Tipo de venta
+              <select id="incomeSaleType" name="sale_type">
+                <option value="all">Todas las ventas</option>
+                <option value="walk_in">Ventas individuales</option>
+                <option value="table">Mesas</option>
+                <option value="bar">Barra</option>
+                <option value="planter">Materas</option>
+              </select>
+            </label>
             <label>Medio de pago
               <select id="incomePaymentMethod" name="payment_method">
                 <option value="all">Todos los medios</option>

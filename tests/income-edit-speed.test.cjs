@@ -26,7 +26,7 @@ function setup() {
     elements: { namedItem: name => amounts[name] } };
   let closed = 0, rendered = 0, saved = 0, nextId = 0;
   const jobs = [], calls = [], notices = [];
-  const context = vm.createContext({ state, isBoss: () => true, $$: () => [row],
+  const context = vm.createContext({ incomeRecordSaleType: () => "table", state, isBoss: () => true, $$: () => [row],
     $: selector => selector === '#incomeEditDialog' ? { close() { closed++; } } : {},
     uid: () => 'operation-' + ++nextId, currencyInputNumber: input => Number(input.value),
     persistInvoiceHistory() { saved++; }, renderIncomeReport() { rendered++; },

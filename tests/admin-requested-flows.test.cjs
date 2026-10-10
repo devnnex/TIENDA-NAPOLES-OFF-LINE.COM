@@ -94,7 +94,7 @@ test('Editar venta guarda los nuevos medios e importes y rechaza un mixto que no
     elements: { namedItem: name => fieldValues[name] }, querySelector: () => ({ disabled: false }) };
   const state = { incomeReport: { records: [record] }, invoiceHistory: [{ id: 'sale-1' }] };
   const sent = [], errors = [];
-  const context = vm.createContext({ state, isBoss: () => true, $$: () => [row], uid: () => 'line-1',
+  const context = vm.createContext({ incomeRecordSaleType: () => "table", state, isBoss: () => true, $$: () => [row], uid: () => 'line-1',
     currencyInputNumber: input => Number(input.value), toast: (message, kind) => { if (kind === 'error') errors.push(message); },
     appsScriptRequest: async (action, payload) => { sent.push(payload.invoice); return { ok: true }; },
     readAppsScriptOutbox: () => [], enqueueAppsScriptJob: (action, payload) => sent.push(payload.invoice),

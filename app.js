@@ -926,6 +926,7 @@ const App = (() => {
         if (!state.syncFresh.movements) void loadInventoryMovements();
       }
       if (section === "income") {
+        state.incomeSaleTypeSnapshot = null;
         if (enteringIncome) { setIncomeRange("today", false); state.incomeReport = null; }
         renderSalesShift();
         initializeIncomeFilters();
@@ -5504,6 +5505,35 @@ const App = (() => {
     }
   };
 
+  const renderBrandAssetFields = (form) => {
+    ["logo_url", "cover_url"].forEach((field) => {
+      const draft = state.brandAssetDrafts?.[field];
+      form[field].value = draft ?? state.business?.[field] ?? "";
+      const status = $(`[data-upload-status="${field}"]`);
+      const box = $(`[data-upload-box="${field}"]`);
+      const uploading = state.brandAssetUploads?.has(field);
+      if (status) status.textContent = uploading ? "Subiendo..." : draft ? "Imagen cargada. Guarda para aplicar." : form[field].value ? "Imagen cargada" : "Seleccionar imagen";
+      box?.classList.toggle("has-file", Boolean(form[field].value));
+      box?.classList.toggle("is-uploading", Boolean(uploading));
+      if (!box) return;
+      let preview = box.querySelector(".brand-asset-preview");
+      if (!form[field].value) { preview?.remove(); return; }
+      if (!preview) {
+        preview = document.createElement("img");
+        preview.className = "brand-asset-preview";
+        preview.alt = field === "logo_url" ? "Vista previa del logo" : "Vista previa de la portada";
+        box.appendChild(preview);
+      }
+      if (preview.getAttribute("src") !== form[field].value) preview.src = form[field].value;
+    });
+  };
+
+  const clearSavedBrandAssetDrafts = (saved) => {
+    ["logo_url", "cover_url"].forEach((field) => {
+      if (state.brandAssetDrafts && state.brandAssetDrafts[field] === saved?.[field]) delete state.brandAssetDrafts[field];
+    });
+  };
+
   const renderBusinessForm = () => {
     const form = $("#businessForm");
     if (!form) return;
@@ -5520,15 +5550,7 @@ const App = (() => {
     if (tipStatus) tipStatus.textContent = tipsEnabled()
       ? `Activa: ${state.tipSettings.percentage}% de propina voluntaria. Apágala para cambiar el porcentaje.`
       : "Configura el porcentaje y enciende el switch para aplicarlo.";
-    form.logo_url.value = state.business?.logo_url || "";
-    form.cover_url.value = state.business?.cover_url || "";
-    ["logo_url", "cover_url"].forEach((field) => {
-      const status = $(`[data-upload-status="${field}"]`);
-      const box = $(`[data-upload-box="${field}"]`);
-      const hasImage = Boolean(form[field]?.value);
-      if (status) status.textContent = hasImage ? "Imagen cargada" : "Seleccionar imagen";
-      box?.classList.toggle("has-file", hasImage);
-    });
+    renderBrandAssetFields(form);
     renderOutdoorTableConfigurator();
   };
 
@@ -6731,9 +6753,68 @@ const App = (() => {
       dateTo: $("#incomeDateTo")?.value || dateInputValue(new Date()),
       ...(current || {}),
       paymentMethod: $("#incomePaymentMethod")?.value || "all",
+      saleType: $("#incomeSaleType")?.value || "all",
       query: $("#incomeSearch")?.value.trim() || "",
       limit: 300
     };
+  };
+
+  const incomeSaleTypeLabel = (type) => ({ all: "Todas las ventas", walk_in: "Venta individual", table: "Mesa", bar: "Barra", planter: "Matera" }[type] || "Todas las ventas");
+
+  const incomeRecordSaleType = (record) => {
+    const stored = (state.invoiceHistory || []).find((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
+    if (record.saleChannel === "walk_in" || stored?.saleChannel === "walk_in"
+      || normalizeText(record.table || "") === "venta individual" || String(record.sessionId || "").startsWith("walk-in-")) return "walk_in";
+    const tableId = record.tableId || stored?.tableId;
+    const table = (state.tables || []).find((entry) => tableId ? String(entry.id) === String(tableId) : normalizeText(tableLabel(entry)) === normalizeText(record.table || ""));
+    return servicePointKind(table || { table_name: record.table }) || "table";
+  };
+
+  const filterIncomeReportBySaleType = (report, filters) => {
+    if (!filters.saleType || filters.saleType === "all") return report;
+    const records = (report.records || []).filter((record) => incomeRecordSaleType(record) === filters.saleType);
+    const ids = new Set(records.map((record) => String(record.saleId)));
+    return { ...report, records, totals: incomeTotalsFromRecords(records), totalRecords: records.length,
+      recordRows: (report.recordRows || []).filter((row) => ids.has(String(row.saleId))),
+      nextIndex: records.length, truncated: false,
+      pendingCount: Math.min(Number(report.pendingCount || 0), records.length) };
+  };
+
+  const completeIncomeSaleTypeReport = async (report, filters, requestId) => {
+    if (!filters.saleType || filters.saleType === "all") return report;
+    const records = new Map((report.records || []).map((record) => [String(record.saleId), record]));
+    const missing = (report.recordRows || []).filter((row) => !records.has(String(row.saleId)));
+    if (Number(report.totalRecords || 0) > records.size && !Array.isArray(report.recordRows)) {
+      throw new Error("El historial no devolvio las paginas necesarias para filtrar todas las ventas.");
+    }
+    for (let offset = 0; offset < missing.length; offset += 300) {
+      if (requestId !== state.incomeRequestId) return report;
+      const pageRows = missing.slice(offset, offset + 300);
+      const page = await appsScriptRequest("get_income_report", { filters: { ...filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
+      if (requestId !== state.incomeRequestId) return report;
+      if (!page?.ok || page.stale || !Array.isArray(page.records)
+        || (filters.startAt && page.intervalApplied !== true)) throw new Error(page?.error || "El historial cambio. Actualiza el filtro de ventas.");
+      const pageIds = new Set(page.records.map((record) => String(record.saleId)));
+      if (pageRows.some((row) => !pageIds.has(String(row.saleId)))) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
+      page.records.forEach((record) => records.set(String(record.saleId), record));
+    }
+    if (Number(report.totalRecords || 0) > records.size) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
+    return { ...report, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
+  };
+
+  const incomeSaleTypeFiltersKey = (filters) => JSON.stringify({ ...filters, saleType: "all" });
+
+  const applyIncomeSaleTypeFilter = () => {
+    const filters = incomeFiltersFromForm();
+    const snapshot = state.incomeSaleTypeSnapshot;
+    if (state.incomeLoading) state.incomeReloadRequested = true;
+    if (snapshot && snapshot.key === incomeSaleTypeFiltersKey(filters)) {
+      state.incomeReport = mergeIncomeReport(snapshot.report, filters);
+      renderIncomeReport();
+      void loadIncomeReport({ background: true });
+    } else {
+      void loadIncomeReport();
+    }
   };
 
   const incomePaymentLabel = (method) => ({
@@ -6793,6 +6874,8 @@ const App = (() => {
         saleId: invoice.id || invoice.sessionId,
         invoice: invoice.number || "Factura",
         sessionId: invoice.sessionId || "",
+        saleChannel: invoice.saleChannel,
+        tableId: invoice.tableId,
         table: invoice.table || "Mesa",
         date: invoice.createdAt || new Date().toISOString(),
         payer: invoice.payerName || "",
@@ -6811,6 +6894,7 @@ const App = (() => {
       };
     }).filter((record) => {
       if (!SalesShift.matches(record.date, filters)) return false;
+      if (filters.saleType && filters.saleType !== "all" && incomeRecordSaleType(record) !== filters.saleType) return false;
       if (filters.paymentMethod === "mixed" && !record.isMixed) return false;
       if (!["all", "mixed"].includes(filters.paymentMethod) && !record.payments.some((payment) => payment.method === filters.paymentMethod)) return false;
       const haystack = normalizeText([record.invoice, record.table, record.payer, record.waiter, record.reference, record.items.map((item) => item.name).join(" ")].join(" "));
@@ -6854,7 +6938,7 @@ const App = (() => {
       totals[key] = Number(totals[key] || 0) - Number(excludedTotals[key] || 0) + Number(pendingTotals[key] || 0);
     });
     totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
-    return {
+    const report = {
       ...remote,
       filters,
       totals,
@@ -6863,6 +6947,7 @@ const App = (() => {
       pendingCount: pending.length,
       localOnly: false
     };
+    return filters.saleType && filters.saleType !== "all" ? filterIncomeReportBySaleType(report, filters) : report;
   };
 
   const setIncomeReportStatus = (message, tone = "ready", iconName = "badge-check") => {
@@ -6985,7 +7070,8 @@ const App = (() => {
     const filters = report.filters || incomeFiltersFromForm();
     if (summaryTarget) {
       const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
-      summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
+      const typeText = incomeSaleTypeLabel(filters.saleType);
+      summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)} · ${escapeHTML(typeText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
     }
     recordsTarget.innerHTML = allRecords.length
       ? visibleRecords.map((record) => {
@@ -6994,7 +7080,7 @@ const App = (() => {
           return `<article class="income-record">
             <div class="income-record-main">
               <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><div class="income-record-actions"><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button><button class="icon-btn danger" type="button" data-delete-income="${escapeHTML(record.saleId)}" aria-label="Eliminar venta completa">${icon("trash-2", 15)}</button></div></div>
-              <div><small>Mesa / responsable</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
+              <div><small class="income-sale-type" data-sale-type="${incomeRecordSaleType(record)}">${escapeHTML(incomeSaleTypeLabel(incomeRecordSaleType(record)))}</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
               <div><small>Atendido por</small><strong>${escapeHTML(record.waiter || "Sin asignar")}</strong><span>${escapeHTML(record.reference || "Sin referencia")}</span></div>
               <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span class="income-record-profit">Ganancia ${money(record.profit)}</span></div>
             </div>
@@ -7037,7 +7123,9 @@ const App = (() => {
     }
     if (!navigator.onLine && !verifiedConnection) {
       const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
-      const matchesCache = cached?.filters && JSON.stringify(cached.filters) === JSON.stringify(filters)
+      const matchesCache = cached?.filters && (JSON.stringify(cached.filters) === JSON.stringify(filters)
+        || ((cached.report?.records || []).length >= Number(cached.report?.totalRecords || 0)
+          && JSON.stringify({ ...cached.filters, saleType: "all" }) === JSON.stringify({ ...filters, saleType: "all" })))
         && Array.isArray(cached.report?.records);
       state.incomeReport = matchesCache
         ? { ...mergeIncomeReport(cached.report, filters), localOnly: true }
@@ -7058,7 +7146,9 @@ const App = (() => {
     const requestId = ++state.incomeRequestId;
     const previousReport = state.incomeReport;
     const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
-    const matchesCache = cached?.filters && JSON.stringify(cached.filters) === JSON.stringify(filters)
+    const matchesCache = cached?.filters && (JSON.stringify(cached.filters) === JSON.stringify(filters)
+      || ((cached.report?.records || []).length >= Number(cached.report?.totalRecords || 0)
+        && JSON.stringify({ ...cached.filters, saleType: "all" }) === JSON.stringify({ ...filters, saleType: "all" })))
       && Array.isArray(cached.report?.records);
     const filtersChanged = JSON.stringify(previousReport?.filters || null) !== JSON.stringify(filters);
     state.syncFresh.sales = false;
@@ -7079,6 +7169,10 @@ const App = (() => {
           if (requestId !== state.incomeRequestId) return false;
           if (status?.ok && Object.prototype.hasOwnProperty.call(status, "historyRevision")
             && String(status.historyRevision || "") === cached.report.revision) {
+            if (filters.saleType && filters.saleType !== incomeFiltersFromForm().saleType) {
+              state.incomeReloadRequested = true;
+              return false;
+            }
             state.incomeReport = mergeIncomeReport(cached.report, filters);
             state.incomeRevision = cached.report.revision;
             state.incomeFetchedAt = Date.now();
@@ -7089,13 +7183,24 @@ const App = (() => {
           }
         } catch (_) { /* Si no hay revision verificable, consultar el informe completo. */ }
       }
-      const result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
+      let result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (requestId !== state.incomeRequestId) return false;
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
       if (filters.startAt && result.intervalApplied !== true) throw new Error("Publica la actualización de turnos en Apps Script para consultar este horario.");
       if (result.stale || !Array.isArray(result.records) || !result.totals) throw new Error("El historial remoto no quedó confirmado; se reintentará.");
       if (requestId !== state.incomeRequestId) return false;
+      if (filters.saleType && filters.saleType !== "all") result = await completeIncomeSaleTypeReport(result, filters, requestId);
+      if (requestId !== state.incomeRequestId) return false;
+      if (filters.saleType && filters.saleType !== incomeFiltersFromForm().saleType) {
+        state.incomeReloadRequested = true;
+        return false;
+      }
       state.incomeLoading = false;
+      if ((result.records || []).length >= Number(result.totalRecords || 0)) {
+        state.incomeSaleTypeSnapshot = { key: JSON.stringify({ ...filters, saleType: "all" }), report: result };
+      } else {
+        state.incomeSaleTypeSnapshot = null;
+      }
       state.incomeReport = mergeIncomeReport(result, filters);
       state.incomeRevision = result.revision || "";
       state.incomeFetchedAt = Date.now();
@@ -7376,6 +7481,7 @@ const App = (() => {
     const saleId = form.sale_id.value;
     const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
     if (!record) return;
+    state.incomeSaleTypeSnapshot = null;
     const reportBefore = state.incomeReport;
     const outboxBefore = readAppsScriptOutbox();
     const remainingRecords = (reportBefore.records || []).filter((entry) => String(entry.saleId) !== String(saleId));
@@ -7464,10 +7570,12 @@ const App = (() => {
       toast("Selecciona una fecha y hora validas para la venta.", "error", "invalid-income-date");
       return;
     }
+    state.incomeSaleTypeSnapshot = null;
     const corrected = {
       id: record.saleId,
       number: record.invoice,
       sessionId: record.sessionId,
+      saleChannel: incomeRecordSaleType(record) === "walk_in" ? "walk_in" : "table",
       table: form.table.value.trim(),
       createdAt: correctedDate.toISOString(),
       payerName: form.payer.value.trim(),
@@ -7500,6 +7608,7 @@ const App = (() => {
     const correctedCost = items.reduce((sum, item) => sum + Number(item.unit_cost || 0) * Number(item.quantity || 0), 0);
     const correctedRecord = {
       ...record,
+      saleChannel: corrected.saleChannel,
       table: corrected.table,
       date: corrected.createdAt,
       payer: corrected.payerName,
@@ -7853,6 +7962,7 @@ const App = (() => {
   );
 
   const saveBusiness = async (form) => {
+    if (state.brandAssetUploads?.size) { toast("Espera a que termine de subir la imagen antes de guardar.", "error", "brand-upload-pending"); return false; }
     const originalBusiness = state.business ? { ...state.business } : null;
     const originalTipSettings = { ...state.tipSettings };
     const originalTables = state.tables.map((table) => ({ ...table }));
@@ -7898,6 +8008,7 @@ const App = (() => {
     }
     if (savedBusiness && savedTables) {
       state.business = savedBusiness;
+      clearSavedBrandAssetDrafts(savedBusiness);
       applyBusinessTipSettings();
       if (Array.isArray(savedTables.tables)) {
         const zones = new Map(savedTables.tables.map((table) => [String(table.id), table.is_outdoor === true]));
@@ -7931,26 +8042,27 @@ const App = (() => {
 
   const uploadAsset = async (file, fieldName) => {
     if (!file) return;
-    const status = $(`[data-upload-status="${fieldName}"]`);
-    const box = $(`[data-upload-box="${fieldName}"]`);
-    if (status) status.textContent = "Subiendo...";
-    box?.classList.add("is-uploading");
-    const extension = file.name.split(".").pop() || "jpg";
-    const path = `brand/${fieldName}-${uid()}.${extension}`;
-    const { error } = await state.sb.storage.from("brand-assets").upload(path, file, { upsert: true });
-    if (error) {
-      if (status) status.textContent = "No se pudo subir";
-      box?.classList.remove("is-uploading");
-      toast(`No se pudo subir: ${error.message}`, "error");
-      return;
+    state.brandAssetUploads ||= new Set();
+    if (state.brandAssetUploads.has(fieldName)) return;
+    state.brandAssetUploads.add(fieldName);
+    const form = $("#businessForm");
+    if (form) renderBrandAssetFields(form);
+    try {
+      const extension = file.name.split(".").pop() || "jpg";
+      const path = `brand/${fieldName}-${uid()}.${extension}`;
+      const { error } = await state.sb.storage.from("brand-assets").upload(path, file, { upsert: true });
+      if (error) throw new Error(error.message);
+      const { data } = state.sb.storage.from("brand-assets").getPublicUrl(path);
+      if (!data?.publicUrl) throw new Error("No se recibio la direccion de la imagen.");
+      state.brandAssetDrafts ||= {};
+      state.brandAssetDrafts[fieldName] = data.publicUrl;
+      toast("Imagen subida. Guarda la marca para aplicarla.");
+    } catch (error) {
+      toast(`No se pudo subir: ${error?.message || error}`, "error");
+    } finally {
+      state.brandAssetUploads.delete(fieldName);
+      if (form) renderBrandAssetFields(form);
     }
-    const { data } = state.sb.storage.from("brand-assets").getPublicUrl(path);
-    const input = $(`[name="${fieldName}"]`);
-    if (input) input.value = data.publicUrl;
-    if (status) status.textContent = "Imagen cargada. Guarda para aplicar.";
-    box?.classList.remove("is-uploading");
-    box?.classList.add("has-file");
-    toast("Imagen subida. Guarda la marca para aplicarla.");
   };
 
   const saveTable = async (form) => {
@@ -10090,6 +10202,7 @@ const App = (() => {
       state.incomeSearchTimer = window.setTimeout(loadIncomeReport, 400);
     });
     $("#incomePaymentMethod")?.addEventListener("change", () => void loadIncomeReport());
+    $("#incomeSaleType")?.addEventListener("change", applyIncomeSaleTypeFilter);
     [$("#incomeDateFrom"), $("#incomeDateTo")].filter(Boolean).forEach((input) => input.addEventListener("change", () => {
       state.incomeRangePreset = "custom";
       markIncomeRangePreset();
@@ -10393,6 +10506,7 @@ const App = (() => {
       }
       if (event.target.matches("[data-upload]")) {
         await uploadAsset(event.target.files[0], event.target.dataset.upload);
+        event.target.value = "";
       }
       if (event.target.name === "menu_item_id" && event.target.closest("#consumptionForm")) {
         const item = state.items.find((entry) => entry.id === event.target.value);

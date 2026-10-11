@@ -9,6 +9,15 @@ const SalesShift = (() => {
     return `${parts.year}-${parts.month}-${parts.day}`;
   };
   const midnight = (date) => Date.parse(`${date}T00:00:00-05:00`);
+  const dateLabel = (date, short = false) => {
+    const formatter = new Intl.DateTimeFormat("es-CO", {
+      timeZone: zone, day: "numeric", month: short ? "short" : "long", year: "numeric"
+    });
+    const value = new Date(midnight(date) + 12 * 60 * 60000);
+    if (!short) return formatter.format(value);
+    const parts = Object.fromEntries(formatter.formatToParts(value).map(({ type, value }) => [type, value]));
+    return `${parts.day} ${parts.month.replace(/\.$/, "")} ${parts.year}`;
+  };
   const addDays = (date, days) => dateKey(new Date(midnight(date) + days * dayMs));
   const parseTime = (text, period) => {
     const value = String(text || "").trim();
@@ -34,6 +43,10 @@ const SalesShift = (() => {
     const end = midnight(shift.date) + endMinutes * 60000 + (endMinutes < startMinutes ? dayMs : 0);
     return Number.isFinite(start) && dateKey(new Date(midnight(shift.date))) === shift.date ? { start, end } : null;
   };
+  const needsNewShift = (shift, now = new Date()) => {
+    const interval = bounds(shift);
+    return !interval || (dateKey(now) > shift.date && Number(now) >= interval.end);
+  };
   const today = (shift, now = new Date()) => {
     const date = dateKey(now), interval = bounds(shift), timestamp = Number(now);
     if (interval && timestamp >= midnight(shift.date) && timestamp < interval.end) {
@@ -44,6 +57,12 @@ const SalesShift = (() => {
     const start = interval && dateKey(new Date(interval.end)) === date && timestamp >= interval.end
       ? Math.max(midnight(date), interval.end) : midnight(date);
     return { dateFrom: date, dateTo: date, startAt: new Date(start).toISOString(), endAt: new Date(midnight(date) + dayMs).toISOString() };
+  };
+  const shiftRange = (shift) => {
+    const interval = bounds(shift);
+    if (!interval) return null;
+    return { dateFrom: shift.date, dateTo: dateKey(new Date(interval.end - 1)),
+      startAt: new Date(interval.start).toISOString(), endAt: new Date(interval.end).toISOString(), shiftId: shift.id };
   };
   const range = (preset, shift, now = new Date()) => {
     if (preset === "today") return today(shift, now);
@@ -65,6 +84,6 @@ const SalesShift = (() => {
     const key = dateKey(new Date(timestamp));
     return key >= filters.dateFrom && key <= filters.dateTo;
   };
-  return { zone, dateKey, parseTime, timeParts, timeLabel, bounds, today, range, matches };
+  return { zone, dateKey, dateLabel, parseTime, timeParts, timeLabel, bounds, needsNewShift, today, shiftRange, range, matches };
 })();
 if (typeof module !== "undefined" && module.exports) module.exports = SalesShift;

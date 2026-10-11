@@ -419,39 +419,61 @@ function salesShiftFromRow_(row) {
 
 function getSalesShift_() {
   var sheet = getSpreadsheet_().getSheetByName(APP.sheets.shifts);
-  return { shift: sheet && sheet.getLastRow() > 1 ? salesShiftFromRow_(sheet.getRange(sheet.getLastRow(), 1, 1, HEADERS.shifts.length).getValues()[0]) : null };
+  var rows = sheet && sheet.getLastRow() > 1 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, HEADERS.shifts.length).getValues() : [];
+  var shifts = [], indexes = {};
+  rows.forEach(function (row) {
+    var shift = salesShiftFromRow_(row);
+    if (!shift) return;
+    if (indexes[shift.id] === undefined) { indexes[shift.id] = shifts.length; shifts.push(shift); }
+    else shifts[indexes[shift.id]] = shift;
+  });
+  return { shift: shifts.length ? shifts[shifts.length - 1] : null, shifts: shifts };
 }
 
 function saveSalesShift_(payload, user) {
   return withScriptLock_(function () {
     var sheet = ensureSheet_(getSpreadsheet_(), APP.sheets.shifts, HEADERS.shifts);
-    var current = getSalesShift_().shift;
+    var history = getSalesShift_(), current = history.shift;
     if (!/^[a-zA-Z0-9-]{16,80}$/.test(String(payload.id || ""))) throw new Error("Identificador de operación inválido.");
     // Cada operación se registra una sola vez, incluso si se perdió la respuesta o se reenvía desde Offline.
     if (sheet.getLastRow() > 1 && sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).createTextFinder(payload.id).matchEntireCell(true).findNext()) {
-      return { shift: current, duplicate: true };
+      return { shift: current, shifts: history.shifts, duplicate: true };
     }
-    var conflict = function (message) { return { ok: false, retryable: false, shift: current, error: message }; };
-    if (String(payload.expectedId || "") !== String(current && current.id || "") || Number(payload.expectedVersion || 0) !== Number(current && current.version || 0)) {
+    var conflict = function (message) { return { ok: false, retryable: false, shift: current, shifts: history.shifts, error: message }; };
+    var action = String(payload.action || ""), target = action === "edit"
+      ? history.shifts.filter(function (shift) { return shift.id === String(payload.expectedId || ""); })[0] : current;
+    if (String(payload.expectedId || "") !== String(target && target.id || "") || Number(payload.expectedVersion || 0) !== Number(target && target.version || 0)) {
       return conflict("Otro equipo actualizó el turno o su base. Revisa el saldo actual y vuelve a guardar.");
     }
-    var action = String(payload.action || ""), amount = Number(payload.amount), now = new Date().toISOString();
-    if (["new", "replace", "add"].indexOf(action) < 0 || !Number.isSafeInteger(amount) || amount < 0 || amount > 999999999999 || (action === "add" && amount === 0)) {
+    var amount = Number(payload.amount), now = new Date().toISOString();
+    if (["new", "replace", "add", "edit"].indexOf(action) < 0 || (action !== "edit" && (!Number.isSafeInteger(amount) || amount < 0 || amount > 999999999999 || (action === "add" && amount === 0)))) {
       return conflict("Escribe un valor válido en pesos colombianos.");
     }
     var saved;
-    if (action === "new") {
+    if (action === "new" || action === "edit") {
       var date = String(payload.date || ""), start = Number(payload.startMinutes), end = Number(payload.endMinutes);
       var midnight = Date.parse(date + "T00:00:00-05:00");
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !isFinite(midnight) || Utilities.formatDate(new Date(midnight), "America/Bogota", "yyyy-MM-dd") !== date
         || !Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < 0 || start >= 1440 || end >= 1440 || start === end) {
         return conflict("La fecha y las horas del turno no son válidas.");
       }
-      if (current) {
+      var startAt = midnight + start * 60000;
+      var endAt = midnight + end * 60000 + (end < start ? 86400000 : 0);
+      var overlaps = history.shifts.some(function (other) {
+        if (action === "edit" && other.id === target.id) return false;
+        var otherMidnight = Date.parse(other.date + "T00:00:00-05:00");
+        var otherStart = otherMidnight + other.startMinutes * 60000;
+        var otherEnd = otherMidnight + other.endMinutes * 60000 + (other.endMinutes < other.startMinutes ? 86400000 : 0);
+        return startAt < otherEnd && endAt > otherStart;
+      });
+      if (overlaps) return conflict("El horario se cruza con otro turno registrado.");
+      if (action === "new" && current) {
         var previousEnd = Date.parse(current.date + "T00:00:00-05:00") + current.endMinutes * 60000 + (current.endMinutes < current.startMinutes ? 86400000 : 0);
-        if (Date.now() < previousEnd || midnight + start * 60000 < previousEnd) return conflict("El nuevo turno no puede solaparse con el turno anterior.");
+        if (Date.now() < previousEnd || startAt < previousEnd) return conflict("El nuevo turno no puede solaparse con el turno anterior.");
       }
-      saved = { id: payload.id, date: date, startMinutes: start, endMinutes: end, base: amount, initialBase: amount, version: 1, createdAt: now, updatedAt: now };
+      saved = action === "new"
+        ? { id: payload.id, date: date, startMinutes: start, endMinutes: end, base: amount, initialBase: amount, version: 1, createdAt: now, updatedAt: now }
+        : Object.assign({}, target, { date: date, startMinutes: start, endMinutes: end, version: target.version + 1, updatedAt: now });
     } else {
       if (!current) return conflict("Primero registra un turno.");
       saved = Object.assign({}, current, { base: action === "add" ? current.base + amount : amount, version: current.version + 1, updatedAt: now });
@@ -461,7 +483,7 @@ function saveSalesShift_(payload, user) {
     sheet.appendRow([payload.id, saved.id, saved.date, saved.startMinutes, saved.endMinutes, saved.initialBase, saved.base, saved.version,
       saved.createdAt, saved.updatedAt, saved.updatedBy, action, amount]);
     SpreadsheetApp.flush();
-    return { shift: saved };
+    return getSalesShift_();
   });
 }
 

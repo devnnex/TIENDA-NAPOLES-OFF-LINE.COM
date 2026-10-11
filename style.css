@@ -5274,10 +5274,20 @@ body[data-page="admin"] { overflow-x: hidden; }
 
 /* Turno de ventas y base compartida. */
 .sales-shift-base { display: flex; align-items: center; gap: .8rem; margin: 0 0 1rem; padding: .85rem 1rem; max-width: 100%; text-align: left; color: #6d28d9; background: #f5f0ff; border: 1px solid #ddd0f8; border-radius: 16px; cursor: pointer; }
+.sales-shift-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); align-items: center; gap: 1rem; width: 100%; box-sizing: border-box; margin: 0 0 1rem; padding: 1rem; background: #f5f0ff; border: 1px solid #ddd0f8; border-radius: 16px; }
+.sales-shift-current { display: flex; align-items: center; flex-wrap: wrap; gap: .8rem; min-width: 0; }
+.sales-shift-panel .sales-shift-base { flex: 1 1 220px; min-width: 0; margin: 0; padding: 0; border: 0; border-radius: 0; }
+.sales-shift-register { min-height: 44px; padding: .55rem .8rem; border: 1px solid #7c3aed; border-radius: 10px; background: #7c3aed; color: #fff; font: inherit; font-size: .82rem; font-weight: 750; cursor: pointer; }
+.sales-shift-register:hover { background: #6d28d9; }
+.sales-shift-register[hidden] { display: none; }
+.sales-shift-history { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: .55rem; min-width: 0; padding-left: 1rem; border-left: 1px solid #ddd0f8; color: #6d28d9; font-size: .8rem; font-weight: 700; }
+.sales-shift-history select { width: 100%; min-width: 0; min-height: 40px; padding: .4rem .6rem; border: 1px solid #cbb9ef; border-radius: 9px; background: #fff; color: #442178; font: inherit; }
+.sales-shift-history button { min-height: 40px; padding: .4rem .7rem; border: 1px solid #cbb9ef; border-radius: 9px; background: #fff; color: #6d28d9; font: inherit; cursor: pointer; }
+.sales-shift-history button:disabled { opacity: .55; cursor: default; }
 .sales-shift-base > span { display: grid; gap: .18rem; }
 .sales-shift-base strong { font-size: 1.45rem; letter-spacing: -.025em; }
 .sales-shift-base small { font-size: .74rem; color: #6d4d91; line-height: 1.4; }
-.sales-shift-base:focus-visible, .sales-shift-action:focus-visible { outline: 3px solid #c4b5fd; outline-offset: 3px; }
+.sales-shift-base:focus-visible, .sales-shift-register:focus-visible, .sales-shift-action:focus-visible { outline: 3px solid #c4b5fd; outline-offset: 3px; }
 .sales-shift-modal { width: min(540px, calc(100vw - 1.5rem)); max-height: calc(100dvh - 1.5rem); border: 1px solid #e4daf5; border-radius: 22px; box-shadow: 0 24px 70px rgba(39, 20, 70, .24); }
 .sales-shift-card { width: 100%; min-height: 540px; max-height: inherit; overflow-y: auto; display: flex; flex-direction: column; gap: 1rem; padding: 1.6rem; box-sizing: border-box; background: linear-gradient(180deg, #f8f4ff 0, #fff 160px); }
 .sales-shift-card .section-head { margin: 0; padding-bottom: 1rem; border-bottom: 1px solid #e9e0f5; align-items: flex-start; }
@@ -5286,6 +5296,7 @@ body[data-page="admin"] { overflow-x: hidden; }
 .sales-shift-card .eyebrow { color: #7c3aed; }
 .sales-shift-row, .sales-shift-hours { display: grid; grid-template-columns: 1fr 1fr; gap: .85rem; }
 .sales-shift-card label { display: grid; gap: .4rem; min-width: 0; font-size: .82rem; font-weight: 700; }
+.sales-shift-card label[hidden] { display: none; }
 .sales-shift-card input, .sales-shift-card select { width: 100%; min-width: 0; height: 46px; border: 1px solid #ddd6e8; border-radius: 12px; background: #fff; color: #241b35; font-size: 16px; }
 .sales-shift-card select option { background: #fff; color: #241b35; }
 .sales-shift-card input.sales-shift-amount { height: 56px; font-size: 1.5rem; font-weight: 800; color: #6d28d9; background: #faf7ff; border-color: #ddd0f8; }
@@ -5298,7 +5309,13 @@ body[data-page="admin"] { overflow-x: hidden; }
 .sales-shift-action[type="button"] { background: #f5f0fc; border-color: #e4daf5; color: #6d28d9; }
 .sales-shift-action[type="button"]:hover { background: #ede4fa; }
 .sales-shift-action:disabled { opacity: .6; cursor: wait; }
+@media (max-width: 850px) {
+  .sales-shift-panel { grid-template-columns: minmax(0, 1fr); }
+  .sales-shift-history { padding: .8rem 0 0; border-left: 0; border-top: 1px solid #ddd0f8; }
+}
 @media (max-width: 560px) {
+  .sales-shift-history { grid-template-columns: minmax(0, 1fr) auto; }
+  .sales-shift-history label { grid-column: 1 / -1; }
   .sales-shift-modal { width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); border-radius: 18px; }
   .sales-shift-card { min-height: 0; padding: 1.1rem; gap: .9rem; }
   .sales-shift-card h2 { font-size: 1.3rem; }
@@ -5306,6 +5323,7 @@ body[data-page="admin"] { overflow-x: hidden; }
   .sales-shift-hours label > span { grid-template-columns: minmax(0, 1fr) 88px; }
   .sales-shift-actions { position: sticky; bottom: -1.1rem; padding: .8rem 0; background: #fff; border-top: 1px solid #eee7f5; }
 }
+
 
 /* Ajustes puntuales de venta individual, consumo y edición de pagos. */
 .compact-table-tile.walk-in-table { background: #e5efff; border-color: #8cb4f5; color: #143d7a; }

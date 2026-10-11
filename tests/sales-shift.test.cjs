@@ -9,6 +9,12 @@ for (const [input, period, minutes, text] of [['800','AM',480,'8:00'],['8:00','P
 }
 for (const value of ['', '0','000','1300','8:60','1260','24:00','-100','1.30','8:0']) assert.equal(shift.parseTime(value,'AM'), null, value);
 const overnight = { id:'shift-a', date:'2026-10-08', startMinutes:900, endMinutes:60 };
+assert.equal(shift.needsNewShift(null,at('2026-10-09T08:00:00')),true);
+assert.equal(shift.needsNewShift(overnight,at('2026-10-09T00:59:59')),false);
+assert.equal(shift.needsNewShift(overnight,at('2026-10-09T01:00:00')),true);
+assert.equal(shift.needsNewShift({...overnight,endMinutes:1320},at('2026-10-08T23:00:00')),false);
+assert.equal(shift.needsNewShift({...overnight,endMinutes:1320},at('2026-10-09T00:00:00')),true);
+assert.equal(shift.needsNewShift({...overnight,date:'2026-10-09'},at('2026-10-09T08:00:00')),false);
 assert.equal(shift.today(overnight,at('2026-10-09T00:30:00')).dateFrom,'2026-10-08');
 assert.equal(shift.today(overnight,at('2026-10-09T00:59:59')).dateFrom,'2026-10-08');
 const after = shift.today(overnight,at('2026-10-09T01:00:00'));
@@ -34,6 +40,11 @@ assert.deepEqual(shift.range('yesterday',overnight,at('2026-10-09T00:30:00')),{d
 assert.equal(shift.range('month',overnight,at('2026-10-09T00:30:00')).startAt,undefined);
 assert.equal(shift.range('7days',overnight,at('2026-10-09T00:30:00')).dateFrom,'2026-10-03');
 assert.equal(shift.today(null,at('2026-10-09T00:30:00')).dateFrom,'2026-10-09');
+const corrected = {id:'corrected',date:'2026-10-10',startMinutes:660,endMinutes:120};
+const correctedRange = shift.shiftRange(corrected);
+assert.deepEqual(correctedRange,{dateFrom:'2026-10-10',dateTo:'2026-10-11',startAt:'2026-10-10T16:00:00.000Z',endAt:'2026-10-11T07:00:00.000Z',shiftId:'corrected'});
+assert.equal(shift.matches('2026-10-11T01:59:59-05:00',correctedRange),true);
+assert.equal(shift.matches('2026-10-11T02:00:00-05:00',correctedRange),false);
 
 // Run the actual shared backend against a worksheet fixture: retries and concurrent base changes.
 const rows = [];
@@ -64,6 +75,21 @@ saved=backend.saveSalesShift_({...add,id:'operation-replace',action:'replace',am
 assert.equal(saved.shift.base,120000); assert.equal(saved.shift.initialBase,100000);
 assert.equal(rows[2][11],'replace'); assert.ok(saved.shift.updatedAt);
 assert.equal(backend.saveSalesShift_({...open,id:'operation-overlap',expectedId:open.id,expectedVersion:3,startMinutes:930},user).ok,false);
+const second={...open,id:'operation-second-01',date:'2020-10-09',startMinutes:900,expectedId:open.id,expectedVersion:3,amount:200000};
+saved=backend.saveSalesShift_(second,user);
+assert.equal(saved.shift.id,second.id);
+assert.equal(saved.shifts.length,2);
+const edit={id:'operation-edit-0001',action:'edit',expectedId:open.id,expectedVersion:3,date:'2020-10-08',startMinutes:660,endMinutes:120};
+saved=backend.saveSalesShift_(edit,user);
+assert.equal(saved.shift.id,second.id,'Editar un turno anterior conserva el turno vigente.');
+assert.equal(saved.shifts[0].startMinutes,660);
+assert.equal(saved.shifts[0].endMinutes,120);
+assert.equal(saved.shifts[0].base,120000);
+assert.equal(saved.shifts[0].version,4);
+assert.equal(backend.saveSalesShift_(edit,user).duplicate,true);
+assert.equal(backend.saveSalesShift_({...edit,id:'operation-edit-stale'},user).ok,false);
+assert.match(backend.saveSalesShift_({...edit,id:'operation-edit-overlap',expectedVersion:4,startMinutes:1080,endMinutes:960},user).error,/cruza/);
+assert.equal(backend.getSalesShift_().shifts.length,2);
 // Totals and all pages must use the same interval, including sales after midnight.
 const sales = Array.from({length: 605}, (_, i) => [`sale-${i}`, `F-${i}`, '', '', 'Mesa 1', '2026-10-09T00:30:00-05:00', '', '', 10, 0, 0, 0, 10, 'cash']);
 sales.push(['before','Before','','','Mesa 1','2026-10-08T14:59:00-05:00','','',99,0,0,0,99,'cash']);
@@ -80,4 +106,9 @@ const page=backend.getIncomeReport_({...during,pageRows:report.recordRows.slice(
 assert.equal(page.intervalApplied,true);assert.equal(page.records.length,300);
 const calendar=backend.getIncomeReport_({dateFrom:'2026-10-09',dateTo:'2026-10-09'});
 assert.equal(calendar.totalRecords,606);assert.equal(calendar.totals.income,6138);
+sales.push(['corrected-in','Corrected in','','','Mesa 1','2026-10-11T01:30:00-05:00','','',50,0,0,0,50,'cash']);
+sales.push(['corrected-out','Corrected out','','','Mesa 1','2026-10-11T02:00:00-05:00','','',70,0,0,0,70,'cash']);
+const correctedReport=backend.getIncomeReport_(correctedRange);
+assert.equal(correctedReport.totalRecords,1);
+assert.equal(correctedReport.totals.income,50);
 console.log('PASS turnos: hora de 12 horas, medianoche, cierre exacto, otros rangos, base compartida, reintentos y conflictos entre equipos.');

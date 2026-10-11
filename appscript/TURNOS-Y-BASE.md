@@ -4,9 +4,13 @@ Publicar el `Code.gs` actualizado en la implementación existente de Apps Script
 
 La actualización añade la pestaña `Turnos_Caja`, con una fila por apertura o cambio de base. Guarda importe inicial, saldo actual, horario, usuario, fecha y hora. Las operaciones llevan un identificador único para evitar duplicados al reintentar; una versión protege los cambios simultáneos desde varios equipos.
 
-Al iniciar sesión, los usuarios con acceso a Ventas ven el formulario. Un nuevo turno muestra la fecha actual de Colombia y las horas vacías: inicio PM, cierre AM. Las horas admiten `800` o `8:00`, y también `8` para las ocho en punto. No admite horas militares, minutos inválidos ni inicio y cierre iguales. Cancelar no cambia la base ni abre otro turno.
+Al iniciar sesión, los usuarios con acceso a Ventas ven el formulario si no hay turno registrado o si ya cambió el día en Colombia y terminó el horario del último turno. Un turno nocturno permanece vigente hasta su hora de cierre. El modal aparece una vez por sesión; si se cierra sin guardar, queda el botón **Registrar nuevo turno** en el panel morado de Ventas y se vuelve a solicitar al siguiente inicio de sesión. Al registrar el nuevo turno deja de solicitarse.
+
+Un nuevo turno muestra la fecha actual de Colombia y las horas vacías: inicio PM, cierre AM. Las horas admiten `800` o `8:00`, y también `8` para las ocho en punto. No admite horas militares, minutos inválidos ni inicio y cierre iguales. Cancelar no cambia la base ni abre otro turno.
 
 Si ya existe un turno sin finalizar, el formulario permite actualizar o agregar base al mismo turno. No abre otro superpuesto. El indicador morado de Ventas muestra la base actual, la inicial y la última actualización; no incorpora ese dinero a los ingresos.
+
+El historial del panel morado muestra las fechas en español y permite consultar las ventas de cada turno o corregir su fecha y horario conservando su base. Al seleccionar un turno se aplica su intervalo completo, incluido el tramo después de medianoche. La sincronización conserva la selección y el contenido mostrado mientras los datos no cambien; una corrección real del horario vuelve a consultar ese intervalo.
 
 Ventas abre en Hoy. Un turno del 8 de octubre de 3:00 PM a 1:00 AM incluye las ventas desde las 3:00 PM del día 8 hasta antes de la 1:00 AM del día 9. A las 12:30 AM sigue mostrando el turno del día 8; a la 1:00 AM Hoy pasa al día 9, sin volver a sumar el tramo ya contado en el turno anterior. Si se guarda otro horario, se usan esas horas.
 

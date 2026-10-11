@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261010-response-v1">
+    <link rel="stylesheet" href="style.css?v=20261011-sales-shift-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="admin">
@@ -443,7 +443,17 @@
           <div class="income-filter-summary" id="incomeFilterSummary" aria-live="polite"></div>
         </div>
 
-        <button class="sales-shift-base" id="salesShiftBase" type="button" aria-label="Ver o editar el turno y saldo base"></button>
+        <div class="sales-shift-panel">
+          <div class="sales-shift-current">
+            <button class="sales-shift-base" id="salesShiftBase" type="button" aria-label="Ver o editar el turno y saldo base"></button>
+            <button class="sales-shift-register" id="registerSalesShift" type="button" hidden>Registrar nuevo turno</button>
+          </div>
+          <div class="sales-shift-history">
+            <label for="salesShiftHistory">Historial de turnos</label>
+            <select id="salesShiftHistory" aria-label="Elegir un turno del historial"><option value="">Elegir un día</option></select>
+            <button id="editSalesShiftHistory" type="button" disabled>Editar horario</button>
+          </div>
+        </div>
 
         <div class="income-kpis" id="incomeKpis"></div>
 
@@ -872,7 +882,7 @@
         <div class="section-head"><div><span class="eyebrow">Caja compartida</span><h2 id="salesShiftTitle">Turno y saldo base</h2></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
         <div class="sales-shift-row">
           <label>Fecha del turno<input name="date" type="date" required></label>
-          <label>Operación<select name="action"><option value="new">Abrir nuevo turno</option><option value="replace">Actualizar base</option><option value="add">Agregar base</option></select></label>
+          <label>Operación<select name="action"><option value="new">Abrir nuevo turno</option><option value="replace">Actualizar base</option><option value="add">Agregar base</option><option value="edit">Corregir fecha y horario</option></select></label>
         </div>
         <label><span id="salesShiftAmountLabel">Saldo base inicial</span><input class="sales-shift-amount" name="amount" type="text" inputmode="numeric" data-currency-input autocomplete="off" value="0" required></label>
         <div class="sales-shift-hours">
@@ -922,7 +932,7 @@
     <script defer src="vendor/lucide.min.js"></script>
     <script defer src="vendor/qrcode.min.js"></script>
     <script defer src="vendor/jspdf.umd.min.js"></script>
-    <script defer src="sales-shift.js"></script>
-    <script defer src="app.js?v=20261010-response-v1"></script>
+    <script defer src="sales-shift.js?v=20261011-sales-shift-v1"></script>
+    <script defer src="app.js?v=20261011-sales-shift-v1"></script>
   </body>
 </html>

@@ -752,11 +752,11 @@ const App = (() => {
     const missing = CATEGORY_PRESETS.filter((name) => !existing.has(normalizeText(name)));
     if (!missing.length) return;
     const created = (await Promise.all(missing.map((name, index) => dbQuiet(
-      state.sb.from("menu_categories").insert({ name, sort_order: 100 + index, is_active: true }).select("*").single(),
+      state.sb.from("menu_categories").insert({ id: uid(), name, sort_order: 100 + index, is_active: true }).select("*").single(),
       null
     )))).filter(Boolean);
     if (created.length) {
-      state.categories = [...state.categories, ...created];
+      state.categories = [...new Map([...state.categories, ...created].map((category) => [category.id, category])).values()];
       persistBootstrapCache();
       renderMenuManager();
     }
@@ -4892,8 +4892,9 @@ const App = (() => {
     (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0) || String(a.id).localeCompare(String(b.id));
 
   const loadAdminData = async () => {
-    const cachedSnapshot = readOfflineAdminSnapshot();
-    const pendingScope = pendingAdminReadScope(cachedSnapshot, await getOfflineSyncStatus());
+    let cachedSnapshot = readOfflineAdminSnapshot();
+    const queueBeforeRead = await getOfflineSyncStatus();
+    let pendingScope = pendingAdminReadScope(cachedSnapshot, queueBeforeRead);
     await setScopedAdminRead(true);
     (cachedSnapshot?.removedSessions || []).forEach((entry) => {
       if (entry?.id && Date.now() < Number(entry.retainUntil || 0) && !state.optimisticSessionStates.has(entry.id)) {
@@ -4902,6 +4903,13 @@ const App = (() => {
     });
     const remoteSnapshot = await readRealtimeData(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }));
     if (remoteSnapshot && (!Array.isArray(remoteSnapshot.requests) || !Array.isArray(remoteSnapshot.sessions))) return false;
+    if (remoteSnapshot) {
+      const queueAfterRead = await getOfflineSyncStatus();
+      cachedSnapshot = readOfflineAdminSnapshot() || cachedSnapshot;
+      pendingScope = pendingAdminReadScope(cachedSnapshot, {blockingRecords:
+        Array.isArray(queueBeforeRead.blockingRecords) && Array.isArray(queueAfterRead.blockingRecords)
+          ? [...queueBeforeRead.blockingRecords,...queueAfterRead.blockingRecords] : null});
+    }
     const snapshot = remoteSnapshot ? mergePendingAdminRows(remoteSnapshot, cachedSnapshot, pendingScope) : null;
     if (snapshot?.pos_features) { state.posFeatures = snapshot.pos_features; if (!state.drawerReceiverTimer) startDrawerReceiver(); }
     else if (!navigator.onLine && typeof readOfflineAdminSnapshot === "function") state.posFeatures = readOfflineAdminSnapshot()?.posFeatures || {};
@@ -4965,8 +4973,24 @@ const App = (() => {
     controller.postMessage({type:'SET_SCOPED_CORE_READ',enabled},[channel.port2]);
   });
 
-  const mergePendingCoreData = (remote,queue) => {
-    const records = queue?.blockingRecords || [];
+  const mergePendingCoreData = (remote,queue,baseline = null) => {
+    const records = [...(queue?.blockingRecords || [])];
+    if (baseline) {
+      for (const [entity,key] of [['restaurant_tables','tables'],['menu_categories','categories'],['menu_items','items']]) {
+        const before = new Map((baseline[key] || []).map((row) => [row.id,row]));
+        const current = new Map((state[key] || []).map((row) => [row.id,row]));
+        before.forEach((row,id) => { if (!current.has(id)) records.push({entity,recordIds:[id],method:'DELETE'}); });
+        current.forEach((row,id) => {
+          const previous = before.get(id);
+          const changedFields = Object.keys({...previous,...row}).filter((field) => field !== 'id'
+            && JSON.stringify(previous?.[field]) !== JSON.stringify(row[field]));
+          if (!previous || changedFields.length) records.push({entity,recordIds:[id],method:previous?'PATCH':'POST',changedFields});
+        });
+      }
+      const changedFields = Object.keys({...baseline.business,...state.business}).filter((field) => field !== 'id'
+        && JSON.stringify(baseline.business?.[field]) !== JSON.stringify(state.business?.[field]));
+      if (changedFields.length) records.push({entity:'business_settings',method:'PATCH',changedFields});
+    }
     const result = { ...remote };
     for (const [entity,key] of [['restaurant_tables','tables'],['menu_categories','categories'],['menu_items','items']]) {
       const pending = records.filter((record) => record.entity === entity);
@@ -5007,6 +5031,7 @@ const App = (() => {
     if (coreRefreshPromise) { coreRefreshPending = true; return coreRefreshPromise; }
     state.coreSyncBusy = true;
     coreRefreshPromise = (async () => {
+      const baseline = JSON.parse(JSON.stringify({business:state.business,tables:state.tables,categories:state.categories,items:state.items}));
       const queue = typeof getOfflineSyncStatus === 'function' ? await getOfflineSyncStatus() : {blockingRecords:[]};
       if (typeof setScopedCoreRead === 'function') await setScopedCoreRead(Array.isArray(queue.blockingRecords));
       const params = new URLSearchParams(location.search);
@@ -5018,7 +5043,8 @@ const App = (() => {
       const coreLoaded = Array.isArray(data?.tables) && Array.isArray(data?.categories) && Array.isArray(data?.items);
       state.syncFresh ||= {};
       if (businessLoaded && coreLoaded) {
-        const fresh = mergePendingCoreData(data,queue);
+        const currentQueue = typeof getOfflineSyncStatus === 'function' ? await getOfflineSyncStatus() : {blockingRecords:[]};
+        const fresh = mergePendingCoreData(data,{blockingRecords:[...(queue.blockingRecords || []),...(currentQueue.blockingRecords || [])]},baseline);
         state.business = fresh.business; state.tables = fresh.tables; state.categories = fresh.categories; state.items = fresh.items;
         state.coreRefreshedAt = Date.now();
       }
@@ -6373,13 +6399,17 @@ const App = (() => {
       return false;
     }
     try {
+      const baseline = new Map(state.inventoryMovements.map((movement) => [movement.movementId, JSON.stringify(movement)]));
       const result = await appsScriptRequest("get_inventory_movements", { limit: 800 });
       if (!result?.ok || !Array.isArray(result.movements)) throw new Error(result?.error || "El historial remoto devolvió una respuesta inválida.");
+      if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) { state.syncFresh.movements = false; return false; }
       const pendingIds = pendingInventoryMovementIds();
-      const merged = new Map(state.inventoryMovements
-        .filter((movement) => pendingIds.has(String(movement.movementId || "")))
-        .map((movement) => [movement.movementId, movement]));
-      result.movements.forEach((movement) => merged.set(movement.movementId, movement));
+      const merged = new Map(result.movements.map((movement) => [movement.movementId, movement]));
+      const current = new Map(state.inventoryMovements.map((movement) => [movement.movementId,movement]));
+      baseline.forEach((value,id) => { if (!current.has(id)) merged.delete(id); });
+      current.forEach((movement,id) => {
+        if (pendingIds.has(String(id)) || baseline.get(id) !== JSON.stringify(movement)) merged.set(id,movement);
+      });
       state.inventoryMovements = Array.from(merged.values()).slice(-3000);
       state.movementRevision = String(result.revision || "");
       persistInventoryMovements();
@@ -7652,6 +7682,8 @@ const App = (() => {
     if (!record) return;
     state.incomeSaleTypeSnapshot = null;
     const reportBefore = state.incomeReport;
+    state.incomeRequestId = Number(state.incomeRequestId || 0) + 1;
+    state.incomeLoading = false;
     const outboxBefore = readAppsScriptOutbox();
     const remainingRecords = (reportBefore.records || []).filter((entry) => String(entry.saleId) !== String(saleId));
     const updatedTotals = { ...(reportBefore.totals || {}) };
@@ -8889,6 +8921,8 @@ const App = (() => {
     const localRecord = localIncomeRecords(filters)
       .find((record) => String(record.saleId) === String(invoice.id || invoice.sessionId));
     if (!localRecord) return;
+    state.incomeRequestId = Number(state.incomeRequestId || 0) + 1;
+    state.incomeLoading = false;
     if (!state.incomeReport) {
       state.incomeReport = localIncomeReport(filters);
       return;
@@ -11689,13 +11723,18 @@ const App = (() => {
     }
     state.users = fallbackUsers;
     renderUsers();
+    const usersBeforeRead = new Map(state.users.map((user) => [String(user.id), JSON.stringify(user)]));
     try {
       const { data, error } = await state.sb.rpc("listUsers", { auth_token: state.authToken });
       if (error) throw error;
       const remoteUsers = Array.isArray(data) ? data : Array.isArray(data?.users) ? data.users : null;
       if (!remoteUsers?.length) throw new Error("La lista remota de usuarios no está disponible.");
-      state.users = mergeUsers(state.currentUser ? [state.currentUser] : [], remoteUsers);
-      const current = remoteUsers.find((user) => String(user.id) === String(state.currentUser?.id));
+      const merged = new Map(mergeUsers(state.currentUser ? [state.currentUser] : [], remoteUsers).map((user) => [String(user.id),user]));
+      const local = new Map(state.users.map((user) => [String(user.id),user]));
+      usersBeforeRead.forEach((value,id) => { if (!local.has(id)) merged.delete(id); });
+      local.forEach((user,id) => { if (usersBeforeRead.get(id) !== JSON.stringify(user)) merged.set(id,user); });
+      state.users = mergeUsers([...merged.values()]);
+      const current = state.users.find((user) => String(user.id) === String(state.currentUser?.id));
       if (current) {
         state.currentUser = { ...state.currentUser, ...current };
         try { localStorage.setItem(ADMIN_USER_CACHE_KEY, JSON.stringify(state.currentUser)); } catch (_) { /* IndexedDB conserva la lista. */ }
@@ -11707,7 +11746,7 @@ const App = (() => {
       void updateGlobalSyncStatus();
       return true;
     } catch (error) {
-      state.users = fallbackUsers;
+      if (state.users.every((user) => usersBeforeRead.get(String(user.id)) === JSON.stringify(user)) && state.users.length === usersBeforeRead.size) state.users = fallbackUsers;
       state.syncFresh.users = false;
       renderUsers();
       void updateGlobalSyncStatus();

@@ -4296,8 +4296,25 @@ const App = (() => {
     String(serverItem.notes || "") === String(expectedItem.notes || "") &&
     String(serverItem.status || "") === String(expectedItem.status || "");
 
+  const mergeSessionItems = (items = [], replacements = []) => {
+    const byId = new Map();
+    [...items, ...replacements].forEach((item) => byId.set(item.id == null ? item : String(item.id), item));
+    return [...byId.values()];
+  };
+
+  const rememberOptimisticSessionItems = (session, items, expectedSession) => {
+    const previous = state.optimisticSessionStates.get(session.id);
+    const expectedItems = previous?.expectedItems || (previous?.expectedItem ? [previous.expectedItem] : []);
+    state.optimisticSessionStates.set(session.id, {
+      mode: "upsert",
+      session,
+      expectedItems: mergeSessionItems(expectedItems, items),
+      expectedSession: expectedSession === undefined ? previous?.expectedSession : expectedSession
+    });
+  };
+
   const mergeOptimisticSessions = (serverSessions = []) => {
-    const merged = new Map(serverSessions.map((session) => [session.id, session]));
+    const merged = new Map(serverSessions.map((session) => [session.id, { ...session, session_items: mergeSessionItems(session.session_items) }]));
     state.optimisticSessionStates.forEach((overlay, sessionId) => {
       const now = Date.now();
       const serverSession = merged.get(sessionId);
@@ -4311,6 +4328,8 @@ const App = (() => {
       const expectedItems = overlay.expectedItems || (overlay.expectedItem ? [overlay.expectedItem] : []);
       const expectedItemConfirmed = !expectedItems.length || expectedItems.every((expectedItem) =>
         (serverSession?.session_items || []).some((item) => sessionItemMatches(item, expectedItem))
+        || (serverSession && expectedItem.status === "cancelled"
+          && !(serverSession.session_items || []).some((item) => String(item.id) === String(expectedItem.id)))
       );
       const expectedSessionConfirmed = !overlay.expectedSession || (
         String(serverSession?.payer_name || "") === String(overlay.expectedSession.payer_name || "") &&
@@ -4325,10 +4344,9 @@ const App = (() => {
         }
         merged.set(sessionId, serverSession);
       } else {
-        if (!serverSession || overlay.localOnly) { merged.set(sessionId, overlay.session); return; }
-        const items = new Map((serverSession.session_items || []).map((item) => [item.id,item]));
-        expectedItems.forEach((item) => items.set(item.id,item));
-        const pending = { ...serverSession, session_items: [...items.values()] };
+        if (!serverSession || overlay.localOnly) { merged.set(sessionId, { ...overlay.session, session_items: mergeSessionItems(overlay.session?.session_items) }); return; }
+        const pending = { ...serverSession, session_items: mergeSessionItems(serverSession.session_items, expectedItems) };
+        if (expectedItems.some((item) => item.status === "cancelled") && !pending.session_items.some((item) => item.status !== "cancelled")) pending.session_payments = [];
         Object.keys(overlay.expectedSession || {}).forEach((field) => {
           if (Object.prototype.hasOwnProperty.call(overlay.session || {},field)) pending[field] = overlay.session[field];
         });
@@ -9373,7 +9391,7 @@ const App = (() => {
 
     const payerName = [...drafts].reverse().find((draft) => draft.payerName)?.payerName || form.payer_name.value.trim() || session.payer_name || "";
     const optimisticItems = drafts.map((draft, index) => ({
-      id: `local-batch-${uid()}`,
+      id: uid(),
       session_id: optimisticSessionId,
       table_id: session.table_id,
       menu_item_id: draft.menuItemId || null,
@@ -9393,17 +9411,12 @@ const App = (() => {
       payer_name: payerName,
       assigned_waiter_id: state.currentUser?.id || session.assigned_waiter_id,
       assigned_waiter: state.currentUser || session.assigned_waiter,
-      session_items: [...(session.session_items || []), ...optimisticItems]
+      session_items: mergeSessionItems(session.session_items, optimisticItems)
     };
     state.sessions = state.sessions.map((entry) => entry.id === optimisticSessionId ? optimisticSession : entry);
-    state.optimisticSessionStates.set(optimisticSessionId, {
-      mode: "upsert",
-      session: optimisticSession,
-      expectedItems: optimisticItems,
-      expectedSession: {
-        payer_name: optimisticSession.payer_name || "",
-        assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
-      }
+    rememberOptimisticSessionItems(optimisticSession, optimisticItems, {
+      payer_name: optimisticSession.payer_name || "",
+      assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
     });
     form.session_id.value = optimisticSessionId;
     form.pending_table_id.value = "";
@@ -9450,7 +9463,7 @@ const App = (() => {
           ...savedSession,
           assigned_waiter: state.currentUser || optimisticSession.assigned_waiter,
           restaurant_tables: table,
-          session_items: [...(savedSession.session_items || []), ...remappedItems]
+          session_items: mergeSessionItems(savedSession.session_items, remappedItems)
         };
         state.sessions = state.sessions.map((entry) => entry.id === optimisticSessionId ? remappedSession : entry);
         state.optimisticSessionStates.delete(optimisticSessionId);
@@ -9476,7 +9489,8 @@ const App = (() => {
       return null;
     }
 
-    const payloads = drafts.map((draft) => ({
+    const payloads = drafts.map((draft, index) => ({
+      id: optimisticItems[index].id,
       session_id: persistedSessionId,
       table_id: session.table_id,
       menu_item_id: draft.menuItemId || null,
@@ -9521,21 +9535,16 @@ const App = (() => {
           ...(sessionSaved || {}),
           restaurant_tables: entry.restaurant_tables || table,
           assigned_waiter: state.currentUser || entry.assigned_waiter,
-          session_items: [
-            ...(entry.session_items || []).filter((item) => !temporaryIds.has(item.id)),
-            ...savedItems.map((item) => ({ ...item, created_by_user: state.currentUser }))
-          ]
+          session_items: mergeSessionItems(
+            (entry.session_items || []).filter((item) => !temporaryIds.has(item.id)),
+            savedItems.map((item) => ({ ...item, created_by_user: state.currentUser }))
+          )
         })
       : entry);
-    state.optimisticSessionStates.set(persistedSessionId, {
-      mode: "upsert",
-      session: confirmedSession,
-      expectedItems: savedItems,
-      expectedSession: sessionSaved ? {
+    rememberOptimisticSessionItems(confirmedSession, savedItems, sessionSaved ? {
         payer_name: sessionSaved.payer_name || "",
         assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
-      } : null
-    });
+      } : null);
     persistOfflineAdminSnapshot();
     return { sessionId: persistedSessionId, items: savedItems };
   };
@@ -9742,8 +9751,8 @@ const App = (() => {
   };
 
   const deleteConsumption = async (sessionId, itemId) => {
-    const session = state.sessions.find((entry) => entry.id === sessionId);
-    const item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
+    let session = state.sessions.find((entry) => entry.id === sessionId);
+    let item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
     if (!session || !item) return;
     if (!await askForConfirmation({
       eyebrow: "Cuenta abierta",
@@ -9752,14 +9761,21 @@ const App = (() => {
       accept: "Sí, quitar producto",
       cancel: "Conservar producto"
     })) return;
+    session = state.sessions.find((entry) => entry.id === sessionId);
+    item = session?.session_items?.find((entry) => entry.id === itemId && entry.status !== "cancelled");
+    if (!session || !item) return;
     if (!consumptionChangeAllowed(session, itemId, { status: "cancelled" })) {
       toast("No puedes quitar este producto: el consumo restante quedaría por debajo de los abonos.", "error", "consumption-below-payments");
       return;
     }
     const originalSession = session;
+    const originalOverlay = state.optimisticSessionStates.get(sessionId);
+    const cancelledItem = { ...item, status: "cancelled", updated_at: new Date().toISOString() };
     state.sessions = state.sessions.map((entry) => entry.id === sessionId
-      ? clearPaymentsWithoutConsumption({ ...entry, session_items: (entry.session_items || []).map((line) => line.id === itemId ? { ...line, status: "cancelled", updated_at: new Date().toISOString() } : line) })
+      ? clearPaymentsWithoutConsumption({ ...entry, session_items: mergeSessionItems(entry.session_items, [cancelledItem]) })
       : entry);
+    rememberOptimisticSessionItems(state.sessions.find((entry) => entry.id === sessionId), [cancelledItem]);
+    persistOfflineAdminSnapshot();
     state.accountsRenderSignature = "";
     renderAdminLive();
     if (isLocalWalkInSession(session)) {
@@ -9771,12 +9787,28 @@ const App = (() => {
     }
     const saved = await retryQuiet(() => state.sb.from("session_items").update({ status: "cancelled", updated_by_user_id: state.currentUser?.id || null }).eq("id", itemId).select("*").single(), 4);
     if (!saved) {
-      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? originalSession : entry);
+      state.sessions = state.sessions.map((entry) => entry.id === sessionId
+        ? clearPaymentsWithoutConsumption({ ...entry, session_items: mergeSessionItems(entry.session_items, [item]),
+            session_payments: entry.session_payments?.length ? entry.session_payments : originalSession.session_payments }) : entry);
+      const currentOverlay = state.optimisticSessionStates.get(sessionId);
+      const previousItems = originalOverlay?.expectedItems || (originalOverlay?.expectedItem ? [originalOverlay.expectedItem] : []);
+      const remainingItems = (currentOverlay?.expectedItems || []).filter((line) => line.id !== itemId);
+      const expectedItems = mergeSessionItems(remainingItems, previousItems.filter((line) => line.id === itemId));
+      if (expectedItems.length || currentOverlay?.expectedSession) {
+        state.optimisticSessionStates.set(sessionId, { ...currentOverlay, session: state.sessions.find((entry) => entry.id === sessionId), expectedItems });
+      } else state.optimisticSessionStates.delete(sessionId);
+      persistOfflineAdminSnapshot();
       state.accountsRenderSignature = "";
       renderAdminLive();
       toast("No se pudo eliminar el consumo. La cuenta fue restaurada.", "error", `delete-consumption:${itemId}`);
       return;
     }
+    const confirmedItem = { ...cancelledItem, ...saved };
+    state.sessions = state.sessions.map((entry) => entry.id === sessionId
+      ? clearPaymentsWithoutConsumption({ ...entry, session_items: mergeSessionItems(entry.session_items, [confirmedItem]) }) : entry);
+    rememberOptimisticSessionItems(state.sessions.find((entry) => entry.id === sessionId), [confirmedItem]);
+    persistOfflineAdminSnapshot();
+    renderAdminLive();
     toast("Consumo eliminado. El inventario permanece sin cambios.", "ok", `consumption-deleted:${itemId}`);
   };
 
@@ -9852,7 +9884,7 @@ const App = (() => {
       created_by_user_id: itemId ? undefined : state.currentUser?.id || null,
       updated_by_user_id: state.currentUser?.id || null
     };
-    const temporaryId = itemId || `local-${uid()}`;
+    const temporaryId = itemId || uid();
     const optimisticItem = {
       ...payload,
       id: temporaryId,
@@ -9867,21 +9899,14 @@ const App = (() => {
           payer_name: payerName || entry.payer_name,
           assigned_waiter_id: state.currentUser?.id || entry.assigned_waiter_id,
           assigned_waiter: state.currentUser || entry.assigned_waiter,
-          session_items: itemId
-            ? (entry.session_items || []).map((item) => item.id === itemId ? { ...item, ...optimisticItem } : item)
-            : [...(entry.session_items || []), optimisticItem]
+          session_items: mergeSessionItems(entry.session_items, [{ ...previousLine, ...optimisticItem }])
         })
       : entry);
     optimisticSession = clearPaymentsWithoutConsumption(optimisticSession);
     state.sessions = state.sessions.map((entry) => entry.id === sessionId ? optimisticSession : entry);
-    state.optimisticSessionStates.set(sessionId, {
-      mode: "upsert",
-      session: optimisticSession,
-      expectedItem: optimisticItem,
-      expectedSession: {
-        payer_name: optimisticSession.payer_name || "",
-        assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
-      }
+    rememberOptimisticSessionItems(optimisticSession, [optimisticItem], {
+      payer_name: optimisticSession.payer_name || "",
+      assigned_waiter_id: optimisticSession.assigned_waiter_id || ""
     });
     persistOfflineAdminSnapshot();
     if (!keepOpen) $("#consumptionDialog")?.close();
@@ -9905,6 +9930,7 @@ const App = (() => {
         4
     );
     const cleanPayload = Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
+    if (!itemId) cleanPayload.id = temporaryId;
     const saved = await retryQuiet(
         () => itemId
           ? state.sb.from("session_items").update(cleanPayload).eq("id", itemId).select("*").single()
@@ -9925,20 +9951,16 @@ const App = (() => {
             ...entry,
             ...(sessionSaved || {}),
             assigned_waiter: state.currentUser || entry.assigned_waiter,
-            session_items: (entry.session_items || []).map((item) => item.id === temporaryId
-              ? { ...saved, created_by_user: item.created_by_user || state.currentUser }
-              : item)
+            session_items: mergeSessionItems(
+              (entry.session_items || []).filter((item) => item.id !== temporaryId),
+              [{ ...saved, created_by_user: previousLine?.created_by_user || state.currentUser }]
+            )
           })
       : entry);
-    state.optimisticSessionStates.set(sessionId, {
-      mode: "upsert",
-      session: confirmedSession,
-      expectedItem: saved,
-      expectedSession: sessionSaved ? {
+    rememberOptimisticSessionItems(confirmedSession, [saved], sessionSaved ? {
         payer_name: sessionSaved.payer_name || "",
         assigned_waiter_id: sessionSaved.assigned_waiter_id || ""
-      } : null
-    });
+      } : null);
     persistOfflineAdminSnapshot();
     if (!silent) toast(itemId ? "Consumo actualizado." : "Producto agregado a la cuenta.", "ok", `consumption-saved:${saved.id}`);
     if (openPaymentAfter) openPaymentDialog(sessionId);

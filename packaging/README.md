@@ -1,7 +1,7 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.15.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.16.exe` con Inno Setup 6.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el
@@ -10,6 +10,18 @@ crea un borrador, sube y verifica el archivo y después lo marca como la última
 publicación. Una versión antigua no desplaza una más reciente. Para cada cambio
 del paquete incrementa la versión, compila y sube el nuevo `.exe`. También se
 puede ejecutar el workflow manualmente desde Actions. No modifica la landing.
+
+La versión 1.0.16 corrige la duplicación local y la reaparición de consumos al
+eliminarlos. Cada alta conserva un UUID desde la vista local hasta la cola y el
+servidor. La confirmación mezcla por identificador: una lectura recibida antes
+de terminar la escritura no añade el mismo consumo otra vez. Las cancelaciones
+actualizan la protección local y el snapshot durable; una lectura atrasada no
+repone el estado anterior. Al rechazar una cancelación se restaura únicamente
+esa línea y se conservan otras eliminaciones realizadas mientras tanto.
+Normaliza copias locales repetidas del mismo UUID, sin agrupar productos con
+UUID distintos ni borrar registros del backend. Conserva las validaciones de
+abonos, los datos offline y el iniciador de 1.0.15. No requiere SQL ni cambios
+en BCA o Apps Script. La caché de la aplicación pasa a v44 para cargar el ajuste.
 
 La versión 1.0.15 corrige únicamente el arranque instalado y los accesos directos.
 En el PC revisado faltaba `TiendaNapolesOffline.exe` en la carpeta instalada;

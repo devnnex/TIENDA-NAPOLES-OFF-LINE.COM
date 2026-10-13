@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v50";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v51";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -276,11 +276,14 @@ const extractRecordId = (url, payload) => {
   if (raw.startsWith("eq.")) return raw.slice(3);
   if (!Array.isArray(payload) && payload?.id) return String(payload.id);
   if (!Array.isArray(payload) && payload?.payment_id) return String(payload.payment_id);
+  if (!Array.isArray(payload) && payload?.request_id) return String(payload.request_id);
+  if (!Array.isArray(payload) && payload?.p_message_id) return String(payload.p_message_id);
   if (!Array.isArray(payload) && payload?.p_session_id && url.pathname.endsWith("/replay_table_session_change")) return String(payload.p_session_id);
   return "";
 };
 
 const extractRecordIds = (url, payload) => {
+  if (Array.isArray(payload?.requests)) return payload.requests.map(event => event.request_id).filter(Boolean).map(String);
   const single = extractRecordId(url, payload);
   if (single) return [single];
   const filter = url.searchParams.get("id") || "";
@@ -468,10 +471,11 @@ const scheduleConfirmedCleanup = () => {
   setTimeout(() => { void purgeConfirmedEntries(); }, CONFIRMED_RETENTION_MS);
 };
 
+const onlineMutationIds = new Set();
 const recoverInterruptedEntries = async () => {
   const entries = await listEntries();
   await Promise.all(entries
-    .filter((entry) => entry.status === "syncing"
+    .filter((entry) => (entry.status === "syncing" && !onlineMutationIds.has(entry.id))
       || (entry.status === "failed" && Number(entry.nextAttemptAt || 0) <= Date.now()
         && ((entry.entity === "rpc:acknowledge_service_requests" && isAcknowledgeSqlError(entry.lastError))
           || (entry.entity === "rpc:save_table_zones" && isZoneSqlError(entry.lastError))))
@@ -980,7 +984,8 @@ const writeReferences = (stored) => {
   const ids = [...new Set([...(entry.recordIds || []), entry.recordId,
     ...extractRecordIds(url, entry.payload)].filter(Boolean))];
   const refs = new Set(ids.map((id) => `${entry.entity}:${id}`));
-  rows.forEach((row) => {
+  const references = [...rows, ...rows.flatMap(row => Array.isArray(row.requests) ? row.requests : [])];
+  references.forEach((row) => {
     if (row.session_id || row.p_session_id) refs.add(`session:${row.session_id || row.p_session_id}`);
     if (row.table_id || row.p_table_id) refs.add(`table:${row.table_id || row.p_table_id}`);
     if (row.menu_item_id) refs.add(`product:${row.menu_item_id}`);
@@ -1005,40 +1010,7 @@ const writesAreRelated = (left, right) => {
   return [...a.refs].some((ref) => b.refs.has(ref));
 };
 
-const flushQueue = (force = false) => {
-  if (!networkAvailable) return entryCounts();
-  if (force) forceFlushRequested = true;
-  if (flushingQueue) return flushingQueue;
-  const forceThisRun = forceFlushRequested;
-  forceFlushRequested = false;
-  flushingQueue = (async () => {
-    let confirmedAny = false;
-    const attempted = new Set();
-    await recoverInterruptedEntries();
-    await purgeConfirmedEntries();
-    while (true) {
-      if (!networkAvailable) break;
-      const now = Date.now();
-      const forceCurrentPass = forceThisRun || forceFlushRequested;
-      forceFlushRequested = false;
-      const blocked = (await listEntries()).filter((candidate) => candidate.status !== "confirmed")
-        .sort((left, right) => queueOrder(left) - queueOrder(right));
-      const found = blocked.find((candidate, index) => candidate.status === "pending" && !attempted.has(candidate.id)
-        && (forceCurrentPass || Number(candidate.nextAttemptAt || 0) <= now)
-        && !blocked.slice(0, index).some((earlier) => writesAreRelated(earlier, candidate)));
-      const entry = found ? normalizeStoredEntry(found) : null;
-      if (!entry) break;
-      attempted.add(entry.id);
-      const startedAt = performance.now();
-      await putEntry({ ...entry, status: "syncing", lastAttemptAt: new Date().toISOString() });
-      syncLog("sending", { operationId: entry.operationId, destination: "supabase", entity: entry.entity, method: entry.method, attempts: entry.attempts });
-      try {
-        const queuedRequest = new Request(entry.url, {
-          method: entry.method,
-          headers: entry.headers,
-          body: ["GET", "HEAD"].includes(entry.method) ? undefined : entry.body
-        });
-        const response = await fetchWithTimeout(queuedRequest, REMOTE_WRITE_TIMEOUT_MS);
+const confirmMutationResponse = async (entry, response) => {
         let confirmed = response.ok;
         let reconciledSessionPatch = false;
         let reconciledAs = "";
@@ -1079,6 +1051,46 @@ const flushQueue = (force = false) => {
             if (confirmed) reconciledAs = "zones_saved_through_rest";
           }
         }
+
+  return { confirmed, reconciledSessionPatch, reconciledAs };
+};
+
+const flushQueue = (force = false) => {
+  if (!networkAvailable) return entryCounts();
+  if (force) forceFlushRequested = true;
+  if (flushingQueue) return flushingQueue;
+  const forceThisRun = forceFlushRequested;
+  forceFlushRequested = false;
+  flushingQueue = (async () => {
+    let confirmedAny = false;
+    const attempted = new Set();
+    await recoverInterruptedEntries();
+    await purgeConfirmedEntries();
+    const sendIndependent = async () => {
+    while (true) {
+      if (!networkAvailable) break;
+      const now = Date.now();
+      const forceCurrentPass = forceThisRun || forceFlushRequested;
+      forceFlushRequested = false;
+      const blocked = (await listEntries()).filter((candidate) => candidate.status !== "confirmed")
+        .sort((left, right) => queueOrder(left) - queueOrder(right));
+      const found = blocked.find((candidate, index) => candidate.status === "pending" && !attempted.has(candidate.id)
+        && (forceCurrentPass || Number(candidate.nextAttemptAt || 0) <= now)
+        && !blocked.slice(0, index).some((earlier) => writesAreRelated(earlier, candidate)));
+      const entry = found ? normalizeStoredEntry(found) : null;
+      if (!entry) break;
+      attempted.add(entry.id);
+      const startedAt = performance.now();
+      await putEntry({ ...entry, status: "syncing", lastAttemptAt: new Date().toISOString() });
+      syncLog("sending", { operationId: entry.operationId, destination: "supabase", entity: entry.entity, method: entry.method, attempts: entry.attempts });
+      try {
+        const queuedRequest = new Request(entry.url, {
+          method: entry.method,
+          headers: entry.headers,
+          body: ["GET", "HEAD"].includes(entry.method) ? undefined : entry.body
+        });
+        const response = await fetchWithTimeout(queuedRequest, REMOTE_WRITE_TIMEOUT_MS);
+        const { confirmed, reconciledSessionPatch, reconciledAs } = await confirmMutationResponse(entry, response);
         if (confirmed) {
           await putEntry({ ...entry, status: "confirmed", confirmedAt: new Date().toISOString(), lastError: "",
             ...(reconciledSessionPatch ? { reconciledAs: "already_closed_or_removed" }
@@ -1137,6 +1149,8 @@ const flushQueue = (force = false) => {
         break;
       }
     }
+    };
+    await Promise.all(Array.from({ length: 4 }, () => sendIndependent()));
     await purgeConfirmedEntries();
     if (confirmedAny) await notifyClients("OFFLINE_QUEUE_FLUSHED", { counts: await entryCounts() });
     return entryCounts();
@@ -1149,12 +1163,41 @@ const flushQueue = (force = false) => {
   return flushingQueue;
 };
 
+let mutationRegistration = Promise.resolve();
+const registerMutation = request => {
+  const registered = mutationRegistration.then(async () => {
+    const entry = await serializeRequest(request), older = await listEntries();
+    const direct = networkAvailable && !older.some(row => row.status !== "confirmed" && writesAreRelated(row, entry));
+    if (direct) { onlineMutationIds.add(entry.id); entry.status = "syncing"; }
+    await putEntry(entry); return { entry, direct };
+  });
+  mutationRegistration = registered.catch(() => undefined); return registered;
+};
+
 const saveLocallyThenSend = async (request) => {
-  const entry = await serializeRequest(request);
-  await putEntry(entry);
+  const { entry, direct } = await registerMutation(request);
+  if (direct) {
+    try {
+      const response = await fetchWithTimeout(new Request(entry.url, { method: entry.method, headers: entry.headers, body: entry.body }), REMOTE_WRITE_TIMEOUT_MS);
+      const result = await confirmMutationResponse(entry, response);
+      if (result.confirmed) {
+        await putEntry({ ...entry, status: "confirmed", confirmedAt: new Date().toISOString(), lastError: "" });
+        scheduleConfirmedCleanup();
+        await notifyClients("OFFLINE_MUTATION_CONFIRMED", { entity: entry.entity, operationId: entry.operationId });
+        // En línea la aplicación recibe la respuesta real del backend.
+        return response.ok ? response : queuedResponse(entry);
+      }
+      if (!isTransientStatus(response.status)) {
+        // Un rechazo definitivo vuelve al formulario; no congela lecturas posteriores.
+        await removeEntry(entry.id); return response;
+      }
+      await putEntry({ ...entry, status: "pending", nextAttemptAt: Date.now() + 1000 });
+    } catch (_) { await putEntry({ ...entry, status: "pending", nextAttemptAt: 0 }); }
+    finally { onlineMutationIds.delete(entry.id); if (networkAvailable) void flushQueue(); }
+  }
   syncLog("queued", { operationId: entry.operationId, destination: "supabase", entity: entry.entity, method: entry.method, attempts: 0 });
   if (self.registration.sync) {
-    try { await self.registration.sync.register("tienda-napoles-sync"); } catch (_) { /* El pulso de la app tambien reintenta. */ }
+    try { await self.registration.sync.register("tienda-napoles-sync"); } catch (_) { /* El pulso también reintenta. */ }
   }
   if (networkAvailable) void flushQueue();
   return queuedResponse(entry);

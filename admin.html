@@ -380,7 +380,11 @@
         <div class="movement-summary" id="movementSummary"></div>
         <div class="panel movement-panel">
           <div class="inventory-toolbar">
-            <label>Producto<select id="movementProductFilter"><option value="all">Todos los productos</option></select></label>
+            <label class="movement-product-field">Producto<span class="movement-product-picker" id="movementProductPicker">
+              <select id="movementProductFilter" class="visually-hidden" tabindex="-1" aria-hidden="true"><option value="all">Todos los productos</option></select>
+              <button type="button" id="movementProductToggle" role="combobox" aria-label="Producto" aria-expanded="false" aria-controls="movementProductOptions" aria-haspopup="listbox">Todos los productos</button>
+              <span class="movement-product-options" id="movementProductOptions" role="listbox" aria-label="Productos" hidden></span>
+            </span></label>
           </div>
           <p class="purchase-filter-feedback" id="movementTotalsFeedback" aria-live="polite"></p>
           <div class="movement-list" id="inventoryMovementList"></div>

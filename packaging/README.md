@@ -1,7 +1,7 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.22.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.23.exe` con Inno Setup 6.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el
@@ -10,6 +10,18 @@ crea un borrador, sube y verifica el archivo y después lo marca como la última
 publicación. Una versión antigua no desplaza una más reciente. Para cada cambio
 del paquete incrementa la versión, compila y sube el nuevo `.exe`. También se
 puede ejecutar el workflow manualmente desde Actions. No modifica la landing.
+
+La versión 1.0.23 prepara la sesión solo al enviar una solicitud explícita
+desde una mesa libre y evita el conflicto SQL de la ruta anterior. Usa el ID y
+el QR de cada mesa, incluidas las que se creen después; 30 mesas es un caso de
+prueba, no un límite. Abrir el QR continúa siendo de lectura y no ocupa la mesa.
+Con conexión, Offline devuelve la confirmación real de Supabase. Al reconectar
+envía hasta cuatro operaciones independientes en paralelo y respeta el orden
+de cambios relacionados. Las lecturas nuevas aceptan los cambios confirmados
+del otro equipo sin restaurar un consumo o una cuenta anterior.
+En ambos proyectos, el selector de Movimientos abre hacia abajo, el importe
+recibido tiene el tamaño de las vueltas y el diseño móvil evita scroll horizontal.
+No requiere una migración adicional ni cambia los cálculos de cobro o stock.
 
 La versión 1.0.22 da prioridad a solicitudes y chat: lee solicitudes cada
 segundo sin esperar el snapshot de cuentas ni los reportes, separa el canal

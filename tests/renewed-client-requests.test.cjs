@@ -44,7 +44,7 @@ function harness() {
         return { request: { ...saved.get(event.request_id) } };
       }) } };
     } };
-    const context = vm.createContext({ state, Date, console, REQUEST_OUTBOX_KEY: 'outbox',
+    const context = vm.createContext({ state, Date, console, URL, AbortController, SUPABASE_CONFIG:{url:"https://fixture.supabase.co",anonKey:"public"}, subscribeClient(){}, fetch:async(url,options)=>Response.json([{id:"session-"+options.headers["x-table-id"],table_id:options.headers["x-table-id"],status:"open"}]), REQUEST_OUTBOX_KEY: 'outbox',
       navigator: { onLine: true }, normalizeText, uid: () => tableId + '-' + ++serial,
       localStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
       window: { clearTimeout: id => timers.delete(id), setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; } },
@@ -61,7 +61,7 @@ function harness() {
       document: { querySelector: () => null }, toast() {}, REQUEST_LABELS: { waiter: 'Mesero' }
     });
     vm.runInContext(section('readRequestOutbox', 'signalRequestArrival')
-      + section('flushRequestOutbox', 'mergeChatMessageList')
+      + section('requestSessionReads', 'mergeChatMessageList')
       + section('isSongRequest', 'hasOpenAdminChatForRequest')
       + section('songTurnCount', 'addItemToSession')
       + section('finishClientChat', 'fetchChatMessages')
@@ -143,8 +143,8 @@ test('una mesa recién escaneada y sin consumo envía mesero y canción en cuant
  guest.api.createRequest('waiter');await guest.api.handleSongRequest('Una canción');await guest.drain();
  assert.equal(h.saved.size,2);assert.equal(h.groups().length,2);
  assert.ok(h.rpcCalls.every(call=>call.name==='createServiceRequestsBatch'));
- assert.ok(h.rpcCalls.flatMap(call=>call.payload.requests).every(row=>row.session_id===null));
- assert.equal(guest.state.currentSession,null,'No hace falta ocupar ni cobrar una mesa para enviar llamados.');
+ assert.ok(h.rpcCalls.flatMap(call=>call.payload.requests).every(row=>row.session_id==='session-free'));
+ assert.equal(guest.state.currentSession.id,'session-free','La solicitud puede tener un borrador de atención sin consumo ni cobro.');
 });
 
 test('un envío anterior detenido no retiene el siguiente llamado ni duplica IDs al terminar',async()=>{

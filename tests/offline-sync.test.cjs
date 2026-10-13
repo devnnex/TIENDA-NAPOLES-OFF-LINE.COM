@@ -1545,6 +1545,7 @@ test('85 avisa a BCA al confirmar cada cambio sin esperar otra escritura lenta',
   };
   const flushing = api.flushQueue(true);
   await enteredSecond;
+  await new Promise(setImmediate);
   assert.ok(confirmedMessages.some((message) => message.type === 'OFFLINE_MUTATION_CONFIRMED' && message.entity === 'menu_categories'),
     'El aviso de la primera escritura ya llegó mientras la segunda sigue en curso.');
   assert.equal(confirmedMessages.some((message) => message.type === 'OFFLINE_QUEUE_FLUSHED'), false);

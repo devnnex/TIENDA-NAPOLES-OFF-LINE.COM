@@ -5449,3 +5449,32 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
   #businessForm .brand-save-actions button, .table-zone-setting-footer button { width: 100%; justify-content: center; }
   .table-zone-setting-footer .table-zone-setting-status { flex-basis: 100%; }
 }
+
+/* Importes de caja y selector con apertura controlada hacia abajo. */
+#cashReceivedFields input[name="cash_received"] { font-size: clamp(2.1rem, 5vw, 3.1rem) !important; font-weight: 900; line-height: 1.12; min-height: 78px; width: 100%; min-width: 0; max-width: 100%; font-variant-numeric: tabular-nums; }
+.visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0,0,0,0); white-space: nowrap; border: 0 !important; }
+#movements .movement-panel { overflow: visible; }
+.movement-product-picker { position: relative; display: block; min-width: 0; width: 100%; }
+#movementProductToggle { display: flex; align-items: center; justify-content: space-between; gap: .5rem; width: 100%; min-width: 0; min-height: 48px; padding: .7rem .9rem; background: #f8fafc; color: #17191f; border: 1px solid #d5d9e0; border-radius: 10px; font: inherit; text-align: left; overflow-wrap: anywhere; }
+#movementProductToggle svg { flex: 0 0 18px; }
+.movement-product-options { position: absolute; top: calc(100% + .35rem); bottom: auto; inset-inline: 0; z-index: 100; display: grid; gap: .15rem; padding: .3rem; max-height: 280px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; border: 1px solid #d5d9e0; border-radius: 12px; background: white; box-shadow: 0 12px 30px #12181f26; }
+.movement-product-options[hidden] { display: none; }
+.movement-product-options button { width: 100%; min-height: 44px; padding: .6rem; border: 0; border-radius: 8px; text-align: left; background: white; color: #17191f; font: inherit; white-space: normal; overflow-wrap: anywhere; }
+.movement-product-options button[aria-selected="true"], .movement-product-options button:hover, .movement-product-options button:focus-visible { background: #eaf1ff; color: #123f91; }
+@media screen and (max-width: 980px) {
+  html, body { max-width: 100%; overflow-x: clip; }
+  main, section, form, fieldset, dialog, .panel, .modal-card { min-width: 0; max-width: 100%; }
+  img, canvas, video { max-width: 100%; }
+  input, select, textarea { min-width: 0; max-width: 100%; }
+  .admin-sidebar { position: relative; top: auto; inset: auto; flex-direction: column; align-items: stretch; overflow: visible; max-width: 100%; }
+  .admin-sidebar nav { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); min-width: 0; gap: .3rem; }
+  .admin-sidebar nav a { min-width: 0; min-height: 44px; gap: .3rem; padding: .5rem; font-size: .74rem; white-space: normal; overflow-wrap: anywhere; }
+  .category-tabs, .assistant-suggestions { flex-wrap: wrap; overflow-x: clip; }
+  .category-tabs .chip, .assistant-suggestions .chip { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+  .toast-host { flex-direction: column; overflow-x: clip; }
+  .toast, .toast > div, .income-record > div, .movement-row > div, .alert-card > div { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+  .form-grid > *, .inventory-toolbar > *, .section-head > * { min-width: 0; max-width: 100%; }
+  .cash-received { grid-template-columns: minmax(0,1fr); }
+  dialog { max-width: calc(100vw - 1rem); }
+  .income-edit-line { grid-template-columns: minmax(0,1fr); }
+}

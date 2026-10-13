@@ -66,7 +66,7 @@ const SupabaseDb = (() => {
       const requestPath = new URL(typeof input === "string" ? input : input?.url || String(input), SUPABASE_CONFIG.url).pathname;
       const urgent = /\/(service_requests|rpc\/(create_service_requests?(?:_batch)?|list_chat_messages|send_chat_message))$/.test(requestPath);
       const reporting = /\/rpc\/(get_report_changes|publish_report_change)$/.test(requestPath);
-      return fetch(input, { ...options, headers, cache: "no-store", priority: urgent ? "high" : reporting ? "low" : "auto" }).then((response) => {
+      return fetch(input, { ...options, headers, cache: "no-store", priority: urgent ? "high" : reporting ? "low" : "auto" }).then(async (response) => {
         try {
           const url = new URL(typeof input === "string" ? input : input?.url || String(input), SUPABASE_CONFIG.url);
           const method = String(options.method || input?.method || "GET").toUpperCase();
@@ -77,7 +77,12 @@ const SupabaseDb = (() => {
           const users = entity === "app_users" || /^rpc\/(save_user|delete_user)$/.test(entity);
           if (response.ok && !response.headers.get("X-Offline-Queued") && ["POST","PATCH","DELETE"].includes(method)
             && (core || operational || users) && typeof window.dispatchEvent === "function") {
-            window.dispatchEvent(new CustomEvent("napoles-remote-change", { detail: { core, operational, users } }));
+            let confirmedRows = [];
+            if (["table_sessions","session_items"].includes(entity)) {
+              const value = await response.clone().json().catch(() => null);
+              confirmedRows = (Array.isArray(value) ? value : [value]).filter(row => row?.id);
+            }
+            window.dispatchEvent(new CustomEvent("napoles-remote-change", { detail: { core, operational, users, entity, confirmedRows } }));
           }
         } catch (_) { /* El aviso no interrumpe una respuesta ya confirmada. */ }
         return response;
@@ -103,6 +108,25 @@ const SupabaseDb = (() => {
 })();
 
 const App = (() => {
+  class OptimisticSessionMap extends Map {
+    set(id, overlay) {
+      if (overlay?.mode === "upsert") {
+        const lines = overlay.expectedItems || (overlay.expectedItem ? [overlay.expectedItem] : []);
+        const version = JSON.stringify([lines.map(line => [line.id,line.item_name,line.quantity,line.unit_price,line.notes || "",line.status]),overlay.expectedSession || null]);
+        const previous = this.get(id);
+        overlay = { ...overlay, versionSignature: version, mutationStartedAt: previous?.versionSignature === version ? previous.mutationStartedAt : Date.now() };
+        if (previous?.versionSignature !== version) delete overlay.confirmedAt;
+      }
+      return super.set(id, overlay);
+    }
+  }
+  const rememberRemoteConfirmation = detail => {
+    if (!Array.isArray(detail?.confirmedRows) || !detail.entity) return;
+    state.confirmedRemoteRows ||= new Map();
+    for (const row of detail.confirmedRows) if (row?.id) state.confirmedRemoteRows.set(detail.entity + ":" + row.id, { row, at: Date.now() });
+    if (state.confirmedRemoteRows.size > 4000) state.confirmedRemoteRows.delete(state.confirmedRemoteRows.keys().next().value);
+  };
+
   const REQUEST_LABELS = {
     waiter: "Llamar mesero",
     bill: "Ver cuenta",
@@ -491,7 +515,7 @@ const App = (() => {
     remoteStorageSyncBusy: false,
     alertFilter: "all",
     optimisticRequestStates: new Map(),
-    optimisticSessionStates: new Map(),
+    optimisticSessionStates: new OptimisticSessionMap(),
     soundEnabled: false,
     soundPrimed: false,
     soundPriming: false,
@@ -1012,6 +1036,7 @@ const App = (() => {
         null
       );
     }
+    if (!session && create) session = await db(state.sb.from("table_sessions").select("*").eq("table_id",tableId).eq("status","open").limit(1).maybeSingle(),null);
     if (!updateState) return session;
     if (state.currentSession?.id !== session?.id) state.clientSnapshotSignature = "";
     if (state.page === "client" && state.currentTable?.id !== tableId) return session;
@@ -3397,6 +3422,40 @@ const App = (() => {
     } finally { window.clearTimeout(timeout); }
   };
 
+  const requestSessionReads = new Map();
+  const prepareRequestSession = event => {
+    const key = String(event.table_id) + ":" + event.table_access_code;
+    if (requestSessionReads.has(key)) return requestSessionReads.get(key);
+    const reading = (async () => {
+      const headers = { apikey: SUPABASE_CONFIG.anonKey, Authorization: "Bearer " + SUPABASE_CONFIG.anonKey,
+        "x-table-id": event.table_id, "x-table-code": event.table_access_code, "Content-Type": "application/json" };
+      const readUrl = new URL("/rest/v1/table_sessions", SUPABASE_CONFIG.url);
+      readUrl.searchParams.set("select", "id,table_id,status"); readUrl.searchParams.set("table_id", "eq." + event.table_id);
+      readUrl.searchParams.set("status", "eq.open"); readUrl.searchParams.set("limit", "1");
+      const send = async (url, options = {}) => {
+        const controller = new AbortController(), timer = window.setTimeout(() => controller.abort(), 5000);
+        try { return await fetch(url, { ...options, headers: { ...headers, ...options.headers }, priority: "high", cache: "no-store", signal: controller.signal }); }
+        finally { window.clearTimeout(timer); }
+      };
+      let response = await send(readUrl.href);
+      if (!response.ok) return null;
+      let rows = await response.json(), session = Array.isArray(rows) ? rows[0] : null;
+      if (!session) {
+        // Solo una solicitud explícita crea el borrador; escanear o consultar sigue siendo de lectura.
+        response = await send(new URL("/rest/v1/table_sessions", SUPABASE_CONFIG.url).href, { method: "POST",
+          headers: { Prefer: "return=representation" }, body: JSON.stringify({ id: uid(), table_id: event.table_id, status: "open" }) });
+        if (response.ok) { rows = await response.json(); session = Array.isArray(rows) ? rows[0] : rows; }
+        else if (response.status === 409) { response = await send(readUrl.href); if(response.ok) { rows=await response.json(); session=Array.isArray(rows)?rows[0]:null; } }
+      }
+      if (!session?.id || String(session.table_id) !== String(event.table_id)) return null;
+      if (state.currentTable?.id === event.table_id && (!state.currentSession || state.currentSession.status !== "open")) {
+        state.currentSession = session; state.clientSnapshotSignature = ""; subscribeClient();
+      }
+      return session;
+    })().catch(() => null).finally(() => requestSessionReads.delete(key));
+    requestSessionReads.set(key, reading); return reading;
+  };
+
   const flushRequestOutbox = async () => {
     if (!navigator.onLine) return;
     state.requestOutboxInFlight ||= new Set();
@@ -3416,16 +3475,21 @@ const App = (() => {
     state.requestOutboxBusy = true;
     let results = null;
     try {
+      const prepared = !due.some(event => !event.session_id) ? due : await Promise.all(due.map(async event => {
+        if (event.session_id) return event;
+        const session = await prepareRequestSession(event);
+        return session ? { ...event, session_id: session.id } : event;
+      }));
       const batch = await readRealtimeData(
         state.sb.rpc("createServiceRequestsBatch", {
-          requests: due.map(({ attempts, next_attempt_at, ...event }) => event)
+          requests: prepared.map(({ attempts, next_attempt_at, ...event }) => event)
         })
       );
       results = batch?.results || null;
 
       // Compatibilidad mientras se publica el backend por lotes.
       if (!results) {
-        results = await Promise.all(due.map(async (item) => {
+        results = await Promise.all(prepared.map(async (item) => {
           let result = await readRealtimeData(state.sb.rpc("createServiceRequest", item));
           if (result?.duplicate && result.request?.id !== item.request_id) result = null;
           if (result) return result;
@@ -4361,7 +4425,7 @@ const App = (() => {
     });
   };
 
-  const mergeOptimisticSessions = (serverSessions = []) => {
+  const mergeOptimisticSessions = (serverSessions = [], { readStartedAt = 0 } = {}) => {
     const merged = new Map(serverSessions.map((session) => [session.id, { ...session, session_items: mergeSessionItems(session.session_items) }]));
     state.optimisticSessionStates.forEach((overlay, sessionId) => {
       const now = Date.now();
@@ -4374,6 +4438,16 @@ const App = (() => {
         return;
       }
       const expectedItems = overlay.expectedItems || (overlay.expectedItem ? [overlay.expectedItem] : []);
+      const receipts = expectedItems.map(item => state.confirmedRemoteRows?.get("session_items:" + item.id));
+      const sessionReceipt = state.confirmedRemoteRows?.get("table_sessions:" + sessionId);
+      const itemProof = !expectedItems.length || expectedItems.every((item,index) => receipts[index] && sessionItemMatches(receipts[index].row,item));
+      const sessionProof = !overlay.expectedSession || (sessionReceipt && Object.keys(overlay.expectedSession).every(field =>
+        String(sessionReceipt.row[field] || "") === String(overlay.expectedSession[field] || "")));
+      const proofAt = Math.max(0,...receipts.map(receipt => receipt?.at || 0),overlay.expectedSession ? sessionReceipt?.at || 0 : 0);
+      if (!overlay.localOnly && readStartedAt && ((overlay.confirmedAt && readStartedAt > overlay.confirmedAt)
+        || (itemProof && sessionProof && proofAt >= Number(overlay.mutationStartedAt || 0) && readStartedAt >= proofAt))) {
+        state.optimisticSessionStates.delete(sessionId); return;
+      }
       const expectedItemConfirmed = !expectedItems.length || expectedItems.every((expectedItem) =>
         (serverSession?.session_items || []).some((item) => sessionItemMatches(item, expectedItem))
         || (serverSession && expectedItem.status === "cancelled"
@@ -4973,6 +5047,7 @@ const App = (() => {
         state.optimisticSessionStates.set(entry.id, { mode: "remove", session: null, retainUntil: entry.retainUntil });
       }
     });
+    const readStartedAt = Date.now();
     const remoteSnapshot = await readRealtimeData(state.sb.rpc("getAdminSnapshot", { auth_token: state.authToken }));
     if (remoteSnapshot && (!Array.isArray(remoteSnapshot.requests) || !Array.isArray(remoteSnapshot.sessions))) return false;
     if (remoteSnapshot) {
@@ -5027,7 +5102,7 @@ const App = (() => {
     const requests = mergeOptimisticRequests(merged);
     const inFlightPending = merged.filter((request) => request.status === "pending" && state.optimisticRequestStates.has(request.id));
     persistPendingAdminRequests([...requests, ...inFlightPending]);
-    const sessions = mergeOptimisticSessions(snapshot.sessions || []);
+    const sessions = mergeOptimisticSessions(snapshot.sessions || [], { readStartedAt });
     const signature = JSON.stringify([requests,sessions]);
     if (signature === state.adminSnapshotSignature) return false;
     state.adminSnapshotSignature = signature;
@@ -6252,7 +6327,45 @@ const App = (() => {
       .map(([id,name]) => `<option value="${escapeHTML(id)}">${escapeHTML(name)}</option>`).join("");
     if (select.innerHTML !== markup) select.innerHTML = markup;
     select.value = state.movementProductFilter || "all";
+    syncMovementProductPicker();
   };
+  const syncMovementProductPicker = () => {
+    const select=$("#movementProductFilter"),toggle=$("#movementProductToggle"),list=$("#movementProductOptions");
+    if(!select || !toggle || !list) return;
+    toggle.innerHTML=escapeHTML(select.selectedOptions[0]?.textContent || "Todos los productos")+icon("chevron-down",18);
+    const markup=[...select.options].map((option,index)=>`<button type="button" role="option" id="movement-product-option-${index}" data-movement-product="${escapeHTML(option.value)}" aria-selected="${String(option.selected)}">${escapeHTML(option.textContent)}</button>`).join("");
+    if(list.innerHTML!==markup)list.innerHTML=markup;
+  };
+  const bindMovementProductPicker = () => {
+    const select=$("#movementProductFilter"),toggle=$("#movementProductToggle"),list=$("#movementProductOptions"),picker=$("#movementProductPicker");
+    if(!select || !toggle || !list || !picker || toggle.dataset.bound) return;
+    toggle.dataset.bound="1";
+    const close=()=>{list.hidden=true;toggle.setAttribute("aria-expanded","false");toggle.removeAttribute("aria-activedescendant");};
+    const choose=option=>{select.value=option.dataset.movementProduct;select.dispatchEvent(new Event("change",{bubbles:true}));close();toggle.focus({preventScroll:true});};
+    const open=()=>{
+      syncMovementProductPicker();
+      if(toggle.getBoundingClientRect().bottom>window.innerHeight-180)toggle.scrollIntoView({block:"center",behavior:"instant"});
+      list.style.maxHeight=Math.max(96,Math.min(280,window.innerHeight-toggle.getBoundingClientRect().bottom-12))+"px";
+      list.hidden=false;toggle.setAttribute("aria-expanded","true");
+    };
+    toggle.addEventListener("click",()=>{if(list.hidden)open();else close();});
+    list.addEventListener("click",event=>{const option=event.target.closest("[data-movement-product]");if(option)choose(option);});
+    toggle.addEventListener("keydown",event=>{
+      if(event.key==="Escape"){close();return;}
+      if(!["ArrowDown","ArrowUp","Home","End","Enter"," "].includes(event.key))return;
+      event.preventDefault();if(list.hidden)open();
+      const options=[...list.querySelectorAll('[role="option"]')];
+      let index=options.findIndex(option=>option.id===toggle.getAttribute("aria-activedescendant"));
+      if(index<0)index=Math.max(0,options.findIndex(option=>option.getAttribute("aria-selected")==="true"));
+      if(event.key==="Enter"||event.key===" "){choose(options[index]);return;}
+      index=event.key==="Home"?0:event.key==="End"?options.length-1:Math.max(0,Math.min(options.length-1,index+(event.key==="ArrowDown"?1:-1)));
+      toggle.setAttribute("aria-activedescendant",options[index].id);options[index].scrollIntoView({block:"nearest"});
+    });
+    document.addEventListener("click",event=>{if(!picker.contains(event.target))close();});
+    document.addEventListener("keydown",event=>{if(event.key==="Escape")close();});
+    window.addEventListener("resize",close);
+  };
+
   let completeMovementsPromise = null;
   const ensureCompleteMovementHistory = () => {
     if (completeMovementsPromise) return completeMovementsPromise;
@@ -11082,6 +11195,7 @@ const App = (() => {
       state.serviceTableZoneFilter = event.currentTarget.value || "all";
       renderServiceTables();
     });
+    bindMovementProductPicker();
     $("#movementProductFilter")?.addEventListener("change", event => {
       state.movementProductFilter = event.currentTarget.value || "all";
       renderInventoryMovements();
@@ -11671,7 +11785,7 @@ const App = (() => {
     }
     state.adminRealtimeNeedsReconnect = false;
     if (!state.peerSyncListener) {
-      state.peerSyncListener = (event) => notifyAdminPeers(event.detail);
+      state.peerSyncListener = (event) => { rememberRemoteConfirmation(event.detail); notifyAdminPeers(event.detail); };
       window.addEventListener("napoles-remote-change", state.peerSyncListener);
     }
     const channel = state.sb

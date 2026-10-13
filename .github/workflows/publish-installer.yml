@@ -1,0 +1,30 @@
+name: Publicar instalador para la landing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dist/Tienda-Napoles-Offline-Setup-*.exe'
+      - 'packaging/publish-release.cjs'
+      - '.github/workflows/publish-installer.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-installer
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el proyecto
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Publicar el instalador mas reciente
+        run: node packaging/publish-release.cjs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

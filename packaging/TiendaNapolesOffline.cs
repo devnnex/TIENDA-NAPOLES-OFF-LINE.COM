@@ -15,10 +15,10 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Iniciador de Tienda Napoles Offline sin consola")]
 [assembly: AssemblyCompany("Tienda Napoles")]
 [assembly: AssemblyProduct("Tienda Napoles Offline")]
-[assembly: AssemblyVersion("1.0.14.0")]
-[assembly: AssemblyFileVersion("1.0.14.0")]
+[assembly: AssemblyVersion("1.0.15.0")]
+[assembly: AssemblyFileVersion("1.0.15.0")]
 
-internal static class TiendaNapolesOffline
+public static class TiendaNapolesOffline
 {
     private const string HealthUrl = "http://127.0.0.1:8766/__tienda_napoles_health";
     private const string AppUrl = "http://127.0.0.1:8766/admin.html";
@@ -30,9 +30,14 @@ internal static class TiendaNapolesOffline
     [STAThread]
     private static void Main()
     {
+        Launch(AppDomain.CurrentDomain.BaseDirectory);
+    }
+
+    public static void Launch(string appDirectory)
+    {
         try
         {
-            string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            appDirectory = Path.GetFullPath(appDirectory);
             string serverScript = Path.Combine(appDirectory, "offline-server.ps1");
             if (!File.Exists(serverScript))
             {
@@ -294,6 +299,14 @@ internal static class TiendaNapolesOffline
 internal static class TaskbarIdentity
 {
     internal const string AppId = "TiendaNapoles.Offline";
+    internal static string RelaunchCommand(string directory)
+    {
+        string powershell = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "WindowsPowerShell", "v1.0", "powershell.exe");
+        return "\"" + powershell + "\" -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
+            Path.Combine(directory, "Iniciar-Tienda-Napoles-Instalada.ps1") + "\"";
+    }
+
     private static readonly Guid PropertyFormat = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
     private delegate bool EnumWindowCallback(IntPtr window, IntPtr parameter);
 
@@ -372,7 +385,7 @@ internal static class TaskbarIdentity
                     const string appComponent = ".127.0.0.1_admin.html";
                     if (identity == null || !(identity.EndsWith(appComponent, StringComparison.Ordinal) ||
                         identity.Contains(appComponent + ".") || (window == attached && identity == AppId))) return true;
-                    SetString(store, 2, "\"" + Path.Combine(directory, "TiendaNapolesOffline.exe") + "\"");
+                    SetString(store, 2, RelaunchCommand(directory));
                     SetString(store, 4, "Tienda N\u00e1poles");
                     SetString(store, 3, Path.Combine(directory, "tienda-napoles.ico") + ",0");
                     SetString(store, 5, AppId);

@@ -1,7 +1,25 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.14.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.15.exe` con Inno Setup 6.
+
+La versión 1.0.15 corrige únicamente el arranque instalado y los accesos directos.
+En el PC revisado faltaba `TiendaNapolesOffline.exe` en la carpeta instalada;
+no se pudo confirmar qué lo eliminó. Los accesos del escritorio, Inicio y los
+nuevos anclajes usan Windows PowerShell y el script instalado, que abre el `.exe`
+normalmente y carga el mismo iniciador desde su fuente si falta el ejecutable.
+Pueden abrir aunque falte ese ejecutable. El `.exe` también conserva la
+compatibilidad con accesos antiguos. No se recrean ejecutables
+ni se cambian las opciones del antivirus.
+
+La carpeta de instalación conserva la de la versión anterior y no depende del
+nombre ni la ubicación de la descarga. Cada instalación vuelve a escribir los
+accesos del escritorio e Inicio. Para reparar una instalación existente, ejecuta
+1.0.15 con el mismo usuario de Windows, sin desinstalar. Si tenías un anclaje
+antiguo en la barra de tareas, desánclalo y ancla el acceso actualizado de Inicio.
+No hay cambios en `app.js`, servidor, interfaz, sincronización ni datos locales.
+El script y los archivos instalados deben conservarse; esta corrección no puede
+evitar una eliminación manual ni un bloqueo de Windows o de un antivirus.
 
 La versión 1.0.14 limita el ajuste a los avisos de Offline hacia BCA: cada
 escritura confirmada avisa sin esperar al resto de la cola. La entrega a
@@ -180,6 +198,12 @@ Para compilar de nuevo, instala Inno Setup 6 y ejecuta:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\packaging\build-installer.ps1
+```
+
+Para comprobar el iniciador y su respaldo sin abrir el navegador ni usar datos reales:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\installed-launcher.test.ps1
 ```
 
 El `.exe` generado puede alojarse como archivo de descarga directa en la futura

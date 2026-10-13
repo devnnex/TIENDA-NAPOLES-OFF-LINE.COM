@@ -6,6 +6,9 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $buildDirectory = Join-Path $PSScriptRoot "build"
 $installerScript = Join-Path $PSScriptRoot "TiendaNapolesOffline.iss"
+$versionMatch = [regex]::Match([IO.File]::ReadAllText($installerScript), '(?m)^#define AppVersion "([0-9]+\.[0-9]+\.[0-9]+)"\s*$')
+if (-not $versionMatch.Success) { throw "No se encontro AppVersion en el script del instalador." }
+$appVersion = $versionMatch.Groups[1].Value
 $launcherSource = Join-Path $PSScriptRoot "TiendaNapolesOffline.cs"
 $launcherExe = Join-Path $buildDirectory "TiendaNapolesOffline.exe"
 $appIcon = Join-Path $projectRoot "tienda-napoles.ico"
@@ -43,7 +46,7 @@ try {
   Pop-Location
 }
 
-$installer = Join-Path (Join-Path $projectRoot "dist") "Tienda-Napoles-Offline-Setup-1.0.14.exe"
+$installer = Join-Path (Join-Path $projectRoot "dist") "Tienda-Napoles-Offline-Setup-$appVersion.exe"
 if (-not (Test-Path -LiteralPath $installer)) { throw "El instalador no aparecio en dist." }
 Get-Item -LiteralPath $installer | Select-Object FullName, Length
 Get-FileHash -LiteralPath $installer -Algorithm SHA256 | Select-Object Algorithm, Hash

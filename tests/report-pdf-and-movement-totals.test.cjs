@@ -55,12 +55,12 @@ test('un PDF sin conexión indica que contiene una copia parcial de los registro
  const h=harness();h.context.navigator.onLine=false;h.state.incomeReport={filters,records:[sale(1)],totalRecords:5};await h.api.exportIncomeCsv();
  assert.equal(h.documents.length,1);assert.ok(h.documents[0].text.includes('Reporte parcial'));assert.ok(h.documents[0].text.includes('1 de 5'));
 });
-test('sin red usa el total de ventas guardado del rango y señala que es una copia local',async()=>{
- const h=harness({readLocalJson:()=>({filters:{dateFrom:'2000-01-01',dateTo:'2026-10-13',paymentMethod:'all',query:'',saleType:'all',complete:true},report:{records:[sale(1)]}}),renderInventoryMovements(){}});
- h.context.navigator.onLine=false;
- h.context.purchaseDateKey=()=> '2026-10-13';
- const a=source.indexOf('  let movementSalesTotalsPromise ='),b=source.indexOf('  const movementSoldUnits =',a);
- vm.runInContext(source.slice(a,b)+';globalThis.loadMovementTotals=loadMovementSalesTotals;',h.context);
- h.context.loadMovementTotals();for(let i=0;i<3;i++)await new Promise(resolve=>setImmediate(resolve));
- assert.equal(h.state.movementSalesRecords.length,1);assert.equal(h.state.movementSalesTotalsError,'');assert.ok(h.state.movementSalesTotalsNotice.includes('Sin conexión'));
+test('filtrar movimientos reutiliza las ventas en memoria sin consultar el backend, con o sin red',()=>{
+ for(const online of [true,false]) {
+  const h=harness({localIncomeRecords:()=>[sale(1)],reportMirror:()=>({deleted:{}}),readAppsScriptOutbox:()=>[],appsScriptRequest(){throw Error('El filtro no debe consultar la red.');}});
+  h.context.navigator.onLine=online;
+  vm.runInContext(block('loadMovementSalesTotals','movementViewRows')+';globalThis.loadMovementTotals=loadMovementSalesTotals;',h.context);
+  h.context.loadMovementTotals();h.context.loadMovementTotals();
+  assert.equal(h.state.movementSalesRecords.length,1);assert.equal(h.api.movementSoldUnits(),2);
+ }
 });

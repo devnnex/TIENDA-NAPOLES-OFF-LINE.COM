@@ -42,7 +42,7 @@ function backend() {
       }
       if (name === 'get_service_request_queue') return { data: { requests: [] } };
       if (name === 'get_session_payments') { await server.ledgerGate; return { data: { payments: [] } }; }
-      if (name === 'getAdminSnapshot') return { data: { requests: server.requests.map(row => ({ ...row })), sessions: [] } };
+      if (name === 'getAdminSnapshot') { if(server.adminGate)await server.adminGate; return { data: { requests: server.requests.map(row => ({ ...row })), sessions: [] } }; }
       if (name === 'listChatMessages') return { data: { messages: server.messages.filter(row => row.session_id === payload.p_session_id).map(row => ({ ...row })) } };
       if (name === 'sendChatMessage') {
         const message = { id: payload.p_message_id, session_id: payload.p_session_id, sender_type: payload.p_sender_type,
@@ -75,7 +75,7 @@ function device(server, page = 'client') {
     page, currentTable: { id: 'table-a' }, currentSession: page === 'client' ? null : { id: 'session-a' }, sb: server.sb,
     clientHydrationToken: 0, clientStaffMessageSoundIds: new Set(), clientSyncBusy: false, clientRequests: [],
     chatMessages: [], assistantMode: 'bar', assistantThreads: { bar: [], song: [] },
-    adminChats: new Map(), adminChatTypingTimers: new Map(), subscriptions: [], requests: [], sessions: [],
+    tables: [], adminChats: new Map(), adminChatTypingTimers: new Map(), subscriptions: [], requests: [], sessions: [],
     authToken: page === 'admin' ? 'valid' : '', optimisticRequestStates: new Map(), posFeatures: {}, syncFresh: {}
   };
   const document = { hidden: false, addEventListener: (name, callback) => events.set(name, callback) };
@@ -97,7 +97,7 @@ function device(server, page = 'client') {
     renderAssistant: () => { renders++; }, renderAdminChat: () => { renders++; }, renderAdminLive: () => { renders++; },
     playClientChatReceipt() {}, playAdminChatReceipt() {}, assistantSay() {}, setPeerTyping() {},
     mergeOptimisticRequests: rows => rows, mergeOptimisticSessions: rows => rows,
-    refreshBackgroundReports() {}, notifyAdminPeers() {}, flushPeerRefreshes() {}, startConfirmedReportSync() {}, syncConfirmedReports() {}, refreshInventoryFromPeer() {}, isBoss: () => false,
+    refreshBackgroundReports() { if(server.reportGate) { server.reportReads=(server.reportReads||0)+1; return server.reportGate; } }, notifyAdminPeers() {}, flushPeerRefreshes() {}, startConfirmedReportSync() {}, syncConfirmedReports() {}, refreshInventoryFromPeer() {}, isBoss: () => false,
     setRealtimeStatus() {}, refreshCoreNow() {}, loadUsers() {}
   });
   vm.runInContext(section('dbQuiet', 'bootstrapCacheKey')
@@ -114,6 +114,7 @@ function device(server, page = 'client') {
     + block('  let clientPosReadPending =', '  const renderClientQueue =')
     + section('pendingAdminRequestsStorageKey', 'mergePendingCoreData')
     + section('pendingAdminReadScope', 'pendingAdminRequestsStorageKey')
+    + block('  const receiveAdminRequests =', '  let adminRefreshPending =')
     + block('  let adminRefreshPending =', '  const startAdminPolling =')
     + section('startAdminPolling', 'pendingAdminReadScope')
     + section('subscribeAdmin', 'tableFromScannedValue')
@@ -279,5 +280,22 @@ function device(server, page = 'client') {
   await timed.advance(8000);
   assert.equal(await waiting, null);
   assert.equal(signal.aborted, true, 'Una lectura detenida se cancela para permitir el siguiente intento.');
+  const busyBackend = backend(), receiver = device(busyBackend, 'admin');
+  busyBackend.reportGate = new Promise(() => {});
+  receiver.state.activeAdminSection = 'movements';
+  receiver.api.subscribeAdmin(); await settle();
+  await receiver.api.refreshAdminNow();
+  assert.ok(busyBackend.reportReads, 'Simula reportes esperando al backend.');
+  let releaseAdmin;
+  busyBackend.adminGate = new Promise(resolve => { releaseAdmin=resolve; });
+  void receiver.api.refreshAdminNow(); await settle();
+  assert.equal(receiver.state.adminSyncBusy,true);
+  for(const [i,type,message] of [[1,'waiter',''],[2,'other','Mesa b solicita la canción: prueba'],[3,'other','Mesa c escribió en el chat: hola']]) {
+    busyBackend.requests.push({id:'simultaneous-'+i,table_id:'table-'+i,session_id:'draft-'+i,status:'pending',request_type:type,message,created_at:'2026-10-13T18:00:00Z'});
+  }
+  busyBackend.emit('admin','request-arrived',{requestIds:busyBackend.requests.map(row=>row.id)}); await settle();
+  assert.equal(receiver.state.requests.length,3,'Mesero, canción y chat de distintas mesas llegan con un snapshot ocupado y reportes lentos.');
+  releaseAdmin(); await settle();
+  assert.equal(receiver.state.requests.length,3,'Completar la lectura anterior no oculta ni duplica solicitudes.');
   console.log('PASS recepción en vivo: dos dispositivos, solicitudes, pagos lentos, chat independiente, respaldo, reconexión y reanudación sin recarga.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

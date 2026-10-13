@@ -96,7 +96,7 @@ test("limpiar movimientos durante la consulta no restaura el historial anterior"
 
 test("eliminar una venta invalida una consulta anterior del informe", async () => {
   const state = { incomeRequestId: 3, incomeLoading: true, incomeReport: { records: [{ saleId: "sale", total: 1000, items: [], payments: [] }], totals: { income: 1000, sales: 1 }, totalRecords: 1 }, invoiceHistory: [], items: [], inventoryMeta: {} };
-  const context = vm.createContext({ state, canDeleteRecords: () => true, readAppsScriptOutbox: () => [], writeAppsScriptOutbox() {}, persistInvoiceHistory() {}, persistInventoryStore() {}, renderIncomeReport() {}, renderInventory() {}, enqueueAppsScriptJob() {}, toast() {}, $: () => ({ close() {} }) });
+  const context = vm.createContext({ state, canDeleteRecords: () => true, readAppsScriptOutbox: () => [], writeAppsScriptOutbox() {}, persistInvoiceHistory() {}, persistInventoryStore() {}, renderIncomeReport() {}, renderInventory() {}, enqueueAppsScriptJob() {}, toast() {}, $: () => ({ close() {} }), reportMirror: () => ({ deleted: {}, sales: {} }), reportMirrorKey: () => 'mirror', saveReportSyncValue() {}, removeDeletedSaleMovements: rows => rows || [], persistInventoryMovements() {}, renderInventoryMovements() {} });
   vm.runInContext(section("  const deleteIncomeSale =", "  const replaceEditedIncomeRecord =") + ";globalThis.remove=deleteIncomeSale;", context);
   await context.remove({ sale_id: { value: "sale" } });
   assert.equal(state.incomeRequestId, 4);

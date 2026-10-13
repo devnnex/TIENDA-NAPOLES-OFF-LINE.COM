@@ -1,7 +1,7 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.20.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.21.exe` con Inno Setup 6.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el
@@ -10,6 +10,12 @@ crea un borrador, sube y verifica el archivo y después lo marca como la última
 publicación. Una versión antigua no desplaza una más reciente. Para cada cambio
 del paquete incrementa la versión, compila y sube el nuevo `.exe`. También se
 puede ejecutar el workflow manualmente desde Actions. No modifica la landing.
+
+La versión 1.0.21 evita consultar historiales completos al entrar o filtrar
+Movimientos. Conserva tres KPI y cambia entre inventario y ventas en memoria.
+Concilia borrados del respaldo y retira movimientos de las ventas eliminadas.
+La recepción de solicitudes y chat conserva su conexión independiente y los
+límites de canciones. No modifica cálculos de cobro o restauración de stock.
 
 La versión 1.0.20 coloca Guardar marca junto al logo y la portada y añade
 Guardar mesas de afuera dentro del configurador. Ambos botones bloquean

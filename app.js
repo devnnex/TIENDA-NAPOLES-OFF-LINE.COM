@@ -937,10 +937,8 @@ const App = (() => {
     }
     if (section === "inventory") renderInventory();
     if (section === "movements") {
-      if (canAccessAdminSection("income")) loadMovementSalesTotals();
-      if (state.completeMovementRevision !== state.movementRevision) void ensureCompleteMovementHistory().catch(error => { const feedback=$("#movementTotalsFeedback"); if(feedback)feedback.textContent=error.message; });
       renderInventoryMovements();
-      if (!state.syncFresh.movements) void loadInventoryMovements();
+      if (!state.syncFresh.movements || Date.now() - Number(state.movementFetchedAt || 0) >= 5000) void loadInventoryMovements();
     }
     if (section === "income") {
       if (enteringIncome) {
@@ -2252,12 +2250,13 @@ const App = (() => {
 
   const persistInventoryMovements = () => persistDurableJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements);
 
-  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "", unitCost }) => {
+  const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "", unitCost, sessionId = "" }) => {
     const numericDelta = Number(delta || 0);
     const isNewProduct = String(type || "").toUpperCase() === "NUEVO_PRODUCTO";
     if (!item || !Number.isFinite(numericDelta) || (!numericDelta && !isNewProduct) || state.inventoryMovements.some((movement) => movement.movementId === eventId)) return null;
     const movement = {
       movementId: eventId,
+      sessionId,
       productId: item.id,
       code: inventoryFor(item).code,
       product: item.name || "Producto",
@@ -3165,6 +3164,7 @@ const App = (() => {
       delta: change,
       before: current.stock,
       after: nextStock,
+      sessionId: context.sessionId || "",
       type: context.movementType || (change < 0 ? "CONSUMO_MESA" : "DEVOLUCION_CONSUMO"),
       reference: context.reference || ""
     });
@@ -5985,7 +5985,7 @@ const App = (() => {
     const movements = (state.inventoryMovements || []).filter(row => eventId ? String(row.movementId) === eventId
       : action === "record_sale" && (String(row.movementId).startsWith(`SALE-${saleId}-`) || (invoice?.sessionId && String(row.sessionId) === String(invoice.sessionId))));
     const change = { operationId: operationId || `${action}:${eventId || saleId || uid()}:${action === "record_sale" ? "saved" : uid()}`, action,
-      payload: { occurredAt: new Date().toISOString(), ...(invoice ? { invoice } : {}), ...(saleId ? { saleId } : {}), ...(productId ? { productId } : {}),
+      payload: { occurredAt: new Date().toISOString(), ...(invoice ? { invoice } : {}), ...(saleId ? { saleId } : {}), ...(payload.saleLink ? { saleLink: payload.saleLink } : {}), ...(productId ? { productId } : {}),
         movements, items: (result.items || (result.item ? [result.item] : [])).filter(item => action === "delete_sale" || ids.has(String(item.productId))) } };
     const queued = readLocalJson(reportChangeOutboxKey, []);
     if (!queued.some(entry => entry.operationId === change.operationId)) {
@@ -6045,9 +6045,13 @@ const App = (() => {
       const id = String(payload.saleId || payload.invoice?.id || payload.invoice?.sessionId || "");
       if (change.action === "clear_income") { mirror.sales = {}; mirror.deleted = {}; mirror.salesClearAt = change.confirmedAt || payload.occurredAt; }
       if (payload.invoice && ["record_sale","edit_sale"].includes(change.action)) { mirror.sales[id] = { ...payload.invoice, reportConfirmedAt: change.confirmedAt || payload.occurredAt }; delete mirror.deleted[id]; }
-      if (change.action === "delete_sale" && id) { delete mirror.sales[id]; mirror.deleted[id] = change.confirmedAt || payload.occurredAt || true; }
+      if (change.action === "delete_sale" && id) {
+        mirror.deletedSaleLinks ||= {};
+        mirror.deletedSaleLinks[id] = payload.saleLink || mirror.sales[id] || {};
+        delete mirror.sales[id]; mirror.deleted[id] = change.confirmedAt || payload.occurredAt || true;
+      }
       if (change.action === "clear_inventory_movements") { mirror.movements = {}; mirror.movementsClearAt = change.confirmedAt || payload.occurredAt; }
-      (payload.movements || []).forEach(row => { if (row.movementId) mirror.movements[row.movementId] = { ...row, reportConfirmedAt: change.confirmedAt || payload.occurredAt }; });
+      (payload.movements || []).forEach(row => { if (row.movementId) mirror.movements[row.movementId] = { ...row, googlePending: Boolean(payload.invoice?.googlePending), reportConfirmedAt: change.confirmedAt || payload.occurredAt }; });
       if (payload.items?.length) applyRemoteInventoryItems(payload.items);
       mirror.cursor = Number(change.sequence);
     }
@@ -6093,8 +6097,6 @@ const App = (() => {
         renderInventoryMovements();
         if (state.activeAdminSection === "inventory") renderInventory();
         if ($("#purchaseHistoryDialog")?.open) { renderPurchaseProductOptions(); renderPurchaseHistory(); }
-        state.movementSalesTotalsKey = "";
-        if (state.activeAdminSection === "movements" && canAccessAdminSection("income")) loadMovementSalesTotals();
       }
       return changed;
     } catch (_) { return false; } finally {
@@ -6102,15 +6104,48 @@ const App = (() => {
       if (confirmedReportReadPending) { confirmedReportReadPending = false; window.setTimeout(() => void syncConfirmedReports(), 0); }
     }
   };
-  const mergeConfirmedMovements = (rows, revision = state.movementRevision) => {
+  const movementBelongsToSale = (row, sale) => {
+    const id = String(sale.saleId || sale.id || sale.sessionId || "");
+    return Boolean(id && (String(row.movementId || "").startsWith("SALE-" + id + "-")
+      || String(row.movementId || "").startsWith("DELETE-SALE-" + id + "-")
+      || (sale.sessionId && String(row.sessionId || "") === String(sale.sessionId))
+      || ((sale.invoice || sale.number) && String(row.reference || "") === String(sale.invoice || sale.number))));
+  };
+  const removeDeletedSaleMovements = rows => {
     const mirror = reportMirror();
-    const currentAfterClear = !mirror.movementsClearAt || Number(String(revision || "").split("-")[0]) >= Date.parse(mirror.movementsClearAt);
-    const map = new Map((currentAfterClear ? rows : []).map(row => [String(row.movementId), row]));
-    Object.values(mirror.movements).forEach(row => {
-      if (map.has(String(row.movementId)) && Number(String(revision || "").split("-")[0]) >= Date.parse(row.reportConfirmedAt || "")) return;
-      map.set(String(row.movementId), row);
+    const deleted = { ...(mirror.deleted || {}) };
+    readAppsScriptOutbox().filter(job => job.action === "delete_sale").forEach(job => { deleted[String(job.payload?.saleId)] = true; });
+    const removed = { ...(mirror.deletedSaleLinks || {}) };
+    rows.forEach(row => {
+      const prefix = "DELETE-SALE-", suffix = "-" + row.productId, marker = String(row.movementId || "");
+      if (row.type !== "VENTA_ELIMINADA" || !marker.startsWith(prefix) || !marker.endsWith(suffix)) return;
+      const id = marker.slice(prefix.length, -suffix.length); deleted[id] = true; removed[id] = { sessionId: row.sessionId, invoice: row.reference };
     });
-    return [...map.values()];
+    const ids = Object.keys(deleted);
+    if (!ids.length) return rows;
+    const sessions = new Set(ids.map(id => removed[id]?.sessionId).filter(Boolean).map(String));
+    const references = new Set(ids.map(id => removed[id]?.invoice || removed[id]?.number).filter(Boolean).map(String));
+    return rows.filter(row => !sessions.has(String(row.sessionId || "")) && !references.has(String(row.reference || ""))
+      && !ids.some(id => String(row.movementId || "").startsWith("SALE-" + id + "-") || String(row.movementId || "").startsWith("DELETE-SALE-" + id + "-")));
+  };
+  const mergeConfirmedMovements = (rows, revision = state.movementRevision, { authoritative = false, readStartedAt = 0, hasMore = false } = {}) => {
+    const mirror = reportMirror();
+    const currentAfterClear = !mirror.movementsClearAt || (authoritative && readStartedAt >= Date.parse(mirror.movementsClearAt))
+      || Number(String(revision || "").split("-")[0]) >= Date.parse(mirror.movementsClearAt);
+    const map = new Map((currentAfterClear ? rows : []).map(row => [String(row.movementId), row]));
+    const oldest = hasMore ? rows.reduce((date,row) => !date || String(row.date || "") < date ? String(row.date || "") : date, "") : "";
+    let retired = false;
+    Object.values(mirror.movements).forEach(row => {
+      const id = String(row.movementId);
+      const settled = !row.googlePending && authoritative && readStartedAt >= Date.parse(row.reportConfirmedAt || "");
+      if (settled && (map.has(id) || !hasMore || (oldest && String(row.date || "") >= oldest))) {
+        delete mirror.movements[id]; retired = true; return;
+      }
+      if (map.has(id) && Number(String(revision || "").split("-")[0]) >= Date.parse(row.reportConfirmedAt || "")) return;
+      map.set(id, row);
+    });
+    if (retired) void saveReportSyncValue(reportMirrorKey(), mirror);
+    return removeDeletedSaleMovements([...map.values()]);
   };
   const mergeConfirmedIncomeReport = (remote, filters) => {
     const mirror = reportMirror();
@@ -6178,7 +6213,7 @@ const App = (() => {
     const query = normalizeText(state.movementSearch || "");
     const from = $("#movementDateFrom")?.value || "", to = $("#movementDateTo")?.value || "";
     if (from && to && from > to) return [];
-    return [...state.inventoryMovements].filter(row => {
+    return movementViewRows().filter(row => {
       const date = purchaseDateKey(row.date);
       return (state.movementProductFilter === "all" || !state.movementProductFilter || String(row.productId) === state.movementProductFilter)
         && (state.movementTypeFilter === "all" || movementKind(row) === state.movementTypeFilter)
@@ -6201,6 +6236,7 @@ const App = (() => {
     if (completeMovementsPromise) return completeMovementsPromise;
     completeMovementsPromise = (async () => {
       if (!navigator.onLine) return false;
+      const readStartedAt = Date.now();
       const baseline = new Map(state.inventoryMovements.map(row => [String(row.movementId), JSON.stringify(row)]));
       const collected = new Map();
       let cursor = null, revision = "";
@@ -6214,6 +6250,7 @@ const App = (() => {
         if (next && next === cursor) throw new Error("No se pudo completar el historial.");
         cursor = next;
       } while (cursor);
+      if (readAppsScriptOutbox().some(job => job.action === "clear_inventory_movements")) return false;
       const pendingIds = new Set();
       readAppsScriptOutbox().forEach(job => {
         const id = job.payload?.adjustment?.eventId || job.payload?.item?.movementEventId || job.payload?.movementId;
@@ -6223,51 +6260,64 @@ const App = (() => {
       const current = new Map(state.inventoryMovements.map(row => [String(row.movementId),row]));
       baseline.forEach((_,id) => { if (!current.has(id)) collected.delete(id); });
       current.forEach((row,id) => { if (pendingIds.has(id) || baseline.get(id) !== JSON.stringify(row)) collected.set(id,row); });
-      state.inventoryMovements = mergeConfirmedMovements([...collected.values()], revision);
+      state.inventoryMovements = mergeConfirmedMovements([...collected.values()], revision, { authoritative: true, readStartedAt });
       state.movementRevision = revision;
       state.completeMovementRevision = revision;
       await saveReportSyncValue("napoles_complete_movement_history_v1", { revision });
       state.movementHasMore = false;
       state.movementCursor = null;
       state.movementLoaded = true;
+      state.movementFetchedAt = Date.now();
       persistInventoryMovements();
       renderInventoryMovements();
       return true;
     })().finally(() => { completeMovementsPromise = null; });
     return completeMovementsPromise;
   };
-  let movementSalesTotalsPromise = null;
+  // El filtro y los KPI reutilizan las ventas que ya están en memoria.
   const loadMovementSalesTotals = () => {
-    const filters = { dateFrom: $("#movementDateFrom")?.value || "2000-01-01", dateTo: $("#movementDateTo")?.value || purchaseDateKey(new Date()), paymentMethod: "all", query: "", saleType: "all", complete: true };
-    const key = JSON.stringify(filters);
-    if (movementSalesTotalsPromise) { state.movementSalesTotalsRequested = true; return; }
-    if (state.movementSalesTotalsKey === key || filters.dateFrom > filters.dateTo) return;
-    state.movementSalesTotalsLoading = true;
-    movementSalesTotalsPromise = (async () => {
-      if (!navigator.onLine) {
-        const cached = readLocalJson("napoles_movement_sales_totals_v1", null);
-        const matching = cached && JSON.stringify(cached.filters) === key;
-        state.movementSalesRecords = matching ? mergeIncomeReport(cached.report,filters).records : localIncomeRecords(filters);
-        state.movementSalesTotalsNotice = matching ? "Sin conexión: totales de la última copia y ventas guardadas en este equipo." : "Sin conexión: vendido solo incluye las ventas disponibles en este equipo. Conéctate para completar otros equipos.";
-        state.movementSalesTotalsKey = key;
-        state.movementSalesTotalsError = "";
-        return;
-      }
-      let report = await appsScriptRequest("get_income_report", { filters });
-      if (!report?.ok || report.stale || !Array.isArray(report.records)) throw new Error("No se pudo consultar el total vendido.");
-      report = await completeIncomeSaleTypeReport(report, filters, state.incomeRequestId);
-      if (report.records.length < Number(report.totalRecords || 0)) throw new Error("El total vendido todavía no está completo.");
-      const mergedSales = mergeIncomeReport(report,filters);
-      state.movementSalesRecords = mergedSales.records;
-      state.movementSalesTotalsNotice = "";
-      await saveReportSyncValue("napoles_movement_sales_totals_v1", { filters, report: mergedSales });
-      state.movementSalesTotalsKey = key;
-      state.movementSalesTotalsError = "";
-    })().catch(error => { state.movementSalesTotalsError = error.message; }).finally(() => {
-      movementSalesTotalsPromise = null; state.movementSalesTotalsLoading = false; renderInventoryMovements();
-      if (state.movementSalesTotalsRequested) { state.movementSalesTotalsRequested = false; loadMovementSalesTotals(); }
-    });
+    const filters = { dateFrom: "2000-01-01", dateTo: "2099-12-31", paymentMethod: "all", query: "", saleType: "all" };
+    const records = new Map(localIncomeRecords(filters).map(row => [String(row.saleId), row]));
+    (state.incomeReport?.records || []).forEach(row => records.set(String(row.saleId), row));
+    Object.keys(reportMirror().deleted || {}).forEach(id => records.delete(id));
+    readAppsScriptOutbox().filter(job => job.action === "delete_sale").forEach(job => records.delete(String(job.payload?.saleId)));
+    state.movementSalesRecords = [...records.values()];
   };
+  const movementViewRows = () => {
+    const rows = removeDeletedSaleMovements(state.inventoryMovements);
+    if (state.movementView !== "sales") return rows;
+    if (!canAccessAdminSection("income")) return [];
+    const result = [];
+    const bySession = new Map(), byReference = new Map(), byId = new Map();
+    rows.forEach(row => {
+      byId.set(String(row.movementId), row);
+      for (const [map,key] of [[bySession,row.sessionId],[byReference,row.reference]]) {
+        if(!key) continue;
+        const list = map.get(String(key)) || []; list.push(row); map.set(String(key),list);
+      }
+    });
+    (state.movementSalesRecords || []).forEach(sale => {
+      const linked = [...(bySession.get(String(sale.sessionId || "")) || []), ...(byReference.get(String(sale.invoice || "")) || [])];
+      (sale.items || []).forEach(line => { const row = byId.get("SALE-" + sale.saleId + "-" + (line.menuItemId || line.menu_item_id)); if(row)linked.push(row); });
+      const products = new Map();
+      (sale.items || []).forEach(line => {
+        const id = String(line.menuItemId || line.menu_item_id || "");
+        if (!linked.some(row => String(row.productId) === id)) return;
+        const value = products.get(id) || { productId: id, product: line.name || line.item_name, quantity: 0, total: 0 };
+        value.quantity += Number(line.quantity || 0);
+        value.total += Number(line.total ?? (Number(line.quantity || 0) * Number(line.unitPrice || line.unit_price || 0)));
+        products.set(id, value);
+      });
+      products.forEach(product => {
+        const row = linked.find(row => String(row.productId) === product.productId);
+        result.push({ ...row, ...product, movementId: "PAID-" + sale.saleId + "-" + product.productId,
+          type: "VENTA_COBRADA", delta: -product.quantity, date: sale.date,
+          reference: sale.invoice, user: sale.waiter || row.user, saleId: sale.saleId });
+      });
+    });
+    return result;
+  };
+
   const movementSoldUnits = () => {
     const id = state.movementProductFilter || "all";
     const from = $("#movementDateFrom")?.value || "", to = $("#movementDateTo")?.value || "";
@@ -6277,18 +6327,17 @@ const App = (() => {
         && (!query || normalizeText(line.name).includes(query))).reduce((sum,line) => sum + Number(line.quantity || 0),0),0);
   };
   const renderMovementTotals = (movements) => {
+    const sales = state.movementView === "sales";
     const entries = movements.filter(row => movementKind(row) === "entry").reduce((sum,row) => sum + Number(row.delta ?? row.quantityChange ?? 0),0);
     const exits = movements.filter(row => movementKind(row) === "exit").reduce((sum,row) => sum + Math.abs(Number(row.delta ?? row.quantityChange ?? 0)),0);
-    const sold = !canAccessAdminSection("income") ? "Sin permiso de ventas" : state.movementSalesTotalsLoading ? "Consultando…" : state.movementSalesTotalsError ? "Pendiente" : reportNumber(movementSoldUnits());
     const summary = $("#movementSummary");
-    if (summary) summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line",19)}<span><small>Unidades ingresadas</small><strong>${reportNumber(entries)}</strong></span></article>
-      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>Unidades retiradas</small><strong>${reportNumber(exits)}</strong></span></article>
-      <article class="movement-kpi">${icon("shopping-bag",19)}<span><small>Unidades vendidas en cuentas cobradas</small><strong>${sold}</strong></span></article>
-      <article class="movement-kpi">${icon("list-checks",19)}<span><small>Registros del filtro</small><strong>${movements.length}</strong></span></article>`;
+    if (summary) summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line",19)}<span><small>${sales ? "Unidades devueltas" : "Unidades ingresadas"}</small><strong>+${reportNumber(entries)}</strong></span></article>
+      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>${sales ? "Unidades vendidas" : "Unidades retiradas"}</small><strong>${sales ? "" : "−"}${reportNumber(exits)}</strong></span></article>
+      <article class="movement-kpi">${icon("list-checks",19)}<span><small>Movimientos visibles</small><strong>${movements.length}</strong></span></article>`;
     const feedback = $("#movementTotalsFeedback");
-    if (feedback) feedback.textContent = state.movementSalesTotalsError || state.movementSalesTotalsNotice || (state.completeMovementRevision === state.movementRevision
-      ? "Totales de todo el historial para el producto y las fechas elegidas. Las salidas incluyen consumos y retiros; vendido solo cuenta ventas cobradas."
-      : "Entradas y salidas de los registros disponibles. Consulta todo el historial para completar los totales. Vendido solo cuenta ventas cobradas.");
+    if (feedback) feedback.textContent = sales
+      ? "Totales de las ventas cobradas y movimientos disponibles en este equipo, para el producto y las fechas elegidas."
+      : "Totales de los movimientos cargados para el producto y las fechas elegidas.";
   };
 
   const buildBusinessReportPdf = ({ title, subtitle, metrics = [], sections = [], note = "", filename }) => {
@@ -6812,11 +6861,13 @@ const App = (() => {
   };
 
   const renderInventoryMovements = () => {
+    if (state.activeAdminSection && state.activeAdminSection !== "movements") return;
+    if (state.movementView === "sales") loadMovementSalesTotals();
     const list = $("#inventoryMovementList");
     const summary = $("#movementSummary");
     if (!list || !summary) return;
     renderMovementProductOptions();
-    const signature = JSON.stringify([state.inventoryMovements, state.movementSearch, state.movementTypeFilter, state.movementProductFilter, $("#movementDateFrom")?.value, $("#movementDateTo")?.value, state.movementSalesRecords, state.movementSalesTotalsLoading, state.movementSalesTotalsError, state.movementSalesTotalsNotice, state.completeMovementRevision]);
+    const signature = JSON.stringify([state.inventoryMovements, state.movementSearch, state.movementTypeFilter, state.movementProductFilter, $("#movementDateFrom")?.value, $("#movementDateTo")?.value, state.movementView, state.movementSalesRecords]);
     if (signature === state.movementRenderSignature && list.firstElementChild) return;
     state.movementRenderSignature = signature;
     const query = normalizeText(state.movementSearch);
@@ -6825,7 +6876,7 @@ const App = (() => {
     list.innerHTML = movements.length ? movements.map((movement) => {
       const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
       const kind = delta >= 0 ? "entry" : "exit";
-      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${delta.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
+      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div>${state.movementView === "sales" ? `<div><small>Importe</small><strong>${money(movement.total)}</strong></div>` : `<div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div>`}<strong class="movement-delta">${delta > 0 ? "+" : ""}${delta.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
     }).join("") : emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right");
     refreshIcons();
   };
@@ -6859,33 +6910,32 @@ const App = (() => {
     if (movementLoadPromise) { if (force) movementRefreshPending = true; return movementLoadPromise; }
     movementLoadPromise = (async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
+    state.movementLoading = true;
     if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) {
       state.syncFresh.movements = false;
       renderInventoryMovements();
       return false;
     }
     try {
+      const readStartedAt = Date.now();
       const baseline = new Map(state.inventoryMovements.map((movement) => [movement.movementId, JSON.stringify(movement)]));
       const result = await appsScriptRequest("get_inventory_movements", { limit: 800 });
       if (!result?.ok || !Array.isArray(result.movements)) throw new Error(result?.error || "El historial remoto devolvió una respuesta inválida.");
       if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) { state.syncFresh.movements = false; return false; }
       const pendingIds = pendingInventoryMovementIds();
-      const merged = new Map((state.completeMovementRevision === result.revision ? state.inventoryMovements : result.movements).map((movement) => [movement.movementId, movement]));
-      result.movements.forEach(movement => merged.set(movement.movementId,movement));
+      const merged = new Map(result.movements.filter(row => row.movementId).map((movement) => [movement.movementId, movement]));
+      result.movements.forEach(movement => { if(movement.movementId)merged.set(movement.movementId,movement); });
       const current = new Map(state.inventoryMovements.map((movement) => [movement.movementId,movement]));
       baseline.forEach((value,id) => { if (!current.has(id)) merged.delete(id); });
       current.forEach((movement,id) => {
         if (pendingIds.has(String(id)) || baseline.get(id) !== JSON.stringify(movement)) merged.set(id,movement);
       });
-      state.inventoryMovements = typeof mergeConfirmedMovements === "function" ? mergeConfirmedMovements(Array.from(merged.values()), result.revision) : Array.from(merged.values());
-      const changedRevision = state.movementRevision !== String(result.revision || "");
+      state.inventoryMovements = typeof mergeConfirmedMovements === "function" ? mergeConfirmedMovements(Array.from(merged.values()), result.revision, { authoritative: true, readStartedAt, hasMore: Boolean(result.hasMore) }) : Array.from(merged.values());
       state.movementRevision = String(result.revision || "");
+      state.movementHasMore = Boolean(result.hasMore);
+      state.movementCursor = result.nextCursor || null;
+      state.movementLoaded = true;
       persistInventoryMovements();
-      if (changedRevision && state.activeAdminSection === "movements") {
-        state.movementSalesTotalsKey = "";
-        if (typeof loadMovementSalesTotals === "function" && canAccessAdminSection("income")) loadMovementSalesTotals();
-        if (typeof ensureCompleteMovementHistory === "function" && state.completeMovementRevision !== state.movementRevision) void ensureCompleteMovementHistory().catch(() => false);
-      }
       state.syncFresh.movements = true;
       renderInventoryMovements();
       if ($("#purchaseHistoryDialog")?.open) {
@@ -6902,6 +6952,7 @@ const App = (() => {
     }
     })().finally(() => {
       movementLoadPromise = null;
+      state.movementLoading = false;
       if (movementRefreshPending) {
         movementRefreshPending = false;
         window.setTimeout(() => void loadInventoryMovements({ force: true }), 0);
@@ -7855,6 +7906,7 @@ const App = (() => {
             state.incomeReport = mergeIncomeReport(cached.report, filters);
             state.incomeRevision = cached.report.revision;
             state.incomeFetchedAt = Date.now();
+      if (state.activeAdminSection === "movements" && state.movementView === "sales") renderInventoryMovements();
             state.syncFresh.sales = true;
             if (state.activeAdminSection === "income") renderIncomeReport();
             void updateGlobalSyncStatus();
@@ -7883,6 +7935,7 @@ const App = (() => {
       state.incomeReport = mergeIncomeReport(result, filters);
       state.incomeRevision = result.revision || "";
       state.incomeFetchedAt = Date.now();
+      if (state.activeAdminSection === "movements" && state.movementView === "sales") renderInventoryMovements();
       state.syncFresh.sales = true;
       void persistDurableJson(INCOME_REPORT_CACHE_KEY, { filters, report: result, fetchedAt: new Date().toISOString() });
       if (state.activeAdminSection === "income") renderIncomeReport();
@@ -7921,6 +7974,8 @@ const App = (() => {
     const canCheckMovements = canAccessAdminSection("movements");
     if ((!canCheckIncome && !canCheckInventory && !canCheckMovements) || !isAppsScriptConfigured() || !navigator.onLine) return false;
     const now = Date.now();
+    if (!force && state.activeAdminSection === "movements" && !state.movementLoading
+      && now - Number(state.movementFetchedAt || 0) >= 5000) void loadInventoryMovements({ background: true });
     if (force) {
       if (state.confirmedReportSyncBusy) { state.backgroundReportForcePending = true; return false; }
       state.confirmedReportSyncBusy = true;
@@ -8196,6 +8251,16 @@ const App = (() => {
     });
     updatedTotals.averageTicket = updatedTotals.sales ? updatedTotals.income / updatedTotals.sales : 0;
     state.incomeReport = { ...reportBefore, records: remainingRecords, totals: updatedTotals, totalRecords: Math.max(0, Number(reportBefore.totalRecords || 0) - 1), recordKeys: (reportBefore.recordKeys || []).filter((key) => String(key) !== String(saleId)) };
+    const saleLink = { sessionId: record.sessionId, invoice: record.invoice };
+    const mirror = reportMirror();
+    mirror.deleted[String(saleId)] = new Date().toISOString();
+    mirror.deletedSaleLinks ||= {};
+    mirror.deletedSaleLinks[String(saleId)] = saleLink;
+    delete mirror.sales[String(saleId)];
+    void saveReportSyncValue(reportMirrorKey(), mirror);
+    state.inventoryMovements = removeDeletedSaleMovements(state.inventoryMovements);
+    persistInventoryMovements();
+    renderInventoryMovements();
     state.invoiceHistory = state.invoiceHistory.filter((invoice) => String(invoice.id || invoice.sessionId) !== String(saleId));
     (record.items || []).forEach((line) => {
       const productId = line.menuItemId || line.menu_item_id;
@@ -8211,7 +8276,8 @@ const App = (() => {
     $("#deleteIncomeDialog")?.close();
     renderIncomeReport();
     renderInventory();
-    if (!hadPendingSale) enqueueAppsScriptJob("delete_sale", { saleId }, `sale-delete:${saleId}`);
+    if (!hadPendingSale) enqueueAppsScriptJob("delete_sale", { saleId, saleLink }, `sale-delete:${saleId}`);
+    else void queueConfirmedReportChange("delete_sale", { saleId, saleLink }, { ok: true }, `sale-delete:${saleId}`);
     toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
   };
 
@@ -11052,13 +11118,18 @@ const App = (() => {
     });
     const updateMovementFilters = () => {
       state.movementProductFilter = $("#movementProductFilter")?.value || "all";
-      state.movementSalesTotalsKey = "";
-      if (canAccessAdminSection("income")) loadMovementSalesTotals();
       renderInventoryMovements();
-      void ensureCompleteMovementHistory().catch(error => { const feedback=$("#movementTotalsFeedback"); if(feedback)feedback.textContent=error.message; });
     };
     ["#movementProductFilter","#movementDateFrom","#movementDateTo"].forEach(selector => $(selector)?.addEventListener("change", updateMovementFilters));
-    $("#completeMovementHistory")?.addEventListener("click", async event => { const button=event.currentTarget; button.disabled=true; try{await ensureCompleteMovementHistory();if(canAccessAdminSection("income"))loadMovementSalesTotals();}catch(error){toast(error.message,"error","movement-history-failed");}finally{button.disabled=false;} });
+    $$('[data-movement-view]').forEach(button => button.addEventListener("click", () => {
+      const view = button.dataset.movementView;
+      if (view === state.movementView) return;
+      state.movementView = view;
+      $$('[data-movement-view]').forEach(tab => tab.setAttribute("aria-selected", String(tab === button)));
+      renderInventoryMovements();
+      const panel = $("#inventoryMovementList");
+      if (!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) panel?.animate?.([{ opacity: .4 }, { opacity: 1 }], { duration: 130 });
+    }));
     $("#exportPurchasesPdf")?.addEventListener("click", () => void exportPurchasesPdf());
     $("#movementSearch")?.addEventListener("input", (event) => {
       state.movementSearch = event.currentTarget.value;

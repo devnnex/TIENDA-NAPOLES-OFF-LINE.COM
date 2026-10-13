@@ -136,3 +136,12 @@ test('Reabrir el chat no elimina el limite de cinco canciones ni permite enviar 
   assert.equal(client.chatMessages.length, 0);
   assert.equal(h.groups()[0].kind, 'song');
 });
+
+test('una mesa recién escaneada y sin consumo envía mesero y canción en cuanto se confirman, sin consultar reportes',async()=>{
+ const h=harness(),guest=h.client('free');guest.state.currentSession=null;
+ guest.api.createRequest('waiter');await guest.api.handleSongRequest('Una canción');await guest.drain();
+ assert.equal(h.saved.size,2);assert.equal(h.groups().length,2);
+ assert.ok(h.rpcCalls.every(call=>call.name==='createServiceRequestsBatch'));
+ assert.ok(h.rpcCalls.flatMap(call=>call.payload.requests).every(row=>row.session_id===null));
+ assert.equal(guest.state.currentSession,null,'No hace falta ocupar ni cobrar una mesa para enviar llamados.');
+});

@@ -17,9 +17,15 @@ del servicio de inventario para respetar los ajustes concurrentes.
 Ventas exporta PDF del filtro, fecha o turno seleccionado y recorre todas las
 páginas online. Compras también exporta PDF con resumen por producto y detalle.
 Sin conexión se identifica la copia disponible y las ventas parciales.
-Movimientos permite elegir producto y fechas, consultar todo el historial y
-ver unidades ingresadas, retiradas y vendidas en cuentas cobradas. Consumir
-o retirar unidades todavía no equivale a cobrar una venta.
+Movimientos conserva sus tres KPI y permite cambiar entre inventario y ventas
+con dos pestañas de texto. Producto y fechas filtran los registros cargados en
+memoria sin consultar otra vez el backend. La vista de ventas agrupa por cuenta
+cobrada y producto; incluye las ventas y movimientos disponibles en ese equipo,
+no promete sumar páginas de historial que todavía no se hayan cargado. Solo
+exportar Compras en PDF completa el historial remoto. Los borrados del respaldo
+se concilian con la UI, y eliminar una venta retira sus movimientos de los
+reportes sin cambiar la restauración de existencias ni los registros de auditoría.
+Las solicitudes, el chat y los límites de canciones conservan su canal independiente.
 
 El selector de consumo conserva el producto al actualizarse la lista y las
 vueltas se muestran en letra y número más grandes. La caja automática conserva

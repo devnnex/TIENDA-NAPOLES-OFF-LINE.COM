@@ -290,6 +290,10 @@ const App = (() => {
     INVOICE_STORAGE_KEY,
     INVENTORY_MOVEMENTS_STORAGE_KEY,
     APPS_SCRIPT_OUTBOX_KEY,
+    "napoles_report_change_outbox_v1",
+    "napoles_report_published_checkouts_v1",
+    "napoles_complete_movement_history_v1",
+    "napoles_movement_sales_totals_v1",
     WALK_IN_DRAFTS_STORAGE_KEY,
     OFFLINE_ADMIN_SNAPSHOT_KEY,
     USER_LIST_CACHE_KEY,
@@ -933,6 +937,8 @@ const App = (() => {
     }
     if (section === "inventory") renderInventory();
     if (section === "movements") {
+      if (canAccessAdminSection("income")) loadMovementSalesTotals();
+      if (state.completeMovementRevision !== state.movementRevision) void ensureCompleteMovementHistory().catch(error => { const feedback=$("#movementTotalsFeedback"); if(feedback)feedback.textContent=error.message; });
       renderInventoryMovements();
       if (!state.syncFresh.movements) void loadInventoryMovements();
     }
@@ -1600,6 +1606,7 @@ const App = (() => {
   };
 
   const renderBrand = () => {
+    syncClientBillVisibility();
     const logo = state.business?.logo_url
       ? `<img src="${escapeHTML(state.business.logo_url)}" alt="${escapeHTML(state.business.business_name)}" class="brand-logo">`
       : `<div class="brand-mark">${icon("utensils", 24)}</div>`;
@@ -1983,6 +1990,7 @@ const App = (() => {
     );
 
   const renderBillChat = () => {
+    if (state.page === "client" && !clientBillEnabled()) { syncClientBillVisibility(); return; }
     const box = $("#billChat");
     if (!box) return;
     if (box.classList.contains("is-closing")) return;
@@ -2098,6 +2106,7 @@ const App = (() => {
   };
 
   const showCurrentBill = async () => {
+    if (!clientBillEnabled()) return;
     if (!state.currentTable) {
       toast("Selecciona tu mesa primero.", "error");
       return;
@@ -2161,6 +2170,7 @@ const App = (() => {
     .toUpperCase();
 
   const loadInventoryStore = () => {
+    state.completeMovementRevision = readLocalJson("napoles_complete_movement_history_v1", {})?.revision;
     const stored = readLocalJson(INVENTORY_STORAGE_KEY, {});
     state.inventoryMeta = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
     const invoices = readLocalJson(INVOICE_STORAGE_KEY, []);
@@ -2225,7 +2235,7 @@ const App = (() => {
     }
   };
 
-  const persistInventoryMovements = () => persistDurableJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements.slice(-3000));
+  const persistInventoryMovements = () => persistDurableJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements);
 
   const recordLocalInventoryMovement = ({ eventId = uid(), item, delta, before, after, type, reference = "", occurredAt = new Date().toISOString(), user = "", unitCost }) => {
     const numericDelta = Number(delta || 0);
@@ -2621,6 +2631,7 @@ const App = (() => {
       if (result?.ok && ["record_sale", "edit_sale", "delete_sale", "clear_income", "adjust_inventory", "upsert_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "clear_inventory_movements"].includes(action)) {
         window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
       }
+      if (typeof queueConfirmedReportChange === "function") await queueConfirmedReportChange(action, payload, result, operationId);
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
     } catch (error) {
       if (error?.name === "AbortError") throw transientAppsScriptError("La sincronización remota continúa en segundo plano.");
@@ -5653,6 +5664,12 @@ const App = (() => {
   const renderBusinessForm = () => {
     const form = $("#businessForm");
     if (!form) return;
+    if (form.client_bill_enabled) {
+      form.client_bill_enabled.checked = clientBillEnabled();
+      form.client_bill_enabled.disabled = !Object.prototype.hasOwnProperty.call(state.business || {}, "client_bill_enabled");
+      const status = $("#clientBillSettingStatus");
+      if (status) status.textContent = form.client_bill_enabled.disabled ? "Pendiente de actualizar Supabase." : clientBillEnabled() ? "Los clientes pueden consultar su cuenta." : "Oculto para los clientes. Puedes llevar las cuentas en tarjetas físicas.";
+    }
     form.business_name.value = state.business?.business_name || "";
     form.subtitle.value = state.business?.subtitle || "";
     form.accent_color.value = state.business?.accent_color || "#f05a28";
@@ -5912,12 +5929,418 @@ const App = (() => {
     }
   };
 
+  // Los avisos públicos no llevan cuentas ni importes. La lectura requiere el token del empleado.
+  const reportMirrorKey = () => `napoles_report_mirror_v1:${SUPABASE_CONFIG.url}:${state.currentUser?.id || ""}`;
+  const reportChangeOutboxKey = "napoles_report_change_outbox_v1";
+  const publishedCheckoutKey = "napoles_report_published_checkouts_v1";
+  const saveReportSyncValue = async (key, value) => {
+    if (typeof persistDurableJson === "function") return persistDurableJson(key, value);
+    try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (_) { return false; }
+  };
+  const reportMirror = () => {
+    if (state.reportMirrorUser !== state.currentUser?.id) {
+      state.reportMirrorUser = state.currentUser?.id;
+      state.reportMirror = readLocalJson(reportMirrorKey(), { cursor: 0, sales: {}, deleted: {}, movements: {}, clearedSales: false, clearedMovements: false });
+    }
+    return state.reportMirror;
+  };
+  const queueConfirmedReportChange = async (action, payload, result, operationId = "") => {
+    const supported = ["record_sale","edit_sale","delete_sale","clear_income","adjust_inventory","upsert_inventory","set_inventory_stock","delete_inventory","clear_inventory","update_inventory_movement_cost","clear_inventory_movements"];
+    if (!result?.ok || !supported.includes(action)) return;
+    const invoice = payload.invoice;
+    const saleId = String(invoice?.id || invoice?.sessionId || payload.saleId || "");
+    const ids = new Set((invoice?.items || []).map(line => String(line.menu_item_id || "")).filter(Boolean));
+    const productId = String(payload.adjustment?.productId || payload.item?.productId || payload.productId || "");
+    if (productId) ids.add(productId);
+    const eventId = String(payload.adjustment?.eventId || payload.item?.movementEventId || payload.movementId || "");
+    const movements = (state.inventoryMovements || []).filter(row => eventId ? String(row.movementId) === eventId
+      : action === "record_sale" && (String(row.movementId).startsWith(`SALE-${saleId}-`) || (invoice?.sessionId && String(row.sessionId) === String(invoice.sessionId))));
+    const change = { operationId: operationId || `${action}:${eventId || saleId || uid()}:${action === "record_sale" ? "saved" : uid()}`, action,
+      payload: { occurredAt: new Date().toISOString(), ...(invoice ? { invoice } : {}), ...(saleId ? { saleId } : {}), ...(productId ? { productId } : {}),
+        movements, items: (result.items || (result.item ? [result.item] : [])).filter(item => action === "delete_sale" || ids.has(String(item.productId))) } };
+    const queued = readLocalJson(reportChangeOutboxKey, []);
+    if (!queued.some(entry => entry.operationId === change.operationId)) {
+      if (!await saveReportSyncValue(reportChangeOutboxKey, [...queued, change])) throw transientAppsScriptError("El cambio quedó guardado; falta proteger su aviso de sincronización.");
+    }
+    void flushConfirmedReportChanges();
+  };
+  const protectCheckoutForFastSync = async (invoice) => {
+    invoice.checkoutAccepted = true;
+    const jobs = readAppsScriptOutbox();
+    jobs.forEach(job => { if (job.action === "record_sale" && String(job.payload?.invoice?.id) === String(invoice.id)) job.payload.invoice.checkoutAccepted = true; });
+    await writeAppsScriptOutbox(jobs);
+    await persistInvoiceHistory();
+    void queueReadyCheckoutReports();
+  };
+  let checkoutReportPreparing = false;
+  const queueReadyCheckoutReports = async () => {
+    if (checkoutReportPreparing || !navigator.onLine || !state.authToken || !isManager()) return;
+    checkoutReportPreparing = true;
+    try {
+      const status = typeof getOfflineSyncStatus === "function" ? await getOfflineSyncStatus() : null;
+      for (const job of readAppsScriptOutbox()) {
+        if (job.action !== "record_sale" || !job.payload?.invoice?.checkoutAccepted) continue;
+        if (reportMirror().sales[String(job.payload.invoice.id)] || readLocalJson(publishedCheckoutKey, []).includes(String(job.payload.invoice.id)) || readLocalJson(reportChangeOutboxKey, []).some(change => change.operationId === "checkout:" + job.payload.invoice.id)) continue;
+        if (state.localSupabaseWrites > 0 || (typeof isSupabaseWriteBlockingJob === "function" && isSupabaseWriteBlockingJob(job,status))) continue;
+        await queueConfirmedReportChange("record_sale", { invoice: { ...job.payload.invoice, googlePending: true } }, { ok: true }, `checkout:${job.payload.invoice.id}`);
+      }
+    } catch (_) { return false; } finally { checkoutReportPreparing = false; }
+  };
+  let confirmedReportSending = false;
+  const flushConfirmedReportChanges = async () => {
+    if (confirmedReportSending || !navigator.onLine || !state.authToken || !isManager()) return false;
+    confirmedReportSending = true;
+    try {
+      while (true) {
+        const change = readLocalJson(reportChangeOutboxKey, [])[0];
+        if (!change) return true;
+        const { data, error } = await state.sb.rpc("publish_report_change", {
+          auth_token: state.authToken, p_operation_id: change.operationId, p_action: change.action, p_payload: change.payload
+        });
+        if (error || !data?.ok) return false;
+        if (change.operationId.startsWith("checkout:")) {
+          const ids = new Set(readLocalJson(publishedCheckoutKey, []));
+          ids.add(String(change.payload.invoice.id));
+          if (!await saveReportSyncValue(publishedCheckoutKey, [...ids])) return false;
+        }
+        const remaining = readLocalJson(reportChangeOutboxKey, []).filter(entry => entry.operationId !== change.operationId);
+        if (!await saveReportSyncValue(reportChangeOutboxKey, remaining)) return false;
+        void syncConfirmedReports();
+      }
+    } catch (_) { return false; } finally { confirmedReportSending = false; }
+  };
+  const applyConfirmedReportChanges = (mirror, changes) => {
+    for (const change of changes) {
+      if (Number(change.sequence) <= Number(mirror.cursor)) continue;
+      const payload = change.payload || {};
+      const id = String(payload.saleId || payload.invoice?.id || payload.invoice?.sessionId || "");
+      if (change.action === "clear_income") { mirror.sales = {}; mirror.deleted = {}; mirror.salesClearAt = change.confirmedAt || payload.occurredAt; }
+      if (payload.invoice && ["record_sale","edit_sale"].includes(change.action)) { mirror.sales[id] = { ...payload.invoice, reportConfirmedAt: change.confirmedAt || payload.occurredAt }; delete mirror.deleted[id]; }
+      if (change.action === "delete_sale" && id) { delete mirror.sales[id]; mirror.deleted[id] = change.confirmedAt || payload.occurredAt || true; }
+      if (change.action === "clear_inventory_movements") { mirror.movements = {}; mirror.movementsClearAt = change.confirmedAt || payload.occurredAt; }
+      (payload.movements || []).forEach(row => { if (row.movementId) mirror.movements[row.movementId] = { ...row, reportConfirmedAt: change.confirmedAt || payload.occurredAt }; });
+      if (payload.items?.length) applyRemoteInventoryItems(payload.items);
+      mirror.cursor = Number(change.sequence);
+    }
+  };
+  let confirmedReportReading = false;
+  let confirmedReportReadPending = false;
+  const syncConfirmedReports = async () => {
+    if (!navigator.onLine || !state.authToken || !state.currentUser || !["income","inventory","movements"].some(section => canAccessAdminSection(section))) return false;
+    if (confirmedReportReading) { confirmedReportReadPending = true; return false; }
+    confirmedReportReading = true;
+    const userId = state.currentUser.id;
+    try {
+      if (typeof hydrateDurableKey === "function" && state.reportMirrorHydratedUser !== userId) {
+        await hydrateDurableKey(reportMirrorKey());
+        state.reportMirrorUser = null;
+        state.reportMirrorHydratedUser = userId;
+      }
+      const mirror = reportMirror();
+      let changed = false;
+      while (true) {
+        const { data, error } = await state.sb.rpc("get_report_changes", { auth_token: state.authToken, p_after: mirror.cursor });
+        if (error || !data?.ok || !Array.isArray(data.changes) || state.currentUser?.id !== userId) return false;
+        if (data.changes.some(change => !Number.isSafeInteger(Number(change.sequence)) || Number(change.sequence) <= Number(mirror.cursor))) return false;
+        if (!data.changes.length) break;
+        const nextMirror = JSON.parse(JSON.stringify(mirror));
+        applyConfirmedReportChanges(nextMirror, data.changes);
+        if (!await saveReportSyncValue(reportMirrorKey(), nextMirror)) return false;
+        Object.assign(mirror, nextMirror);
+        changed = true;
+        if (!data.hasMore) break;
+      }
+      state.fastReportsAvailable = true;
+      if (changed) {
+        const invoiceMap = new Map((state.invoiceHistory || []).filter(invoice => !mirror.salesClearAt || String(invoice.createdAt) > mirror.salesClearAt).map(invoice => [String(invoice.id || invoice.sessionId), invoice]));
+        Object.keys(mirror.deleted).forEach(id => invoiceMap.delete(id));
+        Object.entries(mirror.sales).forEach(([id, invoice]) => invoiceMap.set(id, invoice));
+        state.invoiceHistory = [...invoiceMap.values()];
+        persistInvoiceHistory();
+        state.incomeReport = mergeConfirmedIncomeReport(state.incomeReport || localIncomeReport(incomeFiltersFromForm()), incomeFiltersFromForm());
+        if (state.activeAdminSection === "income") renderIncomeReport();
+        state.inventoryMovements = mergeConfirmedMovements(state.inventoryMovements);
+        persistInventoryMovements();
+        renderInventoryMovements();
+        if (state.activeAdminSection === "inventory") renderInventory();
+        if ($("#purchaseHistoryDialog")?.open) { renderPurchaseProductOptions(); renderPurchaseHistory(); }
+        state.movementSalesTotalsKey = "";
+        if (state.activeAdminSection === "movements" && canAccessAdminSection("income")) loadMovementSalesTotals();
+      }
+      return changed;
+    } catch (_) { return false; } finally {
+      confirmedReportReading = false;
+      if (confirmedReportReadPending) { confirmedReportReadPending = false; window.setTimeout(() => void syncConfirmedReports(), 0); }
+    }
+  };
+  const mergeConfirmedMovements = (rows, revision = state.movementRevision) => {
+    const mirror = reportMirror();
+    const currentAfterClear = !mirror.movementsClearAt || Number(String(revision || "").split("-")[0]) >= Date.parse(mirror.movementsClearAt);
+    const map = new Map((currentAfterClear ? rows : []).map(row => [String(row.movementId), row]));
+    Object.values(mirror.movements).forEach(row => {
+      if (map.has(String(row.movementId)) && Number(String(revision || "").split("-")[0]) >= Date.parse(row.reportConfirmedAt || "")) return;
+      map.set(String(row.movementId), row);
+    });
+    return [...map.values()];
+  };
+  const mergeConfirmedIncomeReport = (remote, filters) => {
+    const mirror = reportMirror();
+    const keys = new Set([...(remote.recordRows || []).map(row => String(row.saleId)), ...(remote.recordKeys || []).map(String)]);
+    const snapshotAfterClear = !mirror.salesClearAt || Date.parse(remote.generatedAt || "") >= Date.parse(mirror.salesClearAt);
+    const baseRows = snapshotAfterClear ? (remote.records || []) : [];
+    const records = new Map(baseRows.map(row => [String(row.saleId), row]));
+    const totals = { ...(baseRows.length === (remote.records || []).length ? remote.totals : incomeTotalsFromRecords(baseRows)) };
+    const adjust = (record, direction) => {
+      const values = incomeTotalsFromRecords([record]);
+      Object.keys(values).forEach(key => { if (key !== "averageTicket") totals[key] = Number(totals[key] || 0) + direction * values[key]; });
+    };
+    for (const id of Object.keys(mirror.deleted)) {
+      if (records.has(id)) { adjust(records.get(id), -1); records.delete(id); }
+    }
+    const visible = new Map(localIncomeRecords(filters, Object.values(mirror.sales)).map(row => [String(row.saleId), row]));
+    for (const [id, invoice] of Object.entries(mirror.sales)) {
+      const old = records.get(id), fresh = visible.get(id);
+      if ((!invoice.googlePending && Date.parse(remote.generatedAt || "") >= Date.parse(invoice.reportConfirmedAt || "")) || (invoice.googlePending && old && keys.has(id))) continue;
+      // Una edición confirmada se sustituye por ID; nunca agrega una segunda venta.
+      if (old) { adjust(old, -1); records.delete(id); }
+      if (fresh) { records.set(id, fresh); if (old || !keys.has(id)) adjust(fresh, 1); }
+    }
+    totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
+    const queued = new Set(readAppsScriptOutbox().filter(job => job.action === "record_sale").map(job => String(job.payload?.invoice?.id || "")));
+    const pendingCount = [...visible].filter(([id]) => mirror.sales[id]?.googlePending && !queued.has(id) && !keys.has(id)).length;
+    return { ...remote, filters, records: [...records.values()].sort((a,b) => String(b.date).localeCompare(String(a.date))), totals, pendingCount: Number(remote.pendingCount || 0) + pendingCount,
+      totalRecords: Math.max(Number(totals.sales || 0), records.size) };
+  };
+  const startConfirmedReportSync = () => {
+    window.clearInterval(state.confirmedReportTimer);
+    const tick = () => { void queueReadyCheckoutReports(); void flushConfirmedReportChanges(); void syncConfirmedReports(); };
+    tick();
+    state.confirmedReportTimer = window.setInterval(tick, SYNC_INTERVAL_MS);
+  };
+
+  const clientBillEnabled = () => state.business?.client_bill_enabled !== false;
+  const syncClientBillVisibility = () => {
+    $$('[data-request="bill"]').forEach(button => { button.hidden = !clientBillEnabled(); });
+    if (state.page === "client" && !clientBillEnabled()) {
+      state.localBillOpen = false;
+      const box = $("#billChat");
+      if (box) { box.hidden = true; box.innerHTML = ""; }
+    }
+  };
+  const saveClientBillVisibility = async (input) => {
+    const previous = clientBillEnabled();
+    const desired = input.checked;
+    input.disabled = true;
+    try {
+      const saved = await retryQuiet(() => state.sb.from("business_settings")
+        .update({ client_bill_enabled: desired }).eq("is_primary", true).select("*").single(), 4);
+      if (!saved) throw new Error("No se pudo guardar. Revisa la conexión y la actualización de Supabase.");
+      state.business = saved;
+      persistBootstrapCache();
+      syncClientBillVisibility();
+      notifyAdminPeers({ core: true });
+      toast(desired ? "Los clientes ya pueden ver su cuenta." : "Ver cuenta quedó oculto para los clientes.");
+    } catch (error) { input.checked = previous; toast(error.message, "error", "bill-setting-failed"); }
+    finally { input.disabled = false; }
+  };
+
+  const reportNumber = value => Number(value || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 });
+  const filteredMovementRows = () => {
+    const query = normalizeText(state.movementSearch || "");
+    const from = $("#movementDateFrom")?.value || "", to = $("#movementDateTo")?.value || "";
+    if (from && to && from > to) return [];
+    return [...state.inventoryMovements].filter(row => {
+      const date = purchaseDateKey(row.date);
+      return (state.movementProductFilter === "all" || !state.movementProductFilter || String(row.productId) === state.movementProductFilter)
+        && (state.movementTypeFilter === "all" || movementKind(row) === state.movementTypeFilter)
+        && (!from || date >= from) && (!to || date <= to)
+        && (!query || normalizeText([row.product,row.code,row.type,row.reference,row.user].join(" ")).includes(query));
+    }).sort((a,b) => String(b.date || "").localeCompare(String(a.date || "")));
+  };
+  const renderMovementProductOptions = () => {
+    const select = $("#movementProductFilter");
+    if (!select) return;
+    const products = new Map(state.items.map(item => [String(item.id), item.name]));
+    state.inventoryMovements.forEach(row => { if (row.productId && !products.has(String(row.productId))) products.set(String(row.productId), row.product); });
+    const markup = '<option value="all">Todos los productos</option>' + [...products].sort((a,b) => a[1].localeCompare(b[1],"es"))
+      .map(([id,name]) => `<option value="${escapeHTML(id)}">${escapeHTML(name)}</option>`).join("");
+    if (select.innerHTML !== markup) select.innerHTML = markup;
+    select.value = state.movementProductFilter || "all";
+  };
+  let completeMovementsPromise = null;
+  const ensureCompleteMovementHistory = () => {
+    if (completeMovementsPromise) return completeMovementsPromise;
+    completeMovementsPromise = (async () => {
+      if (!navigator.onLine) return false;
+      const baseline = new Map(state.inventoryMovements.map(row => [String(row.movementId), JSON.stringify(row)]));
+      const collected = new Map();
+      let cursor = null, revision = "";
+      do {
+        const result = await appsScriptRequest("get_inventory_movements", { limit: 800, cursor, revision });
+        if (!result?.ok || result.stale || !Array.isArray(result.movements)) throw new Error("El historial cambió. Vuelve a intentar la consulta.");
+        if (cursor && String(result.revision || "") !== revision) throw new Error("El historial cambió durante la consulta.");
+        result.movements.forEach(row => collected.set(String(row.movementId), row));
+        revision = String(result.revision || "");
+        const next = result.hasMore ? result.nextCursor : null;
+        if (next && next === cursor) throw new Error("No se pudo completar el historial.");
+        cursor = next;
+      } while (cursor);
+      const pendingIds = new Set();
+      readAppsScriptOutbox().forEach(job => {
+        const id = job.payload?.adjustment?.eventId || job.payload?.item?.movementEventId || job.payload?.movementId;
+        if (id) pendingIds.add(String(id));
+        (job.payload?.invoice?.items || []).forEach(line => pendingIds.add(`SALE-${job.payload.invoice.id}-${line.menu_item_id}`));
+      });
+      const current = new Map(state.inventoryMovements.map(row => [String(row.movementId),row]));
+      baseline.forEach((_,id) => { if (!current.has(id)) collected.delete(id); });
+      current.forEach((row,id) => { if (pendingIds.has(id) || baseline.get(id) !== JSON.stringify(row)) collected.set(id,row); });
+      state.inventoryMovements = mergeConfirmedMovements([...collected.values()], revision);
+      state.movementRevision = revision;
+      state.completeMovementRevision = revision;
+      await saveReportSyncValue("napoles_complete_movement_history_v1", { revision });
+      state.movementHasMore = false;
+      state.movementCursor = null;
+      state.movementLoaded = true;
+      persistInventoryMovements();
+      renderInventoryMovements();
+      return true;
+    })().finally(() => { completeMovementsPromise = null; });
+    return completeMovementsPromise;
+  };
+  let movementSalesTotalsPromise = null;
+  const loadMovementSalesTotals = () => {
+    const filters = { dateFrom: $("#movementDateFrom")?.value || "2000-01-01", dateTo: $("#movementDateTo")?.value || purchaseDateKey(new Date()), paymentMethod: "all", query: "", saleType: "all", complete: true };
+    const key = JSON.stringify(filters);
+    if (movementSalesTotalsPromise) { state.movementSalesTotalsRequested = true; return; }
+    if (state.movementSalesTotalsKey === key || filters.dateFrom > filters.dateTo) return;
+    state.movementSalesTotalsLoading = true;
+    movementSalesTotalsPromise = (async () => {
+      if (!navigator.onLine) {
+        const cached = readLocalJson("napoles_movement_sales_totals_v1", null);
+        const matching = cached && JSON.stringify(cached.filters) === key;
+        state.movementSalesRecords = matching ? mergeIncomeReport(cached.report,filters).records : localIncomeRecords(filters);
+        state.movementSalesTotalsNotice = matching ? "Sin conexión: totales de la última copia y ventas guardadas en este equipo." : "Sin conexión: vendido solo incluye las ventas disponibles en este equipo. Conéctate para completar otros equipos.";
+        state.movementSalesTotalsKey = key;
+        state.movementSalesTotalsError = "";
+        return;
+      }
+      let report = await appsScriptRequest("get_income_report", { filters });
+      if (!report?.ok || report.stale || !Array.isArray(report.records)) throw new Error("No se pudo consultar el total vendido.");
+      report = await completeIncomeSaleTypeReport(report, filters, state.incomeRequestId);
+      if (report.records.length < Number(report.totalRecords || 0)) throw new Error("El total vendido todavía no está completo.");
+      const mergedSales = mergeIncomeReport(report,filters);
+      state.movementSalesRecords = mergedSales.records;
+      state.movementSalesTotalsNotice = "";
+      await saveReportSyncValue("napoles_movement_sales_totals_v1", { filters, report: mergedSales });
+      state.movementSalesTotalsKey = key;
+      state.movementSalesTotalsError = "";
+    })().catch(error => { state.movementSalesTotalsError = error.message; }).finally(() => {
+      movementSalesTotalsPromise = null; state.movementSalesTotalsLoading = false; renderInventoryMovements();
+      if (state.movementSalesTotalsRequested) { state.movementSalesTotalsRequested = false; loadMovementSalesTotals(); }
+    });
+  };
+  const movementSoldUnits = () => {
+    const id = state.movementProductFilter || "all";
+    const from = $("#movementDateFrom")?.value || "", to = $("#movementDateTo")?.value || "";
+    const query = normalizeText(state.movementSearch || "");
+    return (state.movementSalesRecords || []).filter(record => { const date = purchaseDateKey(record.date); return (!from || date >= from) && (!to || date <= to); })
+      .reduce((total, record) => total + (record.items || []).filter(line => (id === "all" || String(line.menuItemId) === id)
+        && (!query || normalizeText(line.name).includes(query))).reduce((sum,line) => sum + Number(line.quantity || 0),0),0);
+  };
+  const renderMovementTotals = (movements) => {
+    const entries = movements.filter(row => movementKind(row) === "entry").reduce((sum,row) => sum + Number(row.delta ?? row.quantityChange ?? 0),0);
+    const exits = movements.filter(row => movementKind(row) === "exit").reduce((sum,row) => sum + Math.abs(Number(row.delta ?? row.quantityChange ?? 0)),0);
+    const sold = !canAccessAdminSection("income") ? "Sin permiso de ventas" : state.movementSalesTotalsLoading ? "Consultando…" : state.movementSalesTotalsError ? "Pendiente" : reportNumber(movementSoldUnits());
+    const summary = $("#movementSummary");
+    if (summary) summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line",19)}<span><small>Unidades ingresadas</small><strong>${reportNumber(entries)}</strong></span></article>
+      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>Unidades retiradas</small><strong>${reportNumber(exits)}</strong></span></article>
+      <article class="movement-kpi">${icon("shopping-bag",19)}<span><small>Unidades vendidas en cuentas cobradas</small><strong>${sold}</strong></span></article>
+      <article class="movement-kpi">${icon("list-checks",19)}<span><small>Registros del filtro</small><strong>${movements.length}</strong></span></article>`;
+    const feedback = $("#movementTotalsFeedback");
+    if (feedback) feedback.textContent = state.movementSalesTotalsError || state.movementSalesTotalsNotice || (state.completeMovementRevision === state.movementRevision
+      ? "Totales de todo el historial para el producto y las fechas elegidas. Las salidas incluyen consumos y retiros; vendido solo cuenta ventas cobradas."
+      : "Entradas y salidas de los registros disponibles. Consulta todo el historial para completar los totales. Vendido solo cuenta ventas cobradas.");
+  };
+
+  const buildBusinessReportPdf = ({ title, subtitle, metrics = [], sections = [], note = "", filename }) => {
+    const PDF = window.jspdf?.jsPDF;
+    if (!PDF) throw new Error("El generador PDF no está disponible. Recarga la aplicación y vuelve a intentar.");
+    const doc = new PDF({ unit: "mm", format: "a4" });
+    const width = 210, margin = 15, bottom = 280;
+    let y = 0;
+    const clean = value => String(value ?? "").replace(/[\u00a0\u202f]/g," ").replace(/→/g," a ");
+    const header = () => {
+      doc.setFillColor(22,43,57); doc.rect(0,0,width,35,"F");
+      doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(17);
+      doc.text(clean(title),margin,14);
+      doc.setFontSize(10); doc.setFont("helvetica","normal");
+      doc.text(doc.splitTextToSize(clean(state.business?.business_name || "Tienda Nápoles"),180).slice(0,1),margin,22);
+      doc.text(doc.splitTextToSize(clean(subtitle),180).slice(0,1),margin,29);
+      doc.setTextColor(35,48,58); y = 44;
+    };
+    const ensure = height => { if (y + height > bottom) { doc.addPage(); header(); } };
+    const paragraph = (text,size=10,bold=false) => {
+      doc.setFont("helvetica",bold ? "bold" : "normal"); doc.setFontSize(size);
+      const lines = doc.splitTextToSize(clean(text),180);
+      for (const line of lines) { ensure(6); doc.text(line,margin,y); y += 5.5; }
+      y += 3;
+    };
+    const table = (columns, rows) => {
+      const drawHead = () => {
+        ensure(10); doc.setFillColor(232,239,243); doc.rect(margin,y-4,180,9,"F");
+        doc.setFont("helvetica","bold");doc.setFontSize(9);
+        let x=margin+2;for(const col of columns){doc.text(clean(col.label),x,y+1);x+=col.width;} y+=10;
+      };
+      drawHead();
+      rows.forEach((row,index) => {
+        doc.setFont("helvetica","normal");doc.setFontSize(9);
+        const cells = columns.map((col,i) => doc.splitTextToSize(clean(row[i]),col.width-4));
+        const h = Math.max(...cells.map(lines => lines.length))*4.5+5;
+        if(y+h>bottom){doc.addPage();header();drawHead();}
+        if(index%2===0){doc.setFillColor(247,249,250);doc.rect(margin,y-3,180,h,"F");}
+        let x=margin+2;cells.forEach((lines,i)=>{doc.text(lines,x,y+1);x+=columns[i].width;});y+=h;
+      });y+=7;
+    };
+    header();
+    metrics.forEach(([label,value]) => paragraph(`${label}: ${value}`,13,true));
+    if(note) paragraph(note,10);
+    for(const section of sections){ensure(22);paragraph(section.title,12,true);if(section.text)paragraph(section.text);table(section.columns,section.rows);}
+    const pages=doc.getNumberOfPages();
+    for(let p=1;p<=pages;p++){doc.setPage(p);doc.setDrawColor(215,224,230);doc.line(margin,285,195,285);doc.setFont("helvetica","normal");doc.setFontSize(8);doc.setTextColor(90,105,115);doc.text(`Generado ${clean(prettyDateTime(new Date()))}`,margin,291);doc.text(`Página ${p} de ${pages}`,195,291,{align:"right"});}
+    doc.save(filename);
+    return doc;
+  };
+  const exportPurchasesPdf = async () => {
+    const button = $("#exportPurchasesPdf");
+    if (button) button.disabled = true;
+    try {
+      if(state.purchaseDateFrom && state.purchaseDateTo && state.purchaseDateFrom>state.purchaseDateTo)throw new Error("La fecha inicial debe ser anterior a la final.");
+      if(navigator.onLine)await ensureCompleteMovementHistory();
+      const rows=purchaseMovements();
+      if(!rows.length)throw new Error("No hay compras con estos filtros.");
+      const total=rows.reduce((sum,row)=>sum+Number(row.delta||0)*purchaseUnitCost(row),0);
+      const units=rows.reduce((sum,row)=>sum+Number(row.delta||0),0);
+      const grouped=new Map();
+      rows.forEach(row=>{const key=String(row.productId||row.product), old=grouped.get(key)||{name:row.product,units:0,total:0};old.units+=Number(row.delta||0);old.total+=Number(row.delta||0)*purchaseUnitCost(row);grouped.set(key,old);});
+      buildBusinessReportPdf({title:"Compras de inventario",subtitle:`${state.purchaseDateFrom||"Todo el historial"} a ${state.purchaseDateTo||"hoy"}`,
+        metrics:[["Total invertido",money(total)],["Unidades compradas",reportNumber(units)],["Registros",rows.length]],
+        note:`Producto: ${$("#purchaseProductFilter")?.selectedOptions?.[0]?.textContent||"Todos"}. Búsqueda: ${state.purchaseSearch||"ninguna"}. ${!navigator.onLine?"Sin conexión: copia disponible en este equipo. ":""}Las devoluciones no se cuentan como compras. Los importes usan el costo guardado; si faltaba, el costo actual del producto.`,
+        sections:[{title:"Resumen por producto",columns:[{label:"Producto",width:100},{label:"Unidades",width:35},{label:"Inversión",width:45}],rows:[...grouped.values()].map(row=>[row.name,reportNumber(row.units),money(row.total)])},
+        {title:"Detalle de compras",columns:[{label:"Fecha / responsable",width:50},{label:"Producto",width:55},{label:"Unidades",width:20},{label:"Costo / unidad",width:27},{label:"Total",width:28}],rows:rows.map(row=>[`${prettyDateTime(row.date)}\n${row.user||"Sistema"}`,`${row.product}\n${row.reference||""}`,reportNumber(row.delta),money(purchaseUnitCost(row)),money(Number(row.delta||0)*purchaseUnitCost(row))])}],
+        filename:`compras-${state.purchaseDateFrom||"historial"}-${state.purchaseDateTo||purchaseDateKey(new Date())}.pdf`});
+    }catch(error){toast(error.message,"error","purchase-pdf-failed");}finally{if(button)button.disabled=false;}
+  };
+
   const renderConsumptionProductOptions = (searchValue = "") => {
     const options = $("#consumptionProductOptions");
     const combobox = $("#consumptionProductCombobox");
     const hint = $("#consumptionProductHint");
     if (!options || !combobox) return;
     const products = matchingProducts(searchValue).slice(0, 30);
+    const previousId = combobox.dataset.activeProduct || "";
+    const signature = JSON.stringify([searchValue, products.map(item => [item.id,item.name,item.price,inventoryFor(item)])]);
+    if (combobox.dataset.renderSignature === signature) return;
+    combobox.dataset.renderSignature = signature;
     state.productPickerMatches = products;
     combobox.dataset.activeIndex = products.length === 1 ? "0" : "-1";
     options.innerHTML = products.length
@@ -5936,6 +6359,13 @@ const App = (() => {
     if (hint) hint.textContent = products.length
       ? `${products.length} producto${products.length === 1 ? "" : "s"}. Busca por nombre o iniciales, por ejemplo CN.`
       : "Sin coincidencias: el nombre escrito puede guardarse como consumo personalizado.";
+    const available = $$('[data-consumption-product]:not(:disabled)', options);
+    const restored = available.findIndex(button => button.dataset.consumptionProduct === previousId);
+    combobox.dataset.activeIndex = "-1";
+    combobox.dataset.activeProduct = "";
+    $("#consumptionProductSearch")?.removeAttribute("aria-activedescendant");
+    if (restored >= 0) setConsumptionProductActiveIndex(restored);
+    else if (available.length === 1) setConsumptionProductActiveIndex(0);
     refreshIcons();
   };
 
@@ -5988,6 +6418,7 @@ const App = (() => {
       button.setAttribute("aria-selected", String(selected));
     });
     $("#consumptionProductCombobox").dataset.activeIndex = String(index);
+    $("#consumptionProductCombobox").dataset.activeProduct = buttons[index].dataset.consumptionProduct;
     input.setAttribute("aria-activedescendant", buttons[index].id);
     buttons[index].scrollIntoView({ block: "nearest" });
     return buttons[index];
@@ -6355,17 +6786,13 @@ const App = (() => {
     const list = $("#inventoryMovementList");
     const summary = $("#movementSummary");
     if (!list || !summary) return;
-    const signature = JSON.stringify([state.inventoryMovements, state.movementSearch, state.movementTypeFilter]);
+    renderMovementProductOptions();
+    const signature = JSON.stringify([state.inventoryMovements, state.movementSearch, state.movementTypeFilter, state.movementProductFilter, $("#movementDateFrom")?.value, $("#movementDateTo")?.value, state.movementSalesRecords, state.movementSalesTotalsLoading, state.movementSalesTotalsError, state.movementSalesTotalsNotice, state.completeMovementRevision]);
     if (signature === state.movementRenderSignature && list.firstElementChild) return;
     state.movementRenderSignature = signature;
     const query = normalizeText(state.movementSearch);
-    const movements = [...state.inventoryMovements]
-      .filter((movement) => state.movementTypeFilter === "all" || movementKind(movement) === state.movementTypeFilter)
-      .filter((movement) => !query || normalizeText([movement.product, movement.code, movement.type, movement.reference, movement.user].join(" ")).includes(query))
-      .sort((left, right) => String(right.date || "").localeCompare(String(left.date || "")));
-    const entries = movements.filter((movement) => movementKind(movement) === "entry").reduce((sum, movement) => sum + Number(movement.delta || 0), 0);
-    const exits = movements.filter((movement) => movementKind(movement) === "exit").reduce((sum, movement) => sum + Math.abs(Number(movement.delta || 0)), 0);
-    summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line", 19)}<span><small>Unidades ingresadas</small><strong>+${entries.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></span></article><article class="movement-kpi exit">${icon("arrow-up-from-line", 19)}<span><small>Unidades retiradas</small><strong>-${exits.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></span></article><article class="movement-kpi">${icon("list-checks", 19)}<span><small>Movimientos visibles</small><strong>${movements.length}</strong></span></article>`;
+    const movements = filteredMovementRows();
+    renderMovementTotals(movements);
     list.innerHTML = movements.length ? movements.map((movement) => {
       const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
       const kind = delta >= 0 ? "entry" : "exit";
@@ -6414,15 +6841,22 @@ const App = (() => {
       if (!result?.ok || !Array.isArray(result.movements)) throw new Error(result?.error || "El historial remoto devolvió una respuesta inválida.");
       if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) { state.syncFresh.movements = false; return false; }
       const pendingIds = pendingInventoryMovementIds();
-      const merged = new Map(result.movements.map((movement) => [movement.movementId, movement]));
+      const merged = new Map((state.completeMovementRevision === result.revision ? state.inventoryMovements : result.movements).map((movement) => [movement.movementId, movement]));
+      result.movements.forEach(movement => merged.set(movement.movementId,movement));
       const current = new Map(state.inventoryMovements.map((movement) => [movement.movementId,movement]));
       baseline.forEach((value,id) => { if (!current.has(id)) merged.delete(id); });
       current.forEach((movement,id) => {
         if (pendingIds.has(String(id)) || baseline.get(id) !== JSON.stringify(movement)) merged.set(id,movement);
       });
-      state.inventoryMovements = Array.from(merged.values()).slice(-3000);
+      state.inventoryMovements = typeof mergeConfirmedMovements === "function" ? mergeConfirmedMovements(Array.from(merged.values()), result.revision) : Array.from(merged.values());
+      const changedRevision = state.movementRevision !== String(result.revision || "");
       state.movementRevision = String(result.revision || "");
       persistInventoryMovements();
+      if (changedRevision && state.activeAdminSection === "movements") {
+        state.movementSalesTotalsKey = "";
+        if (typeof loadMovementSalesTotals === "function" && canAccessAdminSection("income")) loadMovementSalesTotals();
+        if (typeof ensureCompleteMovementHistory === "function" && state.completeMovementRevision !== state.movementRevision) void ensureCompleteMovementHistory().catch(() => false);
+      }
       state.syncFresh.movements = true;
       renderInventoryMovements();
       if ($("#purchaseHistoryDialog")?.open) {
@@ -6963,7 +7397,7 @@ const App = (() => {
   };
 
   const completeIncomeSaleTypeReport = async (report, filters, requestId) => {
-    if (!filters.saleType || filters.saleType === "all") return report;
+    if ((!filters.saleType || filters.saleType === "all") && !filters.complete) return report;
     const records = new Map((report.records || []).map((record) => [String(record.saleId), record]));
     const missing = (report.recordRows || []).filter((row) => !records.has(String(row.saleId)));
     if (Number(report.totalRecords || 0) > records.size && !Array.isArray(report.recordRows)) {
@@ -7051,9 +7485,9 @@ const App = (() => {
     return totals;
   };
 
-  const localIncomeRecords = (filters) => {
+  const localIncomeRecords = (filters, invoices = state.invoiceHistory) => {
     const query = normalizeText(filters.query || "");
-    return state.invoiceHistory.map((invoice) => {
+    return invoices.map((invoice) => {
       const items = (invoice.items || []).map((line) => {
         const quantity = Number(line.quantity || 0);
         const unitPrice = Number(line.unit_price || 0);
@@ -7149,7 +7583,8 @@ const App = (() => {
       pendingCount: pending.length,
       localOnly: false
     };
-    return filters.saleType && filters.saleType !== "all" ? filterIncomeReportBySaleType(report, filters) : report;
+    const merged = typeof mergeConfirmedIncomeReport === "function" ? mergeConfirmedIncomeReport(report, filters) : report;
+    return filters.saleType && filters.saleType !== "all" ? filterIncomeReportBySaleType(merged, filters) : merged;
   };
 
   const setIncomeReportStatus = (message, tone = "ready", iconName = "badge-check") => {
@@ -7872,30 +8307,47 @@ const App = (() => {
     toast("Venta corregida. Se sincronizara automaticamente.", "ok", `income-edited:${record.saleId}`);
   };
 
-  const exportIncomeCsv = () => {
-    const records = state.incomeReport?.records || [];
-    if (!records.length) {
-      toast("No hay ventas para exportar con estos filtros.", "error", "empty-income-export");
-      return;
-    }
-    const safeCsv = (value) => {
-      let text = String(value ?? "");
-      if (/^[=+\-@]/.test(text)) text = `'${text}`;
-      return `"${text.replace(/"/g, '""')}"`;
-    };
-    const rows = [["Factura", "Fecha", "Mesa", "Responsable", "Mesero", "Medios de pago", "Subtotal", "Descuento", "Impuestos", "Servicio", "Costo", "Ganancia", "Total", "Referencia"]];
-    records.forEach((record) => rows.push([
-      record.invoice, record.date, record.table, record.payer, record.waiter,
-      (record.payments || []).map((payment) => `${incomePaymentLabel(payment.method)}: ${payment.amount}`).join(" + "),
-      record.subtotal, record.discount, record.tax, record.service, record.cost, record.profit, record.total, record.reference
-    ]));
-    const blob = new Blob(["\ufeff", rows.map((row) => row.map(safeCsv).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `ventas-${state.incomeReport.filters?.dateFrom || "inicio"}-${state.incomeReport.filters?.dateTo || "hoy"}.csv`;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const exportIncomeCsv = async () => {
+    const button = $("#exportIncomeCsv");
+    if (button) button.disabled = true;
+    try {
+      const filters = { ...incomeFiltersFromForm(), complete: true };
+      if (filters.dateFrom > filters.dateTo) throw new Error("La fecha inicial debe ser anterior a la final.");
+      let report;
+      if (navigator.onLine) {
+        report = await appsScriptRequest("get_income_report", { filters });
+        if (!report?.ok || report.stale || !Array.isArray(report.records)) throw new Error("No se pudo confirmar el reporte. Vuelve a intentar.");
+        if (filters.startAt && report.intervalApplied !== true) throw new Error("El servidor todavía no permite exportar este turno.");
+        const requestId = state.incomeRequestId;
+        report = await completeIncomeSaleTypeReport(report, filters, requestId);
+        if (requestId !== state.incomeRequestId || report.records.length < Number(report.totalRecords || 0)) throw new Error("El historial cambió. Vuelve a exportar para obtener todas las ventas.");
+        report = mergeIncomeReport(report, filters);
+      } else {
+        const current = state.incomeReport;
+        const comparable = value => JSON.stringify({ ...value, complete: undefined });
+        if (current && comparable(current.filters) === comparable(filters)) report = current;
+        else report = localIncomeReport(filters);
+      }
+      const records = report.records || [];
+      if (!records.length) throw new Error("No hay ventas con estos filtros.");
+      const totals = incomeTotalsFromRecords(records);
+      const grouped = new Map();
+      records.forEach(record => (record.items || []).forEach(line => {
+        const id = String(line.menuItemId || line.name), row = grouped.get(id) || { name: line.name, quantity: 0, total: 0 };
+        row.quantity += Number(line.quantity || 0); row.total += Number(line.total || 0); grouped.set(id, row);
+      }));
+      const from = filters.startAt ? prettyDateTime(filters.startAt) : filters.dateFrom;
+      const to = filters.endAt ? prettyDateTime(new Date(new Date(filters.endAt).getTime()-1)) : filters.dateTo;
+      const partial = records.length < Number(report.totalRecords || 0);
+      buildBusinessReportPdf({title: state.incomeRangePreset === "shift" ? "Ventas del turno" : "Reporte de ventas", subtitle:`${from} a ${to}`,
+        metrics:[["Total vendido",money(totals.income)],["Ventas",records.length],["Ganancia estimada",money(totals.profit)]],
+        note:`${!navigator.onLine ? "Sin conexión: copia disponible en este equipo. " : ""}${partial ? `Reporte parcial: ${records.length} de ${report.totalRecords} ventas. Conéctate para descargarlo completo. ` : ""}Tipo: ${incomeSaleTypeLabel(filters.saleType)||"Todas"}. Pago: ${filters.paymentMethod === "all" ? "Todos" : incomePaymentLabel(filters.paymentMethod)}. Búsqueda: ${filters.query||"ninguna"}. ${report.pendingCount ? `Incluye ${report.pendingCount} venta(s) guardada(s), pendientes de respaldo. ` : ""}Ganancia = venta menos costo de productos; no descuenta otros gastos del negocio.`,
+        sections:[{title:"Dinero recibido por medio de pago",columns:[{label:"Medio de pago",width:120},{label:"Total",width:60}],rows:[["Efectivo",money(totals.cash)],["Transferencia",money(totals.transfer)],["Bre-B",money(totals.breb)],...(totals.other?[["Otros",money(totals.other)]]:[])]},
+        {title:"Productos vendidos",columns:[{label:"Producto",width:105},{label:"Unidades",width:30},{label:"Venta",width:45}],rows:[...grouped.values()].sort((a,b)=>b.quantity-a.quantity).map(row=>[row.name,reportNumber(row.quantity),money(row.total)])},
+        {title:"Detalle de cada venta",columns:[{label:"Factura / fecha",width:45},{label:"Mesa / responsable",width:43},{label:"Pago",width:38},{label:"Total",width:27},{label:"Ganancia",width:27}],rows:records.map(record=>[`${record.invoice}\n${prettyDateTime(record.date)}`,`${record.table}\n${record.payer||record.waiter||"Sin nombre"}`,(record.payments||[]).map(payment=>`${incomePaymentLabel(payment.method)}: ${money(payment.amount)}`).join("\n"),money(record.total),money(record.profit)])}],
+        filename:`ventas-${filters.dateFrom}-${filters.dateTo}.pdf`});
+      toast(partial ? "PDF generado con la copia disponible. Falta completar ventas al conectar." : "Reporte de ventas descargado en PDF.");
+    }catch(error){toast(error.message,"error","income-pdf-failed");}finally{if(button)button.disabled=false;}
   };
 
   const renderGeneratedTableQrs = () => {
@@ -8210,6 +8662,7 @@ const App = (() => {
       currency: DEFAULT_CURRENCY,
       logo_url: form.logo_url.value.trim(),
       cover_url: form.cover_url.value.trim(),
+      ...(Object.prototype.hasOwnProperty.call(state.business || {}, "client_bill_enabled") ? { client_bill_enabled: form.client_bill_enabled.checked } : {}),
       tips_enabled: state.tipSettings.enabled === true,
       tip_percentage: Number(state.tipSettings.percentage || 10)
     };
@@ -9304,6 +9757,7 @@ const App = (() => {
       rollbackLocalPayment({ invoice, inventoryBefore, incomeReportBefore });
       return;
     }
+    if (typeof protectCheckoutForFastSync === "function") await protectCheckoutForFastSync(invoice);
     void flushAppsScriptOutbox();
   };
 
@@ -10405,6 +10859,7 @@ const App = (() => {
       await saveBusiness(event.currentTarget);
     });
     $("#businessForm")?.addEventListener("change", async (event) => {
+      if (event.target.name === "client_bill_enabled") { await saveClientBillVisibility(event.target); renderBusinessForm(); return; }
       if (event.target.name === "qr_regeneration_enabled") {
         try {
           localStorage.setItem(QR_REGENERATION_STORAGE_KEY, event.target.checked ? "1" : "0");
@@ -10554,6 +11009,16 @@ const App = (() => {
       state.serviceTableZoneFilter = event.currentTarget.value || "all";
       renderServiceTables();
     });
+    const updateMovementFilters = () => {
+      state.movementProductFilter = $("#movementProductFilter")?.value || "all";
+      state.movementSalesTotalsKey = "";
+      if (canAccessAdminSection("income")) loadMovementSalesTotals();
+      renderInventoryMovements();
+      void ensureCompleteMovementHistory().catch(error => { const feedback=$("#movementTotalsFeedback"); if(feedback)feedback.textContent=error.message; });
+    };
+    ["#movementProductFilter","#movementDateFrom","#movementDateTo"].forEach(selector => $(selector)?.addEventListener("change", updateMovementFilters));
+    $("#completeMovementHistory")?.addEventListener("click", async event => { const button=event.currentTarget; button.disabled=true; try{await ensureCompleteMovementHistory();if(canAccessAdminSection("income"))loadMovementSalesTotals();}catch(error){toast(error.message,"error","movement-history-failed");}finally{button.disabled=false;} });
+    $("#exportPurchasesPdf")?.addEventListener("click", () => void exportPurchasesPdf());
     $("#movementSearch")?.addEventListener("input", (event) => {
       state.movementSearch = event.currentTarget.value;
       renderInventoryMovements();
@@ -10676,6 +11141,8 @@ const App = (() => {
         form.menu_item_id.value = "";
         form.item_name.value = event.currentTarget.value.trim();
       }
+      $("#consumptionProductCombobox").dataset.activeProduct = "";
+      $("#consumptionProductCombobox").dataset.renderSignature = "";
       renderConsumptionProductOptions(event.currentTarget.value);
       showConsumptionProductOptions();
     });
@@ -11123,6 +11590,7 @@ const App = (() => {
 
   const subscribeAdmin = () => {
     if (!state.authToken) return;
+    if (typeof startConfirmedReportSync === "function") startConfirmedReportSync();
     const previous = state.adminBroadcastChannel;
     if (previous && !state.adminRealtimeNeedsReconnect) return;
     window.clearTimeout(state.adminReconnectTimer);
@@ -11140,6 +11608,7 @@ const App = (() => {
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
       .on("broadcast", { event: "refresh" }, refreshAdminNow)
       .on("broadcast", { event: "request-arrived" }, ({ payload }) => void refreshAdminRequests(payload?.requestIds))
+      .on("broadcast", { event: "reports-committed" }, () => void syncConfirmedReports())
       .on("broadcast", { event: "reports-refresh" }, () => void refreshBackgroundReports({ force:true }))
       .on("broadcast", { event: "inventory-refresh" }, () => void refreshInventoryFromPeer())
       .on("broadcast", { event: "users-refresh" }, () => { if (isBoss()) void loadUsers(); })
@@ -12080,6 +12549,7 @@ const App = (() => {
   };
 
   const logoutAdmin = async () => {
+    window.clearInterval(state.confirmedReportTimer);
     const token = state.authToken;
     state.authToken = "";
     state.currentUser = null;

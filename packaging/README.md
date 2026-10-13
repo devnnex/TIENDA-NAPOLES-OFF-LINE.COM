@@ -1,7 +1,7 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.18.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.19.exe` con Inno Setup 6.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el
@@ -11,7 +11,31 @@ publicación. Una versión antigua no desplaza una más reciente. Para cada camb
 del paquete incrementa la versión, compila y sube el nuevo `.exe`. También se
 puede ejecutar el workflow manualmente desde Actions. No modifica la landing.
 
-La versión 1.0.18 añade a cada venta el botón de reimprimir factura de BCA,
+La versión 1.0.19 incorpora la lectura rápida de ventas y movimientos compartidos
+en Supabase, la selección persistente con las flechas del teclado, las vueltas
+más grandes, los totales de entradas, salidas y unidades vendidas por producto,
+y los reportes PDF de ventas y compras. Marca permite mostrar u ocultar
+«Ver cuenta» para los clientes en todos los dispositivos.
+
+Para las nuevas funciones compartidas, aplica una vez en el SQL Editor de Supabase
+`supabase/migrations/20261013160000_fast_reports_and_client_bill.sql`.
+El archivo es repetible y no borra las ventas ni el inventario. La bitácora exige
+un empleado autorizado; los avisos públicos de Realtime no contienen importes
+ni facturas. El receptor consulta Supabase al recibir el aviso y cada 1,5 segundos
+como respaldo. No espera la consulta del reporte completo de Google. Una venta
+de mesa se publica en la ruta rápida cuando su cierre queda confirmado; al
+trabajar sin conexión, conserva su cola hasta que el cierre se sincronice.
+Las operaciones conservan su identidad y los informes se concilian por ID.
+Los cambios de inventario enviados al receptor usan la confirmación remota.
+
+Los PDF online recorren todas las páginas del rango o turno seleccionado.
+Sin conexión identifican la copia disponible y avisan si el reporte de ventas
+es parcial. En Movimientos, «vendidas» cuenta líneas de cuentas cobradas;
+«retiradas» también puede incluir consumo pendiente y retiros manuales.
+La consulta completa del historial evita presentar los primeros 800 registros
+como si fueran todo el inventario.
+
+La versión 1.0.18 añadió a cada venta el botón de reimprimir factura de BCA,
 incluidos los abonos disponibles de la cuenta, sin volver a cobrar ni modificar
 el inventario. Los avisos de escritura confirmada inician las consultas de Ventas
 y Movimientos en paralelo sin una consulta previa de estado ni esperar Inventario.

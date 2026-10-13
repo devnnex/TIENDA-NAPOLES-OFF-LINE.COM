@@ -5426,3 +5426,14 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 .system-modal.stock-warning::backdrop { background: transparent; pointer-events: none; }
 @keyframes stockWarningFlash { 0%, 100% { background: #fff1f1; box-shadow: 0 20px 60px rgba(114, 24, 24, .22); } 50% { background: #ffd7d7; box-shadow: 0 20px 60px rgba(114, 24, 24, .36), 0 0 0 5px rgba(227, 87, 87, .2); } }
 @media (prefers-reduced-motion: reduce) { .system-modal.stock-warning { animation: none; } }
+
+/* Cambio legible incluso al cobrar rápidamente. */
+.cash-change { gap: .4rem; padding: 1rem 1.15rem; min-width: 0; }
+.cash-change span { font-size: clamp(1.05rem, 2vw, 1.35rem); font-weight: 800; }
+.cash-change strong { font-size: clamp(2.1rem, 5vw, 3.1rem); line-height: 1.12; font-weight: 900; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.cash-change small { font-size: 1rem; line-height: 1.4; }
+#movements .inventory-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
+#movements .inventory-toolbar > label { flex: 1 1 150px; min-width: 0; }
+#movements .inventory-toolbar > .inventory-search { flex: 2 1 260px; }
+#movementSummary { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.request-btn[hidden] { display: none !important; }

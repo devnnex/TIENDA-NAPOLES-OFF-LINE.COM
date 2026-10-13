@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Iniciador de Tienda Napoles Offline sin consola")]
 [assembly: AssemblyCompany("Tienda Napoles")]
 [assembly: AssemblyProduct("Tienda Napoles Offline")]
-[assembly: AssemblyVersion("1.0.18.0")]
-[assembly: AssemblyFileVersion("1.0.18.0")]
+[assembly: AssemblyVersion("1.0.19.0")]
+[assembly: AssemblyFileVersion("1.0.19.0")]
 
 public static class TiendaNapolesOffline
 {

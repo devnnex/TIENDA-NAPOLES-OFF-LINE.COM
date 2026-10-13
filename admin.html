@@ -170,6 +170,11 @@
             <small data-upload-status="cover_url">Seleccionar imagen</small>
           </label>
           <div class="tip-setting-card wide">
+            <div class="tip-setting-copy"><span class="tip-setting-icon"><i data-lucide="receipt-text"></i></span><div><strong>Ver cuenta para clientes</strong><small>Activa esta opción para que el cliente consulte su consumo. Apágala si llevas las cuentas en tarjetas físicas.</small></div></div>
+            <label class="modern-switch"><input name="client_bill_enabled" type="checkbox" role="switch" checked aria-label="Mostrar Ver cuenta a los clientes"><span aria-hidden="true"></span></label>
+            <small class="tip-setting-status" id="clientBillSettingStatus"></small>
+          </div>
+          <div class="tip-setting-card wide">
             <div class="tip-setting-copy">
               <span class="tip-setting-icon"><i data-lucide="hand-coins"></i></span>
               <div><strong>Propina voluntaria</strong><small>Al activarla, se mostrará como opción en cuentas, pre-cuentas y cobros.</small></div>
@@ -378,6 +383,9 @@
               <span>Buscar producto, referencia o responsable</span>
               <span class="inventory-search-control"><i data-lucide="search"></i><input id="movementSearch" type="search" autocomplete="off" placeholder="Ej. cerveza, venta o nombre"></span>
             </label>
+            <label>Producto<select id="movementProductFilter"><option value="all">Todos los productos</option></select></label>
+            <label>Desde<input id="movementDateFrom" type="date"></label>
+            <label>Hasta<input id="movementDateTo" type="date"></label>
             <label>Tipo
               <select id="movementTypeFilter">
                 <option value="all">Todos</option>
@@ -386,6 +394,8 @@
               </select>
             </label>
           </div>
+          <p class="purchase-filter-feedback" id="movementTotalsFeedback" aria-live="polite"></p>
+          <button class="ghost" id="completeMovementHistory" type="button"><i data-lucide="list-checks"></i> Consultar todo el historial</button>
           <div class="movement-list" id="inventoryMovementList"></div>
         </div>
       </section>
@@ -398,7 +408,7 @@
             <p>Analiza lo facturado, la utilidad estimada y la distribución por medios de pago.</p>
           </div>
           <div class="income-heading-actions">
-            <button class="ghost" id="exportIncomeCsv" type="button"><i data-lucide="file-down"></i> Exportar</button>
+            <button class="ghost" id="exportIncomeCsv" type="button"><i data-lucide="file-down"></i> Exportar PDF</button>
             <button class="primary" id="refreshIncomeReport" type="button"><i data-lucide="refresh-cw"></i> Actualizar</button>
             <button class="ghost danger-text section-reset-button" type="button" data-reset-section="income"><i data-lucide="trash-2"></i> Eliminar todo</button>
           </div>
@@ -746,7 +756,7 @@
 
         <div class="cash-received" id="cashReceivedFields">
           <label>Dinero recibido<input name="cash_received" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
-          <div class="cash-change" id="cashChange"><span>Vueltas / cambio</span><strong>$0</strong><small>Ingresa el dinero que entrega el cliente.</small></div>
+          <div class="cash-change" id="cashChange" role="status" aria-live="polite" aria-atomic="true"><span>Vueltas / cambio</span><strong>$0</strong><small>Ingresa el dinero que entrega el cliente.</small></div>
         </div>
 
         <div class="mixed-payment" id="mixedPaymentFields" hidden>
@@ -835,7 +845,7 @@
       <div class="modal-card purchase-history-card">
         <div class="section-head purchase-history-head">
           <div><span class="eyebrow">Inversi&oacute;n en inventario</span><h2>Compras</h2><p>Consulta cu&aacute;ntas unidades agregaste, su costo y el total invertido en cada registro.</p></div>
-          <div class="purchase-history-head-actions"><button class="ghost danger-text" id="clearPurchaseHistory" type="button"><i data-lucide="trash-2"></i> Eliminar todo</button><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar compras"><i data-lucide="x"></i></button></div>
+          <div class="purchase-history-head-actions"><button class="ghost" id="exportPurchasesPdf" type="button"><i data-lucide="file-down"></i> Descargar PDF</button><button class="ghost danger-text" id="clearPurchaseHistory" type="button"><i data-lucide="trash-2"></i> Eliminar todo</button><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar compras"><i data-lucide="x"></i></button></div>
         </div>
         <form class="purchase-filters" id="purchaseFilters">
           <label class="purchase-search">Buscar

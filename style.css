@@ -5437,3 +5437,15 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 #movements .inventory-toolbar > .inventory-search { flex: 2 1 260px; }
 #movementSummary { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .request-btn[hidden] { display: none !important; }
+
+/* Guardar junto a las opciones que se están configurando. */
+#businessForm .brand-save-actions { grid-column: 3 / -1; align-self: start; display: flex; padding-top: .15rem; }
+#businessForm .brand-save-actions .form-submit { align-self: auto; min-height: 48px; }
+.table-zone-setting-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem; }
+.table-zone-setting-footer .table-zone-setting-status { flex: 1 1 260px; }
+.table-zone-setting-footer button { flex: 0 0 auto; min-height: 48px; }
+@media (max-width: 1100px) { #businessForm .brand-save-actions { grid-column: 1 / -1; } }
+@media (max-width: 640px) {
+  #businessForm .brand-save-actions button, .table-zone-setting-footer button { width: 100%; justify-content: center; }
+  .table-zone-setting-footer .table-zone-setting-status { flex-basis: 100%; }
+}

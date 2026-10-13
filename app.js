@@ -993,7 +993,7 @@ const App = (() => {
     if (state.currentTable) renderTablePicker();
   };
 
-  const ensureOpenSession = async (tableId) => {
+  const ensureOpenSession = async (tableId, { create = true, updateState = true } = {}) => {
     let session = await db(
       state.sb
         .from("table_sessions")
@@ -1005,12 +1005,13 @@ const App = (() => {
         .maybeSingle(),
       null
     );
-    if (!session) {
+    if (!session && create) {
       session = await db(
         state.sb.from("table_sessions").insert({ table_id: tableId, status: "open" }).select("*").single(),
         null
       );
     }
+    if (!updateState) return session;
     if (state.currentSession?.id !== session?.id) state.clientSnapshotSignature = "";
     if (state.page === "client" && state.currentTable?.id !== tableId) return session;
     state.currentSession = session;
@@ -1030,18 +1031,20 @@ const App = (() => {
     });
   };
 
-  const hydrateSelectedTable = async (tableId) => {
+  const hydrateSelectedTable = async (tableId, { background = false } = {}) => {
     const table = state.currentTable;
     if (!table || table.id !== tableId) return null;
     subscribeClient();
     const token = ++state.clientHydrationToken;
-    state.tableAccountStatus = "checking";
-    state.tableAccountTotal = 0;
-    renderTablePicker();
+    if (!background) {
+      state.tableAccountStatus = "checking";
+      state.tableAccountTotal = 0;
+      renderTablePicker();
+    }
     const snapshot = await readRealtimeData(state.sb.rpc("getClientTableState", {
       table_id: table.id,
       table_access_code: tableCode(table),
-      ensure_session: true
+      ensure_session: false
     }));
     if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
     if (snapshot?.session) {
@@ -1050,9 +1053,17 @@ const App = (() => {
       state.clientRequests = snapshot.requests || [];
       state.clientSnapshotSignature = "";
     } else {
-      const session = await ensureOpenSession(tableId);
-      if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId || !session) return null;
-      await loadClientSnapshot();
+      const session = snapshot ? null : await ensureOpenSession(tableId, { create: false, updateState: false });
+      if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
+      if (session) { state.currentSession = session; await loadClientSnapshot(); }
+      else {
+        state.currentSession = null;
+        state.sessionItems = [];
+        state.clientRequests = [];
+        state.clientSnapshotSignature = "";
+        state.tableLocked = false;
+        state.localBillOpen = false;
+      }
     }
     void refreshClientPosData();
     if (token !== state.clientHydrationToken || state.currentTable?.id !== tableId) return null;
@@ -2115,6 +2126,10 @@ const App = (() => {
     button?.classList.add("is-pending");
     try {
       await hydrateSelectedTable(state.currentTable.id);
+      if (!sessionHasConsumption({ ...state.currentSession, session_items: state.sessionItems })) {
+        toast("Esta mesa está libre y no tiene consumo pendiente.");
+        return;
+      }
       state.localBillOpen = true;
       renderBillChat();
       void refreshClientPosData();
@@ -4173,6 +4188,16 @@ const App = (() => {
       state.clientSubscribedTableId = "";
       state.clientLiveRefresh = null;
       if (previous) state.sb.removeChannel(previous);
+      const tableId = state.currentTable?.id;
+      if (tableId) {
+        const refresh = async () => {
+          if (state.currentTable?.id !== tableId || state.currentSession || state.clientSyncBusy) return;
+          state.clientSyncBusy = true;
+          try { await hydrateSelectedTable(tableId, { background: true }); } finally { state.clientSyncBusy = false; }
+        };
+        state.clientLiveRefresh = refresh;
+        state.clientPollTimer = setInterval(refresh, SYNC_INTERVAL_MS);
+      }
       return;
     }
     const tableId = state.currentTable.id;
@@ -4196,10 +4221,7 @@ const App = (() => {
       if (state.clientSyncBusy) { refreshPending = true; return; }
       state.clientSyncBusy = true;
       try {
-        if (await loadClientSnapshot()) {
-          renderAccount();
-          renderBillChat();
-        }
+        await hydrateSelectedTable(tableId, { background: true });
       } finally {
         state.clientSyncBusy = false;
         if (refreshPending) { refreshPending = false; window.setTimeout(() => void refresh(), 0); }
@@ -5116,7 +5138,7 @@ const App = (() => {
   const renderAdminShell = () => {
     renderBrand();
     syncTipFeatureVisibility();
-    const tableSessions = state.sessions.filter((session) => !isLocalWalkInSession(session));
+    const tableSessions = state.sessions.filter((session) => !isLocalWalkInSession(session) && sessionHasConsumption(session));
     const totals = {
       tables: normalTables().filter((table) => table.is_active).length,
       alerts: activeRequests().length,
@@ -5162,6 +5184,13 @@ const App = (() => {
 
   const sessionPayments = (session) => [...new Map((session?.session_payments || []).map((row) => [row.id, row])).values()];
   const sessionPaid = (session) => sessionPayments(session).reduce((sum, row) => sum + integerMoney(row.amount), 0);
+  const sessionHasConsumption = (session) => {
+    if (!session || session.status !== "open") return false;
+    if (sessionPaid(session) > 0) return true;
+    if (Array.isArray(session.session_items)) return session.session_items.some(item => (item.status === "served" || !item.status) && Number(item.quantity || 0) > 0);
+    // Una lectura parcial no debe ocultar una cuenta real ya confirmada.
+    return Number(session.subtotal || 0) > 0 || Number(session.total || 0) > 0;
+  };
   const sessionBalance = (session) => Math.max(0, sessionTotal(session) - sessionPaid(session));
 
   const consumptionChangeAllowed = (session, itemId, replacement) => {
@@ -5469,7 +5498,7 @@ const App = (() => {
     .filter((table) => tableMatchesZone(table, zoneFilter))
     .filter((table) => tableMatchesGroup(table, groupFilter) && tableMatchesSearch(table, query))
     .map((table) => {
-      const session = state.sessions.find((entry) => entry.table_id === table.id && entry.status === "open");
+      const session = state.sessions.find((entry) => entry.table_id === table.id && sessionHasConsumption(entry));
       const pending = state.requests.filter((request) => request.table_id === table.id && request.status === "pending").length;
       const occupied = Boolean(session);
       return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${isOutdoorTable(table) ? "outdoor" : "indoor"} ${isTerraceTable(table) ? "terrace" : ""} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
@@ -5524,7 +5553,7 @@ const App = (() => {
     const kindLabel = state.activeServiceZone === "bar" ? "terraza" : "matera";
     box.innerHTML = points.length ? points.map((table) => {
       const displayLabel = state.activeServiceZone === "bar" ? tableLabel(table).replace(/^Barra\b/i, "Terraza") : tableLabel(table);
-      const session = state.sessions.find((entry) => String(entry.table_id) === String(table.id) && entry.status === "open");
+      const session = state.sessions.find((entry) => String(entry.table_id) === String(table.id) && sessionHasConsumption(entry));
       const occupied = Boolean(session);
       return `<article class="service-point-tile ${occupied ? "occupied" : "free"}">
         <button type="button" data-open-table="${escapeHTML(table.id)}" title="Atender ${escapeHTML(displayLabel)}">
@@ -8469,7 +8498,7 @@ const App = (() => {
     const box = $("#accountsPanel");
     if (!box) return;
     const accountSearch = $("#accountsSearch")?.value || "";
-    const accountSessions = state.sessions.filter((session) => !isLocalWalkInSession(session) && matchesAccountSearch(session, accountSearch)).sort(compareAccountNumbers);
+    const accountSessions = state.sessions.filter((session) => !isLocalWalkInSession(session) && sessionHasConsumption(session) && matchesAccountSearch(session, accountSearch)).sort(compareAccountNumbers);
     const renderSignature = JSON.stringify([
       accountSearch,
       state.business?.tax_rate,
@@ -10856,7 +10885,19 @@ const App = (() => {
     bindCurrencyInputs();
     $("#businessForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
-      await saveBusiness(event.currentTarget);
+      const form = event.currentTarget;
+      if (form.dataset.saving === "1") return;
+      form.dataset.saving = "1";
+      const buttons = [...form.querySelectorAll('button[type="submit"]')].map(button => ({ button, markup: button.innerHTML, disabled: button.disabled }));
+      buttons.forEach(({ button }) => { button.disabled = true; button.innerHTML = icon("loader-circle", 17) + " Guardando..."; });
+      refreshIcons();
+      try {
+        await saveBusiness(form);
+      } finally {
+        delete form.dataset.saving;
+        buttons.forEach(({ button, markup, disabled }) => { button.innerHTML = markup; button.disabled = disabled; });
+        refreshIcons();
+      }
     });
     $("#businessForm")?.addEventListener("change", async (event) => {
       if (event.target.name === "client_bill_enabled") { await saveClientBillVisibility(event.target); renderBusinessForm(); return; }

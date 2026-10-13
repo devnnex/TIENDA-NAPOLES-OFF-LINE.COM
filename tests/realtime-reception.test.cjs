@@ -32,7 +32,10 @@ function backend() {
     channel: server.channel,
     removeChannel(channel) { channel.active = false; channel.status?.('CLOSED'); },
     rpc: async (name, payload) => {
-      if (name === 'getClientTableState') return { data: { session: { id: 'session-a', table_id: 'table-a' }, sessionItems: [], requests: server.requests } };
+      if (name === 'getClientTableState') {
+        if (server.snapshotGate) await server.snapshotGate;
+        return { data: { session: { id: 'session-a', table_id: 'table-a' }, sessionItems: [], requests: server.requests.map(row => ({ ...row })) } };
+      }
       if (name === 'getClientSnapshot') {
         if (server.snapshotGate) await server.snapshotGate;
         return { data: { sessionItems: [], requests: server.requests.map(row => ({ ...row })) } };
@@ -52,7 +55,7 @@ function backend() {
     from(name) {
       const query = { select() { return this; }, eq() { return this; }, neq() { return this; }, order() { return this; },
         in() { return this; }, limit() { return this; }, maybeSingle() { return this; },
-        then(resolve, reject) { return Promise.resolve({ data: name === 'service_requests' ? server.requests : [] }).then(resolve, reject); } };
+        then(resolve, reject) { return Promise.resolve({ data: name === 'table_sessions' ? { id: 'session-a', table_id: 'table-a', status: 'open' } : name === 'service_requests' ? server.requests : [] }).then(resolve, reject); } };
       return query;
     }
   };

@@ -24,3 +24,16 @@ o retirar unidades todavía no equivale a cobrar una venta.
 El selector de consumo conserva el producto al actualizarse la lista y las
 vueltas se muestran en letra y número más grandes. La caja automática conserva
 su comportamiento: solo efectivo y solo en el PC conectado físicamente.
+
+## Marca y consultas del QR
+
+Guardar marca está junto a Logo y Portada; Guardar mesas de afuera está dentro
+de su configurador. Los dos botones guardan la configuración y bloquean nuevos
+envíos mientras se confirma la operación.
+
+La página del QR consulta la cuenta sin crear sesiones al abrirse, recuperarse
+o actualizarse. El navegador detecta cierres y nuevas cuentas en segundo plano.
+Las sesiones sin consumo confirmado permanecen libres en el plano y quedan
+fuera de las cuentas e indicadores. Los abonos reales y los productos gratuitos
+confirmados se conservan como cuentas activas. Pedir mesero, canción y chatear
+mantienen su funcionamiento; Ver cuenta aplica cuando hay consumo.

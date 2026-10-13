@@ -1,7 +1,7 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.19.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.20.exe` con Inno Setup 6.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el
@@ -10,6 +10,19 @@ crea un borrador, sube y verifica el archivo y después lo marca como la última
 publicación. Una versión antigua no desplaza una más reciente. Para cada cambio
 del paquete incrementa la versión, compila y sube el nuevo `.exe`. También se
 puede ejecutar el workflow manualmente desde Actions. No modifica la landing.
+
+La versión 1.0.20 coloca Guardar marca junto al logo y la portada y añade
+Guardar mesas de afuera dentro del configurador. Ambos botones bloquean
+envíos repetidos hasta que se confirme el guardado.
+
+Abrir, recuperar o actualizar una página del QR consulta la cuenta con
+`ensure_session: false`. La consulta alternativa también es de lectura.
+Las mesas y los indicadores solo consideran ocupadas las cuentas con consumo
+confirmado o abonos reales. Las sesiones vacías de llamados o chat anteriores
+se conservan para atender las solicitudes y reutilizarlas al agregar consumo.
+El navegador comprueba la cuenta actual en segundo plano, incluyendo cierres
+y nuevas cuentas. Pedir mesero, canción y chatear conservan sus acciones
+explícitas. Ver cuenta muestra el consumo cuando corresponde.
 
 La versión 1.0.19 incorpora la lectura rápida de ventas y movimientos compartidos
 en Supabase, la selección persistente con las flechas del teclado, las vueltas

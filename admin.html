@@ -169,6 +169,7 @@
             <span><i data-lucide="image-up"></i> Portada</span>
             <small data-upload-status="cover_url">Seleccionar imagen</small>
           </label>
+          <div class="brand-save-actions"><button class="primary form-submit" id="saveBusinessBrand" type="submit"><i data-lucide="save"></i> Guardar marca</button></div>
           <div class="tip-setting-card wide">
             <div class="tip-setting-copy"><span class="tip-setting-icon"><i data-lucide="receipt-text"></i></span><div><strong>Ver cuenta para clientes</strong><small>Activa esta opción para que el cliente consulte su consumo. Apágala si llevas las cuentas en tarjetas físicas.</small></div></div>
             <label class="modern-switch"><input name="client_bill_enabled" type="checkbox" role="switch" checked aria-label="Mostrar Ver cuenta a los clientes"><span aria-hidden="true"></span></label>
@@ -212,9 +213,9 @@
               </div>
             </div>
             <div class="outdoor-table-selector" id="outdoorTableSelector" aria-label="Seleccionar mesas de afuera"></div>
-            <small class="table-zone-setting-status" id="tableZoneSettingStatus">Las mesas no marcadas se consideran mesas de adentro.</small>
+            <div class="table-zone-setting-footer"><small class="table-zone-setting-status" id="tableZoneSettingStatus">Las mesas no marcadas se consideran mesas de adentro.</small><button class="primary" id="saveOutdoorTableZones" type="submit"><i data-lucide="save"></i> Guardar mesas de afuera</button></div>
           </div>
-          <button class="primary form-submit" type="submit"><i data-lucide="save"></i> Guardar configuración</button>
+
         </form>
       </section>
 

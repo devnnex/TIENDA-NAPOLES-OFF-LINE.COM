@@ -18,10 +18,10 @@ function harness(overrides={}){
   ...overrides});
  vm.runInContext(block('incomeTotalsFromRecords','localIncomeRecords')
   +block('completeIncomeSaleTypeReport','incomeSaleTypeFiltersKey')
-  +block('reportNumber','filteredMovementRows')+block('movementSoldUnits','renderMovementTotals')
+  +block('reportNumber','filteredMovementRows')
   +block('buildBusinessReportPdf','renderConsumptionProductOptions')
   +block('exportIncomeCsv','renderGeneratedTableQrs')
-  +';globalThis.api={exportIncomeCsv,exportPurchasesPdf,buildBusinessReportPdf,movementSoldUnits};',context);
+  +';globalThis.api={exportIncomeCsv,exportPurchasesPdf,buildBusinessReportPdf};',context);
  return {state,context,documents,messages,buttons,api:context.api};
 }
 const sale=id=>({saleId:String(id),invoice:'TN-'+id,date:'2026-10-13T17:00:00Z',table:'Mesa 1',payer:'Ana',subtotal:200,total:200,cost:80,profit:120,payments:[{method:'cash',amount:200}],items:[{menuItemId:'product',name:'Agua',quantity:2,total:200}]});
@@ -46,21 +46,7 @@ test('el PDF de compras usa los registros filtrados y el costo por unidad para s
  assert.equal(h.documents.length,1);assert.ok(h.documents[0].name.startsWith('compras-'));assert.ok(h.documents[0].text.includes('660'));
  assert.ok(h.documents[0].text.includes('Resumen por producto'));assert.ok(h.documents[0].text.includes('Detalle de compras'));
 });
-test('vendido cuenta líneas de cuentas cobradas, sin confundirlas con movimientos de consumo',()=>{
- const h=harness();h.state.movementSalesRecords=[sale(1),{...sale(2),items:[{menuItemId:'other',name:'Jugo',quantity:9}]}];
- h.state.inventoryMovements=[{productId:'product',type:'CONSUMO_MESA',delta:-2},{productId:'product',type:'SALIDA_VENTA',delta:-2}];
- assert.equal(h.api.movementSoldUnits(),2);h.state.movementProductFilter='all';assert.equal(h.api.movementSoldUnits(),11);
-});
 test('un PDF sin conexión indica que contiene una copia parcial de los registros',async()=>{
  const h=harness();h.context.navigator.onLine=false;h.state.incomeReport={filters,records:[sale(1)],totalRecords:5};await h.api.exportIncomeCsv();
  assert.equal(h.documents.length,1);assert.ok(h.documents[0].text.includes('Reporte parcial'));assert.ok(h.documents[0].text.includes('1 de 5'));
-});
-test('filtrar movimientos reutiliza las ventas en memoria sin consultar el backend, con o sin red',()=>{
- for(const online of [true,false]) {
-  const h=harness({localIncomeRecords:()=>[sale(1)],reportMirror:()=>({deleted:{}}),readAppsScriptOutbox:()=>[],appsScriptRequest(){throw Error('El filtro no debe consultar la red.');}});
-  h.context.navigator.onLine=online;
-  vm.runInContext(block('loadMovementSalesTotals','movementViewRows')+';globalThis.loadMovementTotals=loadMovementSalesTotals;',h.context);
-  h.context.loadMovementTotals();h.context.loadMovementTotals();
-  assert.equal(h.state.movementSalesRecords.length,1);assert.equal(h.api.movementSoldUnits(),2);
- }
 });

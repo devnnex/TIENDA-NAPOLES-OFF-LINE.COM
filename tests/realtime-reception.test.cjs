@@ -120,7 +120,7 @@ function device(server, page = 'client') {
     + section('subscribeAdmin', 'tableFromScannedValue')
     + section('resumeRealtimeReception', 'init')
     + ';globalThis.api = { hydrateSelectedTable, subscribeClient, loadChatMessages, persistChatMessage, '
-    + 'broadcastChatEvent, resumeRealtimeReception, subscribeAdmin, refreshAdminNow, readRealtimeData, renderClientQueue, startAdminPolling };', context);
+    + 'broadcastChatEvent, resumeRealtimeReception, subscribeAdmin, refreshAdminNow, pollAdminRequests, readRealtimeData, renderClientQueue, startAdminPolling };', context);
   return {
     state, api: context.api, document, sounds, queueBox, renders: () => renders,
     async advance(ms) {
@@ -165,7 +165,7 @@ function device(server, page = 'client') {
   assert.ok(admin.state.requests.some(row => row.id === 'disconnected-request'), 'El respaldo recibe solicitudes incluso con WebSocket desconectado.');
   await admin.advance(1500);
   assert.notEqual(admin.state.adminBroadcastChannel, initialAdminChannel, 'El canal del administrador se reconstruye sin recargar.');
-  assert.equal(admin.state.subscriptions.length, 1, 'La reconexión no acumula canales.');
+  assert.equal(admin.state.subscriptions.length, 2, 'La reconexión conserva un canal de avisos y otro de datos, sin acumular conexiones.');
   server.requests = [];
   admin.state.requests = [];
   const adminChat = { sessionId: 'session-a', table: { id: 'table-a' }, messages: [], channel: server.channel('table:table-a') };
@@ -297,5 +297,17 @@ function device(server, page = 'client') {
   assert.equal(receiver.state.requests.length,3,'Mesero, canción y chat de distintas mesas llegan con un snapshot ocupado y reportes lentos.');
   releaseAdmin(); await settle();
   assert.equal(receiver.state.requests.length,3,'Completar la lectura anterior no oculta ni duplica solicitudes.');
+  const priorityBackend=backend(),priorityAdmin=device(priorityBackend,'admin');
+  priorityBackend.reportGate=new Promise(()=>{});priorityBackend.adminGate=new Promise(()=>{});
+  priorityAdmin.api.subscribeAdmin();priorityAdmin.api.startAdminPolling();await settle();
+  assert.equal(priorityAdmin.state.adminSyncBusy,true);
+  priorityAdmin.state.adminDataChannel.status('CHANNEL_ERROR');
+  assert.equal(priorityAdmin.state.adminBroadcastChannel.active,true,'Una falla del canal de tablas no desconecta los avisos de solicitudes.');
+  assert.ok(!priorityAdmin.state.adminBroadcastChannel.handlers.some(handler=>handler.type==='postgres_changes'),'Los avisos no dependen de permisos de cambios de filas.');
+  priorityBackend.requests.push(...[1,2,3].map(i=>({id:'priority-'+i,table_id:'table-'+i,session_id:null,status:'pending',request_type:i===1?'waiter':'other',message:i===2?'Canción':i===3?'Chat':'',created_at:'2026-10-13T18:00:00Z'})));
+  await priorityAdmin.advance(1000);
+  assert.equal(priorityAdmin.state.requests.length,3,'Sin avisos ni recargar, llegan solicitudes de cualquier mesa en un ciclo del lector prioritario aunque cuentas y reportes no respondan.');
+  const rendered=priorityAdmin.renders();await priorityAdmin.api.pollAdminRequests();
+  assert.equal(priorityAdmin.renders(),rendered,'Una respuesta idéntica no reconstruye la interfaz.');
   console.log('PASS recepción en vivo: dos dispositivos, solicitudes, pagos lentos, chat independiente, respaldo, reconexión y reanudación sin recarga.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

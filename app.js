@@ -63,7 +63,10 @@ const SupabaseDb = (() => {
       if (authToken) headers.set("x-app-token", authToken);
       if (clientTableAccess.table_id) headers.set("x-table-id", clientTableAccess.table_id);
       if (clientTableAccess.code) headers.set("x-table-code", clientTableAccess.code);
-      return fetch(input, { ...options, headers, cache: "no-store" }).then((response) => {
+      const requestPath = new URL(typeof input === "string" ? input : input?.url || String(input), SUPABASE_CONFIG.url).pathname;
+      const urgent = /\/(service_requests|rpc\/(create_service_requests?(?:_batch)?|list_chat_messages|send_chat_message))$/.test(requestPath);
+      const reporting = /\/rpc\/(get_report_changes|publish_report_change)$/.test(requestPath);
+      return fetch(input, { ...options, headers, cache: "no-store", priority: urgent ? "high" : reporting ? "low" : "auto" }).then((response) => {
         try {
           const url = new URL(typeof input === "string" ? input : input?.url || String(input), SUPABASE_CONFIG.url);
           const method = String(options.method || input?.method || "GET").toUpperCase();
@@ -1115,14 +1118,14 @@ const App = (() => {
     }
   };
 
-  const readRealtimeData = async (query) => {
+  const readRealtimeData = async (query, timeoutMs = 8000) => {
     let timeout;
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     const builder = controller && typeof query?.abortSignal === "function" ? query.abortSignal(controller.signal) : query;
     try {
       return await Promise.race([
         dbQuiet(builder, null),
-        new Promise((resolve) => { timeout = window.setTimeout(() => { controller?.abort(); resolve(null); }, 8000); })
+        new Promise((resolve) => { timeout = window.setTimeout(() => { controller?.abort(); resolve(null); }, timeoutMs); })
       ]);
     } finally { window.clearTimeout(timeout); }
   };
@@ -3395,12 +3398,13 @@ const App = (() => {
   };
 
   const flushRequestOutbox = async () => {
-    if (state.requestOutboxBusy || !navigator.onLine) return;
+    if (!navigator.onLine) return;
+    state.requestOutboxInFlight ||= new Set();
     const now = Date.now();
     const outbox = readRequestOutbox();
-    const due = outbox.filter((item) => Number(item.next_attempt_at || 0) <= now).slice(0, 30);
+    const due = outbox.filter((item) => !state.requestOutboxInFlight.has(item.request_id) && Number(item.next_attempt_at || 0) <= now).slice(0, 30);
     if (!due.length) {
-      const next = outbox.reduce((time, item) => Math.min(time, Number(item.next_attempt_at || Infinity)), Infinity);
+      const next = outbox.filter(item => !state.requestOutboxInFlight.has(item.request_id)).reduce((time, item) => Math.min(time, Number(item.next_attempt_at || Infinity)), Infinity);
       if (Number.isFinite(next)) {
         window.clearTimeout(state.requestOutboxTimer);
         state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, Math.max(250, next - now));
@@ -3408,6 +3412,7 @@ const App = (() => {
       return;
     }
 
+    due.forEach(item => state.requestOutboxInFlight.add(item.request_id));
     state.requestOutboxBusy = true;
     let results = null;
     try {
@@ -3441,7 +3446,7 @@ const App = (() => {
       (results || []).forEach((result, index) => {
         const queued = due[index];
         const request = result?.request || result;
-        if (!queued || !request) return;
+        if (!queued || request?.id !== queued.request_id || !request.status) return;
         succeeded.add(queued.request_id);
         state.clientRequests = [request, ...state.clientRequests.filter((item) => item.id !== queued.request_id && item.id !== request.id)];
       });
@@ -3463,8 +3468,9 @@ const App = (() => {
       }
       renderBillChat();
     } finally {
-      state.requestOutboxBusy = false;
-      if (readRequestOutbox().length) {
+      due.forEach(item => state.requestOutboxInFlight.delete(item.request_id));
+      state.requestOutboxBusy = state.requestOutboxInFlight.size > 0;
+      if (readRequestOutbox().some(item => !state.requestOutboxInFlight.has(item.request_id))) {
         window.clearTimeout(state.requestOutboxTimer);
         state.requestOutboxTimer = window.setTimeout(flushRequestOutbox, 0);
       }
@@ -4754,6 +4760,7 @@ const App = (() => {
     const incoming = (Array.isArray(rows) ? rows : []).filter((row) => row?.id && row.table_id && row.status);
     if (!incoming.length) return;
     const completed = rememberCompletedAdminRequests(incoming.filter((row) => ["acknowledged", "resolved"].includes(row.status) || row.acknowledged_at).map((row) => row.id));
+    const before = JSON.stringify(state.requests);
     const requests = new Map(state.requests.map((row) => [row.id, row]));
     incoming.forEach((row) => {
       if (row.status === "pending" && completed.has(row.id)) return;
@@ -4761,6 +4768,7 @@ const App = (() => {
         restaurant_tables: row.restaurant_tables || requests.get(row.id)?.restaurant_tables || state.tables.find((table) => String(table.id) === String(row.table_id)) });
     });
     state.requests = mergeOptimisticRequests([...requests.values()].sort(compareRequestArrival));
+    if (JSON.stringify(state.requests) === before) return;
     persistPendingAdminRequests(state.requests);
     state.adminSnapshotSignature = "";
     renderAdminLive();
@@ -4772,6 +4780,25 @@ const App = (() => {
     // El aviso solo lleva IDs: la notificación se confirma leyendo Supabase.
     const rows = await readRealtimeData(state.sb.from("service_requests").select("*").in("id", ids));
     receiveAdminRequests(rows);
+  };
+
+  let adminRequestPollBusy = false;
+  const pollAdminRequests = async () => {
+    if (!state.authToken || state.page !== "admin" || adminRequestPollBusy || !navigator.onLine) return false;
+    adminRequestPollBusy = true;
+    const token = state.authToken;
+    const knownPending = state.requests.filter(row => row.status === "pending").map(row => row.id);
+    try {
+      const rows = await readRealtimeData(state.sb.from("service_requests").select("*")
+        .eq("status", "pending").order("created_at", { ascending: true }), 2500);
+      if (state.authToken !== token || !Array.isArray(rows)) return false;
+      receiveAdminRequests(rows);
+      const returned = new Set(rows.map(row => row.id));
+      const missing = knownPending.filter(id => !returned.has(id));
+      // Aceptaciones y cierres se verifican aparte; no retrasan solicitudes nuevas.
+      for (let offset = 0; offset < missing.length; offset += 30) void refreshAdminRequests(missing.slice(offset, offset + 30));
+      return true;
+    } finally { adminRequestPollBusy = false; }
   };
 
   let adminRefreshPending = false;
@@ -4790,6 +4817,9 @@ const App = (() => {
   };
 
   const startAdminPolling = () => {
+    clearInterval(state.adminRequestPollTimer);
+    void pollAdminRequests();
+    state.adminRequestPollTimer = setInterval(() => void pollAdminRequests(), 1000);
     clearInterval(state.adminPollTimer);
     state.adminPollTimer = setInterval(() => {
       void refreshAdminNow();
@@ -4967,6 +4997,7 @@ const App = (() => {
     }
     state.syncFresh.operational = !pendingScope.sessionIds.size && !pendingScope.requestIds.size;
     if (!Array.isArray(snapshot.requests) || !Array.isArray(snapshot.sessions)) return false;
+    if (typeof receiveAdminRequests === "function") receiveAdminRequests(snapshot.requests);
     const livePending = new Set(state.requests.filter((request) => request.status === "pending").map((request) => request.id));
     const knownPending = new Map([...readPendingAdminRequests(), ...state.requests.filter((request) => request.status === "pending")].map((request) => [request.id, request]));
     const incoming = new Map(snapshot.requests.map((request) => [request.id, request]));
@@ -6209,23 +6240,14 @@ const App = (() => {
   };
 
   const reportNumber = value => Number(value || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 });
-  const filteredMovementRows = () => {
-    const query = normalizeText(state.movementSearch || "");
-    const from = $("#movementDateFrom")?.value || "", to = $("#movementDateTo")?.value || "";
-    if (from && to && from > to) return [];
-    return movementViewRows().filter(row => {
-      const date = purchaseDateKey(row.date);
-      return (state.movementProductFilter === "all" || !state.movementProductFilter || String(row.productId) === state.movementProductFilter)
-        && (state.movementTypeFilter === "all" || movementKind(row) === state.movementTypeFilter)
-        && (!from || date >= from) && (!to || date <= to)
-        && (!query || normalizeText([row.product,row.code,row.type,row.reference,row.user].join(" ")).includes(query));
-    }).sort((a,b) => String(b.date || "").localeCompare(String(a.date || "")));
-  };
+  const filteredMovementRows = () => movementViewRows()
+    .filter(row => !state.movementProductFilter || state.movementProductFilter === "all" || String(row.productId) === state.movementProductFilter)
+    .sort((a,b) => String(b.date || "").localeCompare(String(a.date || "")));
   const renderMovementProductOptions = () => {
     const select = $("#movementProductFilter");
     if (!select) return;
-    const products = new Map(state.items.map(item => [String(item.id), item.name]));
-    state.inventoryMovements.forEach(row => { if (row.productId && !products.has(String(row.productId))) products.set(String(row.productId), row.product); });
+    const products = new Map(state.items.map(item => [String(item.id), String(item.name || "Producto")]));
+    state.inventoryMovements.forEach(row => { if (row.productId && !products.has(String(row.productId))) products.set(String(row.productId), String(row.product || row.productName || row.code || "Producto")); });
     const markup = '<option value="all">Todos los productos</option>' + [...products].sort((a,b) => a[1].localeCompare(b[1],"es"))
       .map(([id,name]) => `<option value="${escapeHTML(id)}">${escapeHTML(name)}</option>`).join("");
     if (select.innerHTML !== markup) select.innerHTML = markup;
@@ -6274,70 +6296,17 @@ const App = (() => {
     })().finally(() => { completeMovementsPromise = null; });
     return completeMovementsPromise;
   };
-  // El filtro y los KPI reutilizan las ventas que ya están en memoria.
-  const loadMovementSalesTotals = () => {
-    const filters = { dateFrom: "2000-01-01", dateTo: "2099-12-31", paymentMethod: "all", query: "", saleType: "all" };
-    const records = new Map(localIncomeRecords(filters).map(row => [String(row.saleId), row]));
-    (state.incomeReport?.records || []).forEach(row => records.set(String(row.saleId), row));
-    Object.keys(reportMirror().deleted || {}).forEach(id => records.delete(id));
-    readAppsScriptOutbox().filter(job => job.action === "delete_sale").forEach(job => records.delete(String(job.payload?.saleId)));
-    state.movementSalesRecords = [...records.values()];
-  };
-  const movementViewRows = () => {
-    const rows = removeDeletedSaleMovements(state.inventoryMovements);
-    if (state.movementView !== "sales") return rows;
-    if (!canAccessAdminSection("income")) return [];
-    const result = [];
-    const bySession = new Map(), byReference = new Map(), byId = new Map();
-    rows.forEach(row => {
-      byId.set(String(row.movementId), row);
-      for (const [map,key] of [[bySession,row.sessionId],[byReference,row.reference]]) {
-        if(!key) continue;
-        const list = map.get(String(key)) || []; list.push(row); map.set(String(key),list);
-      }
-    });
-    (state.movementSalesRecords || []).forEach(sale => {
-      const linked = [...(bySession.get(String(sale.sessionId || "")) || []), ...(byReference.get(String(sale.invoice || "")) || [])];
-      (sale.items || []).forEach(line => { const row = byId.get("SALE-" + sale.saleId + "-" + (line.menuItemId || line.menu_item_id)); if(row)linked.push(row); });
-      const products = new Map();
-      (sale.items || []).forEach(line => {
-        const id = String(line.menuItemId || line.menu_item_id || "");
-        if (!linked.some(row => String(row.productId) === id)) return;
-        const value = products.get(id) || { productId: id, product: line.name || line.item_name, quantity: 0, total: 0 };
-        value.quantity += Number(line.quantity || 0);
-        value.total += Number(line.total ?? (Number(line.quantity || 0) * Number(line.unitPrice || line.unit_price || 0)));
-        products.set(id, value);
-      });
-      products.forEach(product => {
-        const row = linked.find(row => String(row.productId) === product.productId);
-        result.push({ ...row, ...product, movementId: "PAID-" + sale.saleId + "-" + product.productId,
-          type: "VENTA_COBRADA", delta: -product.quantity, date: sale.date,
-          reference: sale.invoice, user: sale.waiter || row.user, saleId: sale.saleId });
-      });
-    });
-    return result;
-  };
+  const movementViewRows = () => removeDeletedSaleMovements(state.inventoryMovements);
 
-  const movementSoldUnits = () => {
-    const id = state.movementProductFilter || "all";
-    const from = $("#movementDateFrom")?.value || "", to = $("#movementDateTo")?.value || "";
-    const query = normalizeText(state.movementSearch || "");
-    return (state.movementSalesRecords || []).filter(record => { const date = purchaseDateKey(record.date); return (!from || date >= from) && (!to || date <= to); })
-      .reduce((total, record) => total + (record.items || []).filter(line => (id === "all" || String(line.menuItemId) === id)
-        && (!query || normalizeText(line.name).includes(query))).reduce((sum,line) => sum + Number(line.quantity || 0),0),0);
-  };
   const renderMovementTotals = (movements) => {
-    const sales = state.movementView === "sales";
     const entries = movements.filter(row => movementKind(row) === "entry").reduce((sum,row) => sum + Number(row.delta ?? row.quantityChange ?? 0),0);
     const exits = movements.filter(row => movementKind(row) === "exit").reduce((sum,row) => sum + Math.abs(Number(row.delta ?? row.quantityChange ?? 0)),0);
     const summary = $("#movementSummary");
-    if (summary) summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line",19)}<span><small>${sales ? "Unidades devueltas" : "Unidades ingresadas"}</small><strong>+${reportNumber(entries)}</strong></span></article>
-      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>${sales ? "Unidades vendidas" : "Unidades retiradas"}</small><strong>${sales ? "" : "−"}${reportNumber(exits)}</strong></span></article>
+    if (summary) summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line",19)}<span><small>Unidades ingresadas</small><strong>+${reportNumber(entries)}</strong></span></article>
+      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>${state.movementProductFilter && state.movementProductFilter !== "all" ? "De este producto has vendido" : "Unidades retiradas"}</small><strong>${reportNumber(exits)}</strong></span></article>
       <article class="movement-kpi">${icon("list-checks",19)}<span><small>Movimientos visibles</small><strong>${movements.length}</strong></span></article>`;
     const feedback = $("#movementTotalsFeedback");
-    if (feedback) feedback.textContent = sales
-      ? "Totales de las ventas cobradas y movimientos disponibles en este equipo, para el producto y las fechas elegidas."
-      : "Totales de los movimientos cargados para el producto y las fechas elegidas.";
+    if (feedback) feedback.textContent = "Cantidades de los movimientos cargados para el producto seleccionado.";
   };
 
   const buildBusinessReportPdf = ({ title, subtitle, metrics = [], sections = [], note = "", filename }) => {
@@ -6862,12 +6831,11 @@ const App = (() => {
 
   const renderInventoryMovements = () => {
     if (state.activeAdminSection && state.activeAdminSection !== "movements") return;
-    if (state.movementView === "sales") loadMovementSalesTotals();
     const list = $("#inventoryMovementList");
     const summary = $("#movementSummary");
     if (!list || !summary) return;
     renderMovementProductOptions();
-    const signature = JSON.stringify([state.inventoryMovements, state.movementSearch, state.movementTypeFilter, state.movementProductFilter, $("#movementDateFrom")?.value, $("#movementDateTo")?.value, state.movementView, state.movementSalesRecords]);
+    const signature = JSON.stringify([state.inventoryMovements, state.movementProductFilter]);
     if (signature === state.movementRenderSignature && list.firstElementChild) return;
     state.movementRenderSignature = signature;
     const query = normalizeText(state.movementSearch);
@@ -6876,7 +6844,7 @@ const App = (() => {
     list.innerHTML = movements.length ? movements.map((movement) => {
       const delta = Number(movement.delta ?? movement.quantityChange ?? 0);
       const kind = delta >= 0 ? "entry" : "exit";
-      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div>${state.movementView === "sales" ? `<div><small>Importe</small><strong>${money(movement.total)}</strong></div>` : `<div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div>`}<strong class="movement-delta">${delta > 0 ? "+" : ""}${delta.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
+      return `<article class="movement-row ${kind}"><span class="movement-direction">${icon(kind === "entry" ? "arrow-down-left" : "arrow-up-right", 20)}</span><div class="movement-product"><strong>${escapeHTML(movement.product || "Producto")}</strong><small>${escapeHTML(movement.code || "")}${movement.reference ? ` · ${escapeHTML(movement.reference)}` : ""}</small></div><div><small>Movimiento</small><strong>${escapeHTML(String(movement.type || (kind === "entry" ? "ENTRADA" : "SALIDA")).replaceAll("_", " "))}</strong></div><div><small>Existencia</small><strong>${Number(movement.before || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} → ${Number(movement.after || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong></div><strong class="movement-delta">${delta > 0 ? "+" : ""}${Math.abs(delta).toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><div class="movement-audit"><strong>${escapeHTML(movement.user || "Sistema")}</strong><small>${escapeHTML(prettyDateTime(movement.date))}</small></div></article>`;
     }).join("") : emptyState("Sin movimientos", query ? "No hay coincidencias para este filtro." : "Las entradas y salidas apareceran aqui con su responsable.", "arrow-left-right");
     refreshIcons();
   };
@@ -7906,7 +7874,6 @@ const App = (() => {
             state.incomeReport = mergeIncomeReport(cached.report, filters);
             state.incomeRevision = cached.report.revision;
             state.incomeFetchedAt = Date.now();
-      if (state.activeAdminSection === "movements" && state.movementView === "sales") renderInventoryMovements();
             state.syncFresh.sales = true;
             if (state.activeAdminSection === "income") renderIncomeReport();
             void updateGlobalSyncStatus();
@@ -7935,7 +7902,6 @@ const App = (() => {
       state.incomeReport = mergeIncomeReport(result, filters);
       state.incomeRevision = result.revision || "";
       state.incomeFetchedAt = Date.now();
-      if (state.activeAdminSection === "movements" && state.movementView === "sales") renderInventoryMovements();
       state.syncFresh.sales = true;
       void persistDurableJson(INCOME_REPORT_CACHE_KEY, { filters, report: result, fetchedAt: new Date().toISOString() });
       if (state.activeAdminSection === "income") renderIncomeReport();
@@ -11116,20 +11082,10 @@ const App = (() => {
       state.serviceTableZoneFilter = event.currentTarget.value || "all";
       renderServiceTables();
     });
-    const updateMovementFilters = () => {
-      state.movementProductFilter = $("#movementProductFilter")?.value || "all";
+    $("#movementProductFilter")?.addEventListener("change", event => {
+      state.movementProductFilter = event.currentTarget.value || "all";
       renderInventoryMovements();
-    };
-    ["#movementProductFilter","#movementDateFrom","#movementDateTo"].forEach(selector => $(selector)?.addEventListener("change", updateMovementFilters));
-    $$('[data-movement-view]').forEach(button => button.addEventListener("click", () => {
-      const view = button.dataset.movementView;
-      if (view === state.movementView) return;
-      state.movementView = view;
-      $$('[data-movement-view]').forEach(tab => tab.setAttribute("aria-selected", String(tab === button)));
-      renderInventoryMovements();
-      const panel = $("#inventoryMovementList");
-      if (!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) panel?.animate?.([{ opacity: .4 }, { opacity: 1 }], { duration: 130 });
-    }));
+    });
     $("#exportPurchasesPdf")?.addEventListener("click", () => void exportPurchasesPdf());
     $("#movementSearch")?.addEventListener("input", (event) => {
       state.movementSearch = event.currentTarget.value;
@@ -11702,6 +11658,8 @@ const App = (() => {
 
   const subscribeAdmin = () => {
     if (!state.authToken) return;
+    void pollAdminRequests();
+    subscribeAdminData();
     if (typeof startConfirmedReportSync === "function") startConfirmedReportSync();
     const previous = state.adminBroadcastChannel;
     if (previous && !state.adminRealtimeNeedsReconnect) return;
@@ -11718,13 +11676,47 @@ const App = (() => {
     }
     const channel = state.sb
       .channel("admin", { config: { broadcast: { self: false }, private: false } })
-      .on("broadcast", { event: "refresh" }, refreshAdminNow)
+      .on("broadcast", { event: "refresh" }, () => { void pollAdminRequests(); void refreshAdminNow(); })
       .on("broadcast", { event: "request-arrived" }, ({ payload }) => void refreshAdminRequests(payload?.requestIds))
       .on("broadcast", { event: "reports-committed" }, () => void syncConfirmedReports())
       .on("broadcast", { event: "reports-refresh" }, () => void refreshBackgroundReports({ force:true }))
       .on("broadcast", { event: "inventory-refresh" }, () => void refreshInventoryFromPeer())
       .on("broadcast", { event: "users-refresh" }, () => { if (isBoss()) void loadUsers(); })
-      .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow())
+      .on("broadcast", { event: "core-refresh" }, () => void refreshCoreNow());
+    state.subscriptions.push(channel);
+    state.adminBroadcastChannel = channel;
+    channel.subscribe((status) => {
+      if (state.adminBroadcastChannel !== channel) return;
+      if (status === "SUBSCRIBED") {
+        state.adminRealtimeNeedsReconnect = false;
+        window.clearTimeout(state.adminReconnectTimer);
+        setRealtimeStatus("En vivo", "live");
+        void pollAdminRequests();
+        void refreshAdminNow();
+      }
+      if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
+        state.adminRealtimeNeedsReconnect = true;
+        window.clearTimeout(state.adminReconnectTimer);
+        state.adminReconnectTimer = window.setTimeout(() => {
+          if (state.adminBroadcastChannel === channel && state.authToken) subscribeAdmin();
+        }, 3000);
+        setRealtimeStatus("Respaldo cada 1,5 segundos", "fallback");
+      }
+    });
+  };
+
+  const subscribeAdminData = () => {
+    if (!state.authToken) return;
+    const previous = state.adminDataChannel;
+    if (previous && !state.adminDataNeedsReconnect) return;
+    state.adminDataChannel = null;
+    window.clearTimeout(state.adminDataReconnectTimer);
+    if (previous) {
+      state.subscriptions = state.subscriptions.filter(entry => entry !== previous);
+      void state.sb.removeChannel(previous);
+    }
+    state.adminDataNeedsReconnect = false;
+    const channel = state.sb.channel("admin-data")
       .on("postgres_changes", { event: "*", schema: "public", table: "service_requests" }, (event) => { receiveAdminRequests([event.new]); void refreshAdminNow(); })
       .on("postgres_changes", { event: "*", schema: "public", table: "table_sessions" }, refreshAdminNow)
       .on("postgres_changes", { event: "*", schema: "public", table: "session_items" }, refreshAdminNow)
@@ -11737,23 +11729,15 @@ const App = (() => {
           if (state.activeAdminSection === "users") renderUsers();
         });
       });
+    state.adminDataChannel = channel;
     state.subscriptions.push(channel);
-    state.adminBroadcastChannel = channel;
-    channel.subscribe((status) => {
-      if (state.adminBroadcastChannel !== channel) return;
-      if (status === "SUBSCRIBED") {
-        state.adminRealtimeNeedsReconnect = false;
-        window.clearTimeout(state.adminReconnectTimer);
-        setRealtimeStatus("En vivo", "live");
-        void refreshAdminNow();
-      }
+    channel.subscribe(status => {
+      if (state.adminDataChannel !== channel) return;
+      if (status === "SUBSCRIBED") { state.adminDataNeedsReconnect = false; return; }
       if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
-        state.adminRealtimeNeedsReconnect = true;
-        window.clearTimeout(state.adminReconnectTimer);
-        state.adminReconnectTimer = window.setTimeout(() => {
-          if (state.adminBroadcastChannel === channel && state.authToken) subscribeAdmin();
-        }, 3000);
-        setRealtimeStatus("Respaldo cada 1,5 segundos", "fallback");
+        state.adminDataNeedsReconnect = true;
+        window.clearTimeout(state.adminDataReconnectTimer);
+        state.adminDataReconnectTimer = window.setTimeout(subscribeAdminData, 5000);
       }
     });
   };

@@ -5449,9 +5449,3 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
   #businessForm .brand-save-actions button, .table-zone-setting-footer button { width: 100%; justify-content: center; }
   .table-zone-setting-footer .table-zone-setting-status { flex-basis: 100%; }
 }
-
-/* Los dos reportes comparten los KPI y filtran la copia ya cargada. */
-.movement-view-tabs { display: flex; flex-wrap: wrap; gap: .45rem 1.2rem; }
-.movement-view-tabs [role="tab"] { padding: .25rem 0; border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: transparent; color: #667085; font: inherit; font-size: clamp(1rem, 2vw, 1.65rem); cursor: pointer; }
-.movement-view-tabs [aria-selected="true"] { color: #17191f; border-bottom-color: var(--accent, #164eff); }
-.movement-view-tabs [role="tab"]:focus-visible { outline: 2px solid #164eff; outline-offset: 4px; }

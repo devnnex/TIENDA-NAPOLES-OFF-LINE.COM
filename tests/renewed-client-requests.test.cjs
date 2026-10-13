@@ -80,6 +80,7 @@ function harness() {
   return { admin, saved, rpcCalls, signals, client, renders: () => renders,
     groups: () => adminContext.api.groupedActiveRequests(),
     resolve(ids) { ids.forEach(id => { saved.get(id).status = 'resolved'; }); adminContext.api.receiveAdminRequests(ids.map(id => ({ ...saved.get(id) }))); },
+    allowNewWrites() { gate = null; },
     pause() { let release; gate = new Promise(resolve => { release = resolve; }); return () => { release(); gate = null; }; }
   };
 }
@@ -144,4 +145,12 @@ test('una mesa recién escaneada y sin consumo envía mesero y canción en cuant
  assert.ok(h.rpcCalls.every(call=>call.name==='createServiceRequestsBatch'));
  assert.ok(h.rpcCalls.flatMap(call=>call.payload.requests).every(row=>row.session_id===null));
  assert.equal(guest.state.currentSession,null,'No hace falta ocupar ni cobrar una mesa para enviar llamados.');
+});
+
+test('un envío anterior detenido no retiene el siguiente llamado ni duplica IDs al terminar',async()=>{
+ const h=harness(),guest=h.client('a'),release=h.pause();guest.api.createRequest('waiter');await new Promise(setImmediate);
+ assert.equal(h.rpcCalls.length,1);h.allowNewWrites();guest.api.createRequest('waiter');
+ assert.equal(h.rpcCalls.length,2,'El nuevo llamado inicia su escritura sin esperar a que termine el anterior.');
+ await guest.drain();assert.equal(h.saved.size,1,'El segundo llamado llega mientras la primera escritura continúa detenida.');release();await guest.drain();assert.equal(h.saved.size,2);assert.equal(h.signals.flat().length,2);
+ assert.equal(guest.state.requestOutboxInFlight.size,0);
 });

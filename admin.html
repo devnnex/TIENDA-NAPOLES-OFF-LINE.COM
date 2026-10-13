@@ -369,7 +369,7 @@
         <div class="section-head inventory-heading">
           <div>
             <span class="eyebrow">Auditoria exacta</span>
-            <h2 class="movement-view-tabs" role="tablist" aria-label="Ver movimientos"><button type="button" role="tab" data-movement-view="inventory" aria-selected="true" aria-controls="inventoryMovementList">Movimientos de inventario</button><button type="button" role="tab" data-movement-view="sales" aria-selected="false" aria-controls="inventoryMovementList">Movimientos de ventas</button></h2>
+            <h2>Movimientos de inventario</h2>
             <p>Entradas, salidas, productos nuevos y devoluciones con fecha, hora y responsable.</p>
           </div>
           <div class="inventory-heading-actions">
@@ -380,20 +380,7 @@
         <div class="movement-summary" id="movementSummary"></div>
         <div class="panel movement-panel">
           <div class="inventory-toolbar">
-            <label class="inventory-search">
-              <span>Buscar producto, referencia o responsable</span>
-              <span class="inventory-search-control"><i data-lucide="search"></i><input id="movementSearch" type="search" autocomplete="off" placeholder="Ej. cerveza, venta o nombre"></span>
-            </label>
             <label>Producto<select id="movementProductFilter"><option value="all">Todos los productos</option></select></label>
-            <label>Desde<input id="movementDateFrom" type="date"></label>
-            <label>Hasta<input id="movementDateTo" type="date"></label>
-            <label>Tipo
-              <select id="movementTypeFilter">
-                <option value="all">Todos</option>
-                <option value="entry">Entradas</option>
-                <option value="exit">Salidas</option>
-              </select>
-            </label>
           </div>
           <p class="purchase-filter-feedback" id="movementTotalsFeedback" aria-live="polite"></p>
           <div class="movement-list" id="inventoryMovementList"></div>

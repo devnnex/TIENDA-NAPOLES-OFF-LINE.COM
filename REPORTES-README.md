@@ -17,15 +17,19 @@ del servicio de inventario para respetar los ajustes concurrentes.
 Ventas exporta PDF del filtro, fecha o turno seleccionado y recorre todas las
 páginas online. Compras también exporta PDF con resumen por producto y detalle.
 Sin conexión se identifica la copia disponible y las ventas parciales.
-Movimientos conserva sus tres KPI y permite cambiar entre inventario y ventas
-con dos pestañas de texto. Producto y fechas filtran los registros cargados en
-memoria sin consultar otra vez el backend. La vista de ventas agrupa por cuenta
-cobrada y producto; incluye las ventas y movimientos disponibles en ese equipo,
-no promete sumar páginas de historial que todavía no se hayan cargado. Solo
-exportar Compras en PDF completa el historial remoto. Los borrados del respaldo
-se concilian con la UI, y eliminar una venta retira sus movimientos de los
-reportes sin cambiar la restauración de existencias ni los registros de auditoría.
-Las solicitudes, el chat y los límites de canciones conservan su canal independiente.
+Movimientos conserva su lista y tres KPI. Solo el selector de producto filtra
+la copia cargada; no consulta facturas ni une dos reportes para mostrar filas.
+Las cantidades retiradas se muestran positivas. Al elegir un producto, la
+tarjeta indica «De este producto has vendido» con la cantidad de salidas que
+ya contiene esa lista; no es una consulta adicional de facturas cobradas.
+Acepta respuestas anteriores del respaldo sin metadatos de paginación. Los
+borrados y las ventas eliminadas conservan su conciliación y restauración de stock.
+
+Las solicitudes tienen un lector independiente de cuentas y reportes cada
+segundo y reciben avisos de inmediato. El canal público de avisos y el de
+cambios de datos se recuperan por separado. En el cliente un envío lento no
+detiene el siguiente. Solo se muestran avisos confirmados por el backend;
+el chat y el límite de cinco canciones conservan su comportamiento.
 
 El selector de consumo conserva el producto al actualizarse la lista y las
 vueltas se muestran en letra y número más grandes. La caja automática conserva

@@ -22,10 +22,10 @@ function fixture(){
  });
  vm.runInContext(block('movementBelongsToSale','mergeConfirmedIncomeReport')
   +block('filteredMovementRows','renderMovementProductOptions')
-  +block('loadMovementSalesTotals','movementSoldUnits')
+  +block('movementViewRows','renderMovementTotals')
   +(offline?block('pendingInventoryMovementIds','resetInventoryForm'):slice('  let movementRefreshPending =','  const resetInventoryForm ='))
   +block('deleteIncomeSale','replaceEditedIncomeRecord')
-  +';globalThis.api={loadInventoryMovements,mergeConfirmedMovements,removeDeletedSaleMovements,loadMovementSalesTotals,filteredMovementRows,movementViewRows,deleteIncomeSale};',context);
+  +';globalThis.api={loadInventoryMovements,mergeConfirmedMovements,removeDeletedSaleMovements,filteredMovementRows,movementViewRows,deleteIncomeSale};',context);
  return {state,context,jobs,mirror,calls,controls,saved,api:context.api,setResponse:value=>{response=value;},hold(){let release;gate=new Promise(resolve=>{release=resolve;});return()=>{gate=null;release();};}};
 }
 const movement=(id,extras={})=>({movementId:id,productId:'p',product:'Agua',delta:-2,type:'CONSUMO_MESA',sessionId:'session-a',date:'2026-10-13T18:00:00Z',...extras});
@@ -37,6 +37,12 @@ test('una respuesta vacía elimina movimientos borrados directamente del backend
  assert.equal(await h.api.loadInventoryMovements(),true);assert.equal(h.state.inventoryMovements.length,0);
  assert.equal(Object.keys(h.mirror.movements).length,0);assert.deepEqual(h.calls,['get_inventory_movements']);
  assert.equal(h.api.mergeConfirmedMovements([]).length,0,'Otra actualización no revive la réplica retirada.');
+});
+test('movimientos válidos de un respaldo anterior se muestran aunque no incluya revisión ni paginación',async()=>{
+ const h=fixture();h.setResponse({ok:true,movements:[movement('legacy')]});
+ assert.equal(await h.api.loadInventoryMovements(),true);
+ assert.deepEqual(Array.from(h.state.inventoryMovements,row=>row.movementId),['legacy']);
+ assert.equal(h.state.movementLoading,false);
 });
 test('un borrado parcial retira solamente la fila omitida y conserva cambios locales durante la lectura',async()=>{
  const h=fixture();h.state.inventoryMovements=[movement('keep'),movement('removed')];
@@ -50,20 +56,17 @@ test('un borrado remoto no descarta movimientos que todavía están en la cola n
  h.mirror.movements.new=movement('new',{reportConfirmedAt:'2099-01-01T00:00:00Z'});
  await h.api.loadInventoryMovements();assert.deepEqual(Array.from(h.state.inventoryMovements,row=>row.movementId).sort(),['new','pending']);
 });
-test('las tres tarjetas totalizan el producto y cambiar a ventas agrupa líneas cobradas sin pedir datos de red',()=>{
- const h=fixture();h.state.inventoryMovements=[movement('consume'),movement('manual',{sessionId:'',delta:10,type:'ENTRADA_UNIDADES'})];
- h.state.invoiceHistory=[sale];h.state.incomeReport={records:[sale]};h.api.loadMovementSalesTotals();
- h.state.movementView='sales';let rows=h.api.filteredMovementRows();
- assert.equal(rows.length,1);assert.equal(rows[0].delta,-5);assert.equal(rows[0].total,500);assert.equal(rows[0].type,'VENTA_COBRADA');
- h.state.movementProductFilter='other';assert.equal(h.api.filteredMovementRows().length,0);
- h.state.movementProductFilter='p';assert.equal(h.api.filteredMovementRows().length,1);
- h.state.movementView='inventory';assert.equal(h.api.filteredMovementRows().length,2);assert.equal(h.calls.length,0);
+test('el selector suma únicamente movimientos cargados del producto, sin unir facturas ni pedir datos de red',()=>{
+ const h=fixture();h.state.inventoryMovements=[movement('consume'),movement('manual',{sessionId:'',delta:10,type:'ENTRADA_UNIDADES'}),movement('other',{productId:'q',delta:-9})];
+ h.state.movementProductFilter='p';let rows=h.api.filteredMovementRows();
+ assert.equal(rows.length,2);assert.equal(rows.filter(row=>row.delta<0).reduce((sum,row)=>sum+Math.abs(row.delta),0),2);
+ h.state.movementProductFilter='q';assert.equal(h.api.filteredMovementRows().length,1);
+ h.state.movementProductFilter='all';assert.equal(h.api.filteredMovementRows().length,3);assert.equal(h.calls.length,0);
 });
 test('eliminar una venta oculta su consumo y devolución, conserva ajustes ajenos y evita que lecturas antiguas los restauren',()=>{
  const h=fixture();h.mirror.deleted['sale-a']='2026-10-13';h.mirror.deletedSaleLinks={'sale-a':{sessionId:'session-a',invoice:'TN-1'}};
  const rows=[movement('consume'),movement('SALE-sale-a-p'),movement('DELETE-SALE-sale-a-p',{type:'VENTA_ELIMINADA',delta:2}),movement('manual',{sessionId:'',type:'ENTRADA_UNIDADES',delta:10})];
  assert.deepEqual(Array.from(h.api.mergeConfirmedMovements(rows),row=>row.movementId),['manual']);
- h.state.invoiceHistory=[sale];h.api.loadMovementSalesTotals();assert.equal(h.state.movementSalesRecords.length,0);
 });
 test('la eliminación confirmada por backend se reconoce aunque el navegador no recibiera el aviso de venta',()=>{
  const h=fixture();const rows=[movement('consume'),movement('DELETE-SALE-sale-a-p',{type:'VENTA_ELIMINADA',reference:'TN-1'}),movement('other',{sessionId:'other-session'})];
@@ -86,11 +89,10 @@ if(!offline)test('si el backend rechaza borrar una venta se restauran también s
  await h.api.deleteIncomeSale({sale_id:{value:'sale-a'}});
  assert.equal(h.state.inventoryMeta.p.stock,10);assert.equal(h.state.incomeReport.records.length,1);
  assert.equal(h.state.inventoryMovements.length,1);assert.equal(h.mirror.deleted['sale-a'],undefined);
- h.api.loadMovementSalesTotals();assert.equal(h.state.movementSalesRecords.length,1);
 });
 test('entrar y filtrar no inicia consultas completas de ventas o movimientos y mantiene tres KPI',()=>{
  assert.doesNotMatch(block('showAdminSection','ensureOpenSession'),/loadMovementSalesTotals\(|ensureCompleteMovementHistory\(/);
- const a=source.indexOf('    const updateMovementFilters ='),b=source.indexOf('    $("#exportPurchasesPdf")',a);
+ const a=source.indexOf('    $("#movementProductFilter")?.addEventListener'),b=source.indexOf('    $("#exportPurchasesPdf")',a);
  assert.doesNotMatch(source.slice(a,b),/appsScriptRequest\(|ensureCompleteMovementHistory\(|loadIncomeReport\(/);
  assert.equal((block('renderMovementTotals','buildBusinessReportPdf').match(/<article /g)||[]).length,3);
  assert.ok(!fs.readFileSync(path.join(__dirname,'../admin.html'),'utf8').includes('id="completeMovementHistory"'));

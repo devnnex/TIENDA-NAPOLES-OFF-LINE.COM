@@ -1,7 +1,7 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.17.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.18.exe` con Inno Setup 6.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el
@@ -10,6 +10,24 @@ crea un borrador, sube y verifica el archivo y después lo marca como la última
 publicación. Una versión antigua no desplaza una más reciente. Para cada cambio
 del paquete incrementa la versión, compila y sube el nuevo `.exe`. También se
 puede ejecutar el workflow manualmente desde Actions. No modifica la landing.
+
+La versión 1.0.18 añade a cada venta el botón de reimprimir factura de BCA,
+incluidos los abonos disponibles de la cuenta, sin volver a cobrar ni modificar
+el inventario. Los avisos de escritura confirmada inician las consultas de Ventas
+y Movimientos en paralelo sin una consulta previa de estado ni esperar Inventario.
+Un aviso recibido durante una lectura provoca otra consulta al terminar. La
+consulta periódica por revisiones sigue como respaldo. Al recuperar internet,
+las operaciones listas se envían mientras arrancan las lecturas; cada venta
+conserva su dependencia del cierre de la cuenta y su identidad de operación.
+Se evita iniciar dos envíos simultáneos de la misma cola tras el guardado durable.
+
+En ambos proyectos, el cobro con o sin impresión abre automáticamente solo la caja
+local y solo si el pago actual incluye efectivo positivo. Un abono en efectivo
+también abre la caja local al confirmarse, antes de reconstruir la interfaz; un
+reintento reconocido como duplicado no vuelve a abrirla. Un dispositivo distinto
+del PC conectado no solicita apertura remota automáticamente. La reimpresión
+no abre la caja. Conserva el control de apertura manual existente. No requiere
+SQL ni cambios o despliegues de Apps Script. La caché de Offline pasa a v46.
 
 La versión 1.0.17 extiende la protección frente a consultas atrasadas a Marca,
 mesas, catálogo, usuarios y movimientos. Conserva los cambios locales hechos

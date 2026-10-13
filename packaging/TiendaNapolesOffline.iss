@@ -1,5 +1,5 @@
 #define AppName "Tienda Nápoles Offline"
-#define AppVersion "1.0.17"
+#define AppVersion "1.0.18"
 
 [Setup]
 AppId={{1B759C3D-EEAC-42F1-8C91-A400775027C1}

@@ -49,7 +49,9 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
     sendCashDrawerPulse: async () => { calls.push('drawer'); return true; },
     dbQuiet: async query => (await query).data,
     toast: () => {}, tipsEnabled: () => false,
-    paymentFromForm: () => validPayment ? { method, payments: [{ method, amount: state.activePaymentTotal }] } : null,
+    paymentFromForm: () => validPayment ? { method, payments: method === 'mixed'
+      ? [{ method: 'cash', amount: state.activePaymentTotal / 2 }, { method: 'breb', amount: state.activePaymentTotal / 2 }]
+      : [{ method, amount: state.activePaymentTotal }] } : null,
     currencyInputNumber: (input) => Number(input?.value || 0), integerMoney: (value) => Number(value),
     paidInventoryPlan: () => [], validatePaidInventory: () => validStock,
     sessionTotals: () => ({ subtotal: 100, total: 100 }), uid: () => 'invoice-1',
@@ -78,20 +80,23 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
 
 for (const method of ['cash', 'transfer', 'breb', 'mixed']) {
   for (const action of ['save', 'print']) {
-    test(`cobro ${method}/${action}: abre una vez y solo imprime cuando se solicita`, async () => {
+    test(`cobro ${method}/${action}: abre solo con efectivo y solo imprime cuando se solicita`, async () => {
       const app = setup({ method });
       const saving = app.context.api.processPayment(app.form, { value: action });
       await new Promise(setImmediate);
-      assert.equal(app.calls.filter((call) => call === 'drawer').length, 1);
+      const expectedPulses = ['cash', 'mixed'].includes(method) ? 1 : 0;
+      assert.equal(app.calls.filter((call) => call === 'drawer').length, expectedPulses);
       assert.equal(app.calls.filter((call) => call === 'print').length, action === 'print' ? 1 : 0);
       assert.equal(app.calls.includes('popup'), action === 'print');
-      assert.ok(app.calls.indexOf('storage') < app.calls.indexOf('drawer'));
-      assert.ok(app.calls.indexOf('drawer') < app.calls.indexOf('render-inventory'), 'El pulso sale antes de reconstruir la interfaz.');
+      if (expectedPulses) {
+        assert.ok(app.calls.indexOf('storage') < app.calls.indexOf('drawer'));
+        assert.ok(app.calls.indexOf('drawer') < app.calls.indexOf('render-inventory'), 'El pulso sale antes de reconstruir la interfaz.');
+      }
       assert.equal(app.dialog.open, false);
       assert.equal(app.state.invoiceHistory.length, 1);
       // El hardware actua sin esperar la confirmacion remota, tambien offline.
       await app.context.api.processPayment(app.form, { value: action });
-      assert.equal(app.calls.filter((call) => call === 'drawer').length, 1);
+      assert.equal(app.calls.filter((call) => call === 'drawer').length, expectedPulses);
       app.finishClose({ saved: { id: 'session-1' } });
       await saving;
     });
@@ -116,6 +121,19 @@ test('la apertura manual explícita conserva su comportamiento', async () => {
   const app = setup({ device: 'mobile' });
   assert.equal(await app.context.api.openCashDrawer(), true);
   assert.equal(app.calls.filter(call => call === 'request_pos_drawer').length, 1);
+});
+
+test('un pago mixto sin efectivo no abre la caja', async () => {
+  const app=setup({method:'mixed'});
+  app.context.paymentFromForm=()=>({method:'mixed',payments:[{method:'transfer',amount:50},{method:'breb',amount:50}]});
+  const saving=app.context.api.processPayment(app.form,{value:'save'});await new Promise(setImmediate);
+  assert.equal(app.calls.includes('drawer'),false);app.finishClose({});await saving;
+});
+
+test('una cuenta ya abonada por completo no vuelve a abrir la caja al cerrarla', async () => {
+  const app=setup();app.state.sessions[0].session_payments=[{id:'paid',amount:100,payment_method:'cash'}];app.state.activePaymentTotal=0;
+  const saving=app.context.api.processPayment(app.form,{value:'save'});await new Promise(setImmediate);
+  assert.equal(app.calls.includes('drawer'),false);app.finishClose({});await saving;
 });
 
 for (const options of [{ validPayment: false }, { validStock: false }, { received: 99 }, { savedLocally: false }, { duplicate: true }]) {

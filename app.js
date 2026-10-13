@@ -2618,7 +2618,7 @@ const App = (() => {
         appsScriptStatusEpoch += 1;
         appsScriptStatusPromise = null;
       }
-      if (result?.ok && ["record_sale", "edit_sale", "delete_sale", "clear_income"].includes(action)) {
+      if (result?.ok && ["record_sale", "edit_sale", "delete_sale", "clear_income", "adjust_inventory", "upsert_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "clear_inventory_movements"].includes(action)) {
         window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
       }
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
@@ -2631,7 +2631,7 @@ const App = (() => {
   };
 
   const readAppsScriptStatus = (force = false) => {
-    if (!force && appsScriptStatusResult && Date.now() - appsScriptStatusAt < 5000) {
+    if (!force && appsScriptStatusResult && Date.now() - appsScriptStatusAt < 1500) {
       return Promise.resolve(appsScriptStatusResult);
     }
     if (appsScriptStatusPromise) return appsScriptStatusPromise;
@@ -2775,6 +2775,7 @@ const App = (() => {
   const runAppsScriptOutbox = async (force = false) => {
     if (state.appsScriptOutboxBusy || !isAppsScriptConfigured()) return false;
     await flushDurableWrites();
+    if (state.appsScriptOutboxBusy) return false;
     state.appsScriptOutboxBusy = true;
     let activeJob = null;
     try {
@@ -2997,9 +2998,10 @@ const App = (() => {
       if (readAppsScriptOutbox().length) {
         void flushAppsScriptOutbox();
       }
-      const synced = await syncInventoryWithAppsScript();
       const purchasesOpen = Boolean($("#purchaseHistoryDialog")?.open);
-      if (state.activeAdminSection === "movements" || purchasesOpen) await loadInventoryMovements();
+      const movementRead = state.activeAdminSection === "movements" || purchasesOpen
+        ? loadInventoryMovements({ background: true }) : Promise.resolve(false);
+      const [synced] = await Promise.all([syncInventoryWithAppsScript(), movementRead]);
       if (purchasesOpen) {
         renderPurchaseProductOptions();
         renderPurchaseHistory();
@@ -3017,6 +3019,8 @@ const App = (() => {
     inventoryPeerRefreshPending = true;
     if (inventoryPeerRefreshPromise) return inventoryPeerRefreshPromise;
     inventoryPeerRefreshPromise = (async () => {
+      const movementRefresh = state.activeAdminSection === "movements"
+        ? loadInventoryMovements({ background: true, force: true }) : Promise.resolve(false);
       do {
         inventoryPeerRefreshPending = false;
         if (inventoryReadPromise) await inventoryReadPromise;
@@ -3024,7 +3028,7 @@ const App = (() => {
         inventoryPeerRefreshPending = false;
         await syncInventoryWithAppsScript();
       } while (inventoryPeerRefreshPending);
-      if (state.activeAdminSection === "movements") await loadInventoryMovements();
+      await movementRefresh;
       return true;
     })().finally(() => {
       inventoryPeerRefreshPromise = null;
@@ -3041,6 +3045,10 @@ const App = (() => {
       void flushPeerRefreshes();
       const startedAt = performance.now();
       recordSyncEvent("sync-cycle-started", { destination: "all", action: reason });
+      // Las ventas listas pueden enviarse sin esperar el resto de las lecturas.
+      // La cola conserva la dependencia del cierre de su cuenta en Supabase.
+      const appsScriptFlush = state.page === "admin" && navigator.onLine
+        ? flushAppsScriptOutbox(true) : Promise.resolve(false);
       // Las lecturas independientes comienzan de inmediato. Una operación
       // pendiente de una entidad no debe congelar toda la aplicación.
       const coreRefresh = refreshCoreNow();
@@ -3075,6 +3083,7 @@ const App = (() => {
       }
       if (state.page === "client" && state.currentTable) await hydrateSelectedTable(state.currentTable.id);
       await initialReads;
+      await appsScriptFlush;
       const finalCounts = await getOfflineSyncStatus();
       const requiredFresh = requiredSyncDomains();
       const cleanQueue = finalCounts.controllerAvailable
@@ -5191,6 +5200,7 @@ const App = (() => {
       session.session_payments = [...sessionPayments(session).filter((row) => row.id !== id), data.payment];
       if (typeof persistOfflineAdminSnapshot === "function") persistOfflineAdminSnapshot();
       if (typeof flushDurableWrites === "function") await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
+      if (form.payment_method.value === "cash" && !data.duplicate) void openCashDrawer({ localOnly: true });
       delete form.dataset.paymentId; $("#abonoDialog")?.close();
       state.accountsRenderSignature = ""; state.adminSnapshotSignature = "";
       if (!data.payment._offline_pending) notifyAdminPeers({ operational:true });
@@ -5201,7 +5211,6 @@ const App = (() => {
         if (wasVisible) setTableConsumptionPreviewVisible(true);
       }
       toast("Abono guardado: " + money(amount) + ". Saldo: " + money(sessionBalance(session)), "ok", "abono:" + id);
-      if (form.payment_method.value === "cash") void openCashDrawer({ localOnly: true });
     } catch (error) {
       toast(error?.message || "No se pudo confirmar el abono. Revisa el registro antes de volver a intentarlo.", "error", "abono-failed");
     } finally { delete form.dataset.saving; button.disabled = false; }
@@ -6389,8 +6398,9 @@ const App = (() => {
   };
 
   let movementLoadPromise = null;
-  const loadInventoryMovements = () => {
-    if (movementLoadPromise) return movementLoadPromise;
+  let movementRefreshPending = false;
+  const loadInventoryMovements = ({ force = false } = {}) => {
+    if (movementLoadPromise) { if (force) movementRefreshPending = true; return movementLoadPromise; }
     movementLoadPromise = (async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
     if (readAppsScriptOutbox().some((job) => job.action === "clear_inventory_movements")) {
@@ -6427,7 +6437,13 @@ const App = (() => {
       void updateGlobalSyncStatus();
       return false;
     }
-    })().finally(() => { movementLoadPromise = null; });
+    })().finally(() => {
+      movementLoadPromise = null;
+      if (movementRefreshPending) {
+        movementRefreshPending = false;
+        window.setTimeout(() => void loadInventoryMovements({ force: true }), 0);
+      }
+    });
     return movementLoadPromise;
   };
 
@@ -7276,7 +7292,7 @@ const App = (() => {
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
             <div class="income-record-main">
-              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><div class="income-record-actions"><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button><button class="icon-btn danger" type="button" data-delete-income="${escapeHTML(record.saleId)}" aria-label="Eliminar venta completa">${icon("trash-2", 15)}</button></div></div>
+              <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><div class="income-record-actions"><button class="icon-btn" type="button" data-print-income="${escapeHTML(record.saleId)}" aria-label="Imprimir factura" title="Imprimir factura">${icon("printer", 15)}</button><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button><button class="icon-btn danger" type="button" data-delete-income="${escapeHTML(record.saleId)}" aria-label="Eliminar venta completa">${icon("trash-2", 15)}</button></div></div>
               <div><small class="income-sale-type" data-sale-type="${incomeRecordSaleType(record)}">${escapeHTML(incomeSaleTypeLabel(incomeRecordSaleType(record)))}</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
               <div><small>Atendido por</small><strong>${escapeHTML(record.waiter || "Sin asignar")}</strong><span>${escapeHTML(record.reference || "Sin referencia")}</span></div>
               <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span class="income-record-profit">Ganancia ${money(record.profit)}</span></div>
@@ -7306,7 +7322,7 @@ const App = (() => {
   const loadIncomeReport = async ({ background = false, force = false, verifiedConnection = false } = {}) => {
     if (!$("#income") || !canAccessAdminSection("income")) return false;
     if (state.incomeLoading) {
-      if (!background) state.incomeReloadRequested = true;
+      if (force || !background) state.incomeReloadRequested = true;
       return false;
     }
     const filters = incomeFiltersFromForm();
@@ -7429,7 +7445,7 @@ const App = (() => {
         state.incomeLoading = false;
         if (state.incomeReloadRequested) {
           state.incomeReloadRequested = false;
-          window.setTimeout(() => void loadIncomeReport(), 0);
+          window.setTimeout(() => void loadIncomeReport({ background: Boolean(state.incomeReport), force: true }), 0);
         }
       }
     }
@@ -7441,11 +7457,30 @@ const App = (() => {
     const canCheckMovements = canAccessAdminSection("movements");
     if ((!canCheckIncome && !canCheckInventory && !canCheckMovements) || !isAppsScriptConfigured() || !navigator.onLine) return false;
     const now = Date.now();
-    if (state.backgroundReportSyncBusy) {
-      if (force) state.backgroundReportForcePending = true;
-      return false;
+    if (force) {
+      if (state.confirmedReportSyncBusy) { state.backgroundReportForcePending = true; return false; }
+      state.confirmedReportSyncBusy = true;
+      try {
+        const refreshes = [];
+        if (canCheckIncome && !readAppsScriptOutbox().some((job) => job.action === "clear_income")) {
+          refreshes.push(loadIncomeReport({ background: Boolean(state.incomeReport), force: true }));
+        }
+        if (canCheckMovements || (canCheckInventory && $("#purchaseHistoryDialog")?.open)) {
+          refreshes.push(loadInventoryMovements({ background: true, force: true }));
+        }
+        return (await Promise.all(refreshes)).some(Boolean);
+      } catch (_) { return false; }
+      finally {
+        state.confirmedReportSyncBusy = false;
+        if (state.backgroundReportForcePending) {
+          state.backgroundReportForcePending = false;
+          window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+        }
+      }
     }
-    if (!force && now - state.backgroundReportCheckedAt < 5000) return false;
+    if (state.confirmedReportSyncBusy) return false;
+    if (state.backgroundReportSyncBusy) return false;
+    if (!force && now - state.backgroundReportCheckedAt < 1500) return false;
     state.backgroundReportSyncBusy = true;
     state.backgroundReportCheckedAt = now;
     try {
@@ -7476,10 +7511,6 @@ const App = (() => {
       return false;
     } finally {
       state.backgroundReportSyncBusy = false;
-      if (state.backgroundReportForcePending) {
-        state.backgroundReportForcePending = false;
-        window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
-      }
     }
   };
 
@@ -9028,6 +9059,72 @@ const App = (() => {
     return printThermalReceipt(receipt.session, receipt.invoice);
   };
 
+  const printIncomeReceipt = async (saleId) => {
+    const record = state.incomeReport?.records?.find((entry) => String(entry.saleId) === String(saleId));
+    if (!record) {
+      toast("No se encontro la venta para imprimir.", "error", `income-receipt-missing:${saleId}`);
+      return false;
+    }
+    const receiptWindow = window.open("", "_blank", "width=420,height=720");
+    const storedInvoice = state.invoiceHistory.find((entry) => String(entry.id || entry.sessionId) === String(record.saleId));
+    const tableName = String(record.table || storedInvoice?.table || "Venta individual").trim() || "Venta individual";
+    const isWalkIn = normalizeText(tableName) === "venta individual";
+    const items = (record.items || []).map((item) => ({
+      id: item.lineId || item.id || "",
+      menu_item_id: item.menuItemId || item.menu_item_id || null,
+      item_name: item.name || item.item_name || "Producto",
+      quantity: Number(item.quantity || 0),
+      unit_price: Number(item.unitPrice ?? item.unit_price ?? 0),
+      status: "confirmed"
+    }));
+    const subtotal = Number(record.subtotal || 0);
+    const discount = Number(record.discount || 0);
+    const tax = Number(record.tax || 0);
+    const serviceFee = Number(record.service || 0);
+    const total = Number(record.total || 0);
+    const baseTotal = Math.max(0, subtotal - discount + tax + serviceFee);
+    const tipAmount = Math.max(0, total - baseTotal);
+    const payments = (record.payments || []).map((payment) => ({
+      method: payment.method,
+      amount: Number(payment.amount || 0)
+    }));
+    const invoice = {
+      id: record.saleId,
+      number: record.invoice || "Factura",
+      sessionId: record.sessionId || storedInvoice?.sessionId || record.saleId,
+      table: tableName,
+      createdAt: record.date,
+      payerName: record.payer || "",
+      waiterName: record.waiter || "",
+      paymentMethod: record.isMixed || payments.length > 1 ? "mixed" : (payments[0]?.method || storedInvoice?.paymentMethod || "cash"),
+      payments,
+      reference: record.reference || "",
+      withTip: tipAmount > 0,
+      tipAmount,
+      tipPercentage: baseTotal > 0 ? Math.round(tipAmount / baseTotal * 10000) / 100 : 0,
+      baseTotal,
+      cashReceived: storedInvoice?.cashReceived ?? null,
+      changeDue: storedInvoice?.changeDue ?? 0,
+      totals: { subtotal, discount, tax, serviceFee, total },
+      items
+    };
+    const session = {
+      id: invoice.sessionId,
+      table_id: isWalkIn ? null : (storedInvoice?.tableId || "income-history"),
+      sale_channel: isWalkIn ? "walk_in" : (storedInvoice?.saleChannel || "table"),
+      payer_name: record.payer || "",
+      assigned_waiter: { full_name: record.waiter || "Equipo" },
+      restaurant_tables: isWalkIn ? null : { table_name: tableName },
+      session_items: items
+    };
+    // Muestra el documento enseguida mientras se recuperan abonos no guardados localmente.
+    if (receiptWindow) { receiptWindow.document.open(); receiptWindow.document.write(thermalReceiptHtml(session, invoice)); receiptWindow.document.close(); }
+    const ledger = Array.isArray(storedInvoice?.prepayments) ? { payments: storedInvoice.prepayments }
+      : invoice.sessionId ? await dbQuiet(state.sb.rpc("get_session_payments", { p_session_id: invoice.sessionId, auth_token: state.authToken }), null) : null;
+    if (ledger?.payments?.length) { invoice.prepayments = ledger.payments; invoice.remainingPaid = Math.max(0, Number(invoice.totals.total || 0) - ledger.payments.reduce((sum,row) => sum + Number(row.amount || 0),0)); }
+    return printThermalReceipt(session, invoice, receiptWindow);
+  };
+
   const bindPaymentConfirmShortcut = () => {
     const dialog = $("#paymentDialog");
     const form = $("#paymentForm");
@@ -9184,7 +9281,7 @@ const App = (() => {
       return;
     }
     // El pulso sale al confirmar el guardado, antes de reconstruir la interfaz.
-    void openCashDrawer({ localOnly: true });
+    if (payment.payments.some((row) => row.method === "cash" && Number(row.amount) > 0)) void openCashDrawer({ localOnly: true });
     const closePromise = closeSession(session.id, { paid: checkoutPaid, totals });
     $("#paymentDialog")?.close();
     renderInventory();
@@ -10827,6 +10924,7 @@ const App = (() => {
         state.incomeVisibleCount += 60;
         renderIncomeReport();
       }
+      if (target.dataset.printIncome) void printIncomeReceipt(target.dataset.printIncome);
       if (target.dataset.editIncome) openIncomeEdit(target.dataset.editIncome);
       if (target.dataset.deleteIncome) openDeleteIncomeDialog(target.dataset.deleteIncome);
       if (target.id === "refreshIncomeReport") await runRefreshAction(target, async () => {
@@ -12050,6 +12148,7 @@ const App = (() => {
 
   const resumeRealtimeReception = () => {
     if (document.hidden) return;
+    void flushPeerRefreshes();
     if (state.page === "client" && state.currentTable) {
       subscribeClient();
       void state.clientLiveRefresh?.();

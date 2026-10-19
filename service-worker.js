@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v51";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v53";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -9,7 +9,7 @@ const MAX_RETRY_DELAY_MS = 30_000;
 const BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
 const DYNAMIC_BRAND_ASSETS = new Set(["pwa-manifest.webmanifest", "pwa-icon-192.png", "pwa-icon-512.png"]);
 const APP_SHELL = [
-  "./", "./index.html", "./admin.html", "./app.js", "./sales-shift.js", "./style.css",
+  "./", "./index.html", "./admin.html", "./app.js", "./menu-cards.js", "./menu-cards.css", "./sales-shift.js", "./style.css",
   "./manifest.webmanifest", "./pwa-icon.svg", "./tienda-napoles.ico", "./sound/alarm.mp3",
   "./sound/receipt-received.mp3", "./images/check.png", "./images/mesero.png",
   "./vendor/supabase-js.min.js", "./vendor/lucide.min.js",
@@ -71,10 +71,12 @@ const withStore = async (mode, action) => {
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(OFFLINE_STORE, mode);
     const request = action(transaction.objectStore(OFFLINE_STORE));
-    request.onsuccess = () => resolve(request.result);
+    let result;
+    request.onsuccess = () => { result = request.result; };
     request.onerror = () => reject(request.error);
-    transaction.oncomplete = () => database.close();
-    transaction.onerror = () => reject(transaction.error);
+    transaction.oncomplete = () => { database.close(); resolve(result); };
+    transaction.onerror = () => { database.close(); reject(transaction.error); };
+    transaction.onabort = () => { database.close(); reject(transaction.error || new Error("offline_transaction_aborted")); };
   });
 };
 
@@ -316,7 +318,11 @@ const serializeRequest = async (request) => {
       })();
   const entity = url.pathname.includes("/rpc/") ? `rpc:${rpcNameFor(url)}` : url.pathname.split("/").pop();
   const recordIds = extractRecordIds(url, normalized.payload);
+  const headers = new Headers(request.headers);
+  const localCommit = headers.get("x-pos-local-commit") === "1";
+  headers.delete("x-pos-local-commit");
   return {
+    localCommit,
     id: crypto.randomUUID(),
     operationId: crypto.randomUUID(),
     source: "supabase",
@@ -326,7 +332,7 @@ const serializeRequest = async (request) => {
     operationType: request.method,
     url: request.url,
     method: request.method,
-    headers: [...request.headers.entries()],
+    headers: [...headers.entries()],
     body: normalized.body,
     payload: normalized.payload,
     createdAt: new Date().toISOString(),
@@ -487,6 +493,15 @@ const recoverInterruptedEntries = async () => {
     .map((entry) => putEntry({ ...entry, status: "pending", nextAttemptAt: 0 })));
 };
 
+const retryFailedStaffEntries = async () => {
+  const entities = new Set(["table_sessions", "session_items", "menu_items", "menu_categories",
+    "restaurant_tables", "business_settings", "rpc:record_session_payment", "rpc:replay_table_session_change"]);
+  for (const entry of await listEntries()) {
+    if (!entities.has(entry.entity) || !["failed", "conflict"].includes(entry.status)) continue;
+    await putEntry({ ...entry, status: "pending", nextAttemptAt: 0 });
+  }
+};
+
 const notifyClients = async (type, payload = {}) => {
   const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
   windows.forEach((client) => client.postMessage({ type, ...payload }));
@@ -615,7 +630,7 @@ const verifyRestMutation = async (entry) => {
   ["content-type", "content-length", "prefer", "accept-profile"].forEach((name) => headers.delete(name));
   headers.set("Accept", "application/json");
   try {
-    const response = await fetch(url.href, { method: "GET", headers });
+    const response = await fetchWithTimeout(new Request(url.href, { method: "GET", headers }), REMOTE_WRITE_TIMEOUT_MS);
     if (!response.ok) return false;
     const rows = await response.json();
     const received = Array.isArray(rows) ? rows : (rows ? [rows] : []);
@@ -973,6 +988,15 @@ const reconcileTableSessionConflicts = async (authToken, force = false) => {
   return confirmedAny;
 };
 
+let retryQueueTimer = null;
+const scheduleQueueRetry = async () => {
+  clearTimeout(retryQueueTimer);
+  if (!networkAvailable) return;
+  const pending = (await listEntries()).filter(entry => entry.status === "pending");
+  if (!pending.length) return;
+  const nextAt = Math.min(...pending.map(entry => Number(entry.nextAttemptAt || 0)));
+  retryQueueTimer = setTimeout(() => { void flushQueue(); }, Math.max(500, nextAt - Date.now()));
+};
 let flushingQueue = null;
 let forceFlushRequested = false;
 
@@ -1159,6 +1183,7 @@ const flushQueue = (force = false) => {
     forceFlushRequested = false;
     flushingQueue = null;
     if (rerunForced) void flushQueue(true);
+    else void scheduleQueueRetry();
   });
   return flushingQueue;
 };
@@ -1167,7 +1192,7 @@ let mutationRegistration = Promise.resolve();
 const registerMutation = request => {
   const registered = mutationRegistration.then(async () => {
     const entry = await serializeRequest(request), older = await listEntries();
-    const direct = networkAvailable && !older.some(row => row.status !== "confirmed" && writesAreRelated(row, entry));
+    const direct = !entry.localCommit && networkAvailable && !older.some(row => row.status !== "confirmed" && writesAreRelated(row, entry));
     if (direct) { onlineMutationIds.add(entry.id); entry.status = "syncing"; }
     await putEntry(entry); return { entry, direct };
   });
@@ -1207,7 +1232,9 @@ const fetchWithTimeout = async (request, timeoutMs = REMOTE_READ_TIMEOUT_MS) => 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(new Request(request, { signal: controller.signal }));
+    const response = await fetch(new Request(request, { signal: controller.signal }));
+    await response.clone().arrayBuffer();
+    return response;
   } finally {
     clearTimeout(timer);
   }
@@ -1342,6 +1369,7 @@ self.addEventListener("message", (event) => {
   }
   if (event.data?.type === "SET_NETWORK_STATUS") {
     networkAvailable = event.data.online !== false;
+    if (networkAvailable) event.waitUntil(flushQueue(true));
   }
   if (event.data?.type === "FLUSH_OFFLINE_QUEUE") {
     archiveReadConfig = null;
@@ -1353,7 +1381,8 @@ self.addEventListener("message", (event) => {
           invoices: Array.isArray(event.data?.invoices) ? event.data.invoices : [] };
       }
     } catch (_) { /* La configuracion es opcional; sin prueba no se libera el consumo. */ }
-    event.waitUntil(refreshQueuedSessionItemAuth(event.data?.authToken)
+    event.waitUntil((event.data?.retryFailed && event.data?.authToken ? retryFailedStaffEntries() : Promise.resolve())
+      .then(() => refreshQueuedSessionItemAuth(event.data?.authToken))
       .then(() => refreshQueuedTableSessionAuth(event.data?.authToken))
       .then(() => refreshQueuedRequestAuth(event.data?.authToken))
       .then(() => reconcileTableSessionConflicts(event.data?.authToken, event.data?.force === true))

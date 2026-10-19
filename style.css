@@ -3735,7 +3735,7 @@ button:disabled {
 .payment-summary span { align-self: end; font-weight: 750; }
 .payment-summary strong { grid-row: span 2; font-size: clamp(1.8rem, 5vw, 2.55rem); }
 .payment-summary small { color: rgba(255, 255, 255, .65); }
-.payment-methods { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; margin: 0; padding: 0; border: 0; }
+.payment-methods { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .5rem; margin: 0; padding: 0; border: 0; }
 .payment-methods legend { margin-bottom: .5rem; color: #4f5967; font-size: .84rem; font-weight: 750; }
 .payment-methods label { position: relative; }
 .payment-methods input { position: absolute; opacity: 0; pointer-events: none; }
@@ -3892,7 +3892,7 @@ button:disabled {
 .income-kpi.is-loading small { min-height: 16px; border-radius: 8px; background: linear-gradient(90deg, #edf0f3 20%, #f7f8f9 40%, #edf0f3 60%); background-size: 200% 100%; animation: incomeShimmer 1.25s infinite; }
 @keyframes incomeShimmer { to { background-position: -200% 0; } }
 
-.income-payment-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; min-width: 0; }
+.income-payment-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; min-width: 0; }
 .income-payment-grid article { display: grid; grid-template-columns: 1fr auto; gap: .25rem .8rem; min-width: 0; padding: .9rem 1rem; border: 1px solid rgba(18, 24, 31, .08); border-radius: 16px; background: #fff; }
 .income-payment-grid span { display: flex; align-items: center; gap: .4rem; color: #5f6978; font-size: .76rem; font-weight: 800; }
 .income-payment-grid span svg { color: var(--accent); }
@@ -4290,7 +4290,7 @@ button:active, .primary:active, .ghost:active, .icon-btn:active, .chip:active { 
 .cash-change span { font-size: .72rem; font-weight: 800; }
 .cash-change strong { font-size: 1.35rem; }
 .cash-change small { font-size: .68rem; }
-.cash-change.is-sufficient { color: #0e6840; background: #e3f8ec; }
+#cashChange.cash-change.is-sufficient { color: #000000; background: #e3f8ec; }
 .cash-change.is-insufficient { color: #a52a2a; background: #ffebeb; }
 .payment-cash-drawer { width: 100%; justify-content: center; }
 

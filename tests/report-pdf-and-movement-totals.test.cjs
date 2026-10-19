@@ -46,6 +46,46 @@ test('el PDF de compras usa los registros filtrados y el costo por unidad para s
  assert.equal(h.documents.length,1);assert.ok(h.documents[0].name.startsWith('compras-'));assert.ok(h.documents[0].text.includes('660'));
  assert.ok(h.documents[0].text.includes('Resumen por producto'));assert.ok(h.documents[0].text.includes('Detalle de compras'));
 });
+
+test('Compras descarga la selección visible aunque la consulta remota no tenga permiso o conexión',async()=>{
+ let reads=0;const rows=[{productId:'p',product:'Arroz',date:'2026-10-13T17:00:00Z',delta:2,unitCost:1500,user:'Ana'}];
+ const h=harness({purchaseMovements:()=>rows,ensureCompleteMovementHistory:async()=>{reads++;throw Error('No tienes acceso a Movimientos');}});
+ await h.api.exportPurchasesPdf();assert.equal(reads,0);assert.equal(h.documents.length,1);assert.equal(h.messages.length,0);
+ assert.ok(h.documents[0].text.includes('3.000'));assert.ok(h.documents[0].text.includes('Alcance:'));
+ assert.ok(h.documents[0].doc.internal.pageSize.getWidth()>h.documents[0].doc.internal.pageSize.getHeight());
+});
+
+test('Compras aplica producto, fechas, búsqueda y exclusiones iguales a la pantalla',async()=>{
+ const h=harness({normalizeText:value=>String(value).toLowerCase(),businessDateKey:value=>new Date(value).toISOString().slice(0,10),isPurchaseMovement:row=>row.type==='ENTRADA',
+  purchaseHistoryCutoff:()=>NaN,hiddenPurchaseMovementIds:()=>new Set(['hidden'])});
+ Object.assign(h.state,{purchaseProductFilter:'p',purchaseSearch:'proveedor',inventoryMovements:[
+  {movementId:'ok',type:'ENTRADA',productId:'p',product:'Arroz',date:'2026-10-12T17:00:00Z',delta:4,unitCost:1500,reference:'Proveedor A'},
+  {movementId:'hidden',type:'ENTRADA',productId:'p',product:'Oculto',date:'2026-10-12T17:00:00Z',delta:4,unitCost:1500,reference:'Proveedor'},
+  {movementId:'date',type:'ENTRADA',productId:'p',product:'Anterior',date:'2026-09-12T17:00:00Z',delta:4,unitCost:1500,reference:'Proveedor'},
+  {movementId:'other',type:'ENTRADA',productId:'other',product:'Otro producto',date:'2026-10-12T17:00:00Z',delta:4,unitCost:1500,reference:'Proveedor'},
+  {movementId:'query',type:'ENTRADA',productId:'p',product:'Sin coincidencia',date:'2026-10-12T17:00:00Z',delta:4,unitCost:1500,reference:'Compra'},
+  {movementId:'exit',type:'SALIDA',productId:'p',product:'Venta',date:'2026-10-12T17:00:00Z',delta:4,unitCost:1500,reference:'Proveedor'}]});
+ vm.runInContext(block('purchaseMovements','renderPurchaseProductOptions'),h.context);
+ await h.api.exportPurchasesPdf();assert.equal(h.documents.length,1,h.messages.join(';'));
+ const pdf=h.documents[0].text;assert.ok(pdf.includes('6.000'));assert.ok(pdf.includes('Proveedor A'));
+ for(const omitted of ['Oculto','Anterior','Otro producto','Sin coincidencia'])assert.equal(pdf.includes(omitted),false);
+});
+
+test('Compras pagina referencias extensas y conserva los registros, cantidades e importes',async()=>{
+ const rows=Array.from({length:185},(_,i)=>({productId:'p'+i,product:'Producto '+i,date:'2026-10-13T17:00:00Z',delta:1.25,unitCost:12345,user:'Ana',reference:'Referencia '+i+' '+('Detalle largo '.repeat(i===1?300:4))}));
+ const h=harness({purchaseMovements:()=>rows});h.state.movementHasMore=true;h.context.navigator.onLine=false;
+ await h.api.exportPurchasesPdf();assert.equal(h.documents.length,1,h.messages.join(';'));const pdf=h.documents[0];
+ assert.ok(pdf.doc.getNumberOfPages()>5);assert.ok(pdf.text.includes('Producto 184'));
+ assert.ok(pdf.text.includes(money(185*1.25*12345)));assert.ok(pdf.text.includes('sin cargar'));assert.ok(pdf.text.includes('Sin conexi'));
+ assert.ok(pdf.text.trimEnd().endsWith('%%EOF'));assert.equal(h.buttons.exportPurchasesPdf.disabled,false);
+});
+
+test('Compras informa registros vacíos, fechas inválidas y fallos de generación, liberando el botón',async()=>{
+ const h=harness({purchaseMovements:()=>[]});await h.api.exportPurchasesPdf();assert.equal(h.documents.length,0);assert.match(h.messages[0],/No hay compras/);
+ h.state.purchaseDateFrom='2026-11-01';await h.api.exportPurchasesPdf();assert.equal(h.documents.length,0);assert.match(h.messages[1],/fecha inicial/);
+ const failed=harness({purchaseMovements:()=>[{product:'Agua',delta:1,unitCost:2}],window:{}});await failed.api.exportPurchasesPdf();
+ assert.equal(failed.documents.length,0);assert.match(failed.messages[0],/generador PDF/);assert.equal(failed.buttons.exportPurchasesPdf.disabled,false);
+});
 test('un PDF sin conexión indica que contiene una copia parcial de los registros',async()=>{
  const h=harness();h.context.navigator.onLine=false;h.state.incomeReport={filters,records:[sale(1)],totalRecords:5};await h.api.exportIncomeCsv();
  assert.equal(h.documents.length,1);assert.ok(h.documents[0].text.includes('Reporte parcial'));assert.ok(h.documents[0].text.includes('1 de 5'));

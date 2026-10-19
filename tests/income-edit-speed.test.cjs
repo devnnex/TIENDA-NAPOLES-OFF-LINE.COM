@@ -20,7 +20,7 @@ function setup() {
     } }, syncFresh: {} };
   const values = { name: { value: 'Producto' }, quantity: { value: '2' }, price: { value: 10000 } };
   const row = { dataset: { lineId: 'line-1', incomeLine: '0' }, querySelector: selector => values[selector.match(/"(.+)"/)[1]] };
-  const amounts = { edit_payment_cash: { value: 7000 }, edit_payment_transfer: { value: 13000 }, edit_payment_breb: { value: 0 } };
+  const amounts = { edit_payment_cash: { value: 7000 }, edit_payment_transfer: { value: 13000 }, edit_payment_breb: { value: 0 }, edit_payment_card: { value: 0 } };
   const form = { sale_id: { value: 'sale-1' }, table: { value: 'M1' }, date: { value: '2026-10-09T12:00' },
     payer: { value: 'Cliente' }, waiter: { value: 'Mesero' }, payment_method: { value: 'mixed' }, reference: { value: '' },
     elements: { namedItem: name => amounts[name] } };

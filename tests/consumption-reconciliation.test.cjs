@@ -45,6 +45,7 @@ function harness() {
     return query;
   } };
   const context = vm.createContext({ state, Date, Map, Set, uid: randomUUID, REMOTE_CONFIRMATION_HOLD_MS: 15000,
+    retryPosMutation: async factory => (await factory()).data,
     retryQuiet: async factory => (await factory()).data, dbQuiet: async query => (await query).data,
     persistOfflineAdminSnapshot() { backend.cached = { sessions: structuredClone(state.sessions), requests: [] }; }, renderAdminLive() {}, renderAdmin() {}, renderTableConsumptionPreview() {}, renderLastConsumptionTime() {}, toast() {},
     isLocalWalkInSession: row => row.local_only === true, persistWalkInDrafts() {}, askForConfirmation: async () => true,

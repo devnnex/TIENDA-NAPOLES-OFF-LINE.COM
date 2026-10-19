@@ -11,7 +11,8 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261011-sales-shift-v1">
+    <link rel="stylesheet" href="style.css?v=20261019-carta-compras-v1">
+    <link rel="stylesheet" href="menu-cards.css?v=20261019-carta-compras-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="admin">
@@ -83,6 +84,7 @@
           <p class="js-business-subtitle">Gestiona solicitudes, mesas, menu y cuentas.</p>
           <span class="live-status" id="realtimeStatus"><i data-lucide="wifi"></i> Conectando en vivo</span>
           <span class="live-status sync-status is-offline" id="globalSyncStatus" role="status" aria-live="polite" hidden></span>
+          <button class="ghost" id="retryPendingSync" type="button" hidden>Reintentar respaldo</button>
         </div>
         <div class="admin-header-actions">
           <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
@@ -433,7 +435,7 @@
                 <option value="all">Todos los medios</option>
                 <option value="cash">Efectivo</option>
                 <option value="transfer">Transferencia</option>
-                <option value="breb">Bre-B</option>
+                <option value="breb">Bre-B</option><option value="card">Tarjeta</option>
                 <option value="mixed">Pagos mixtos</option>
               </select>
             </label>
@@ -742,6 +744,7 @@
           <label><input type="radio" name="payment_method" value="cash" checked><span><i data-lucide="banknote"></i>Efectivo</span></label>
           <label><input type="radio" name="payment_method" value="transfer"><span><i data-lucide="landmark"></i>Transferencia</span></label>
           <label><input type="radio" name="payment_method" value="breb"><span><i data-lucide="scan-line"></i>Bre-B</span></label>
+          <label><input type="radio" name="payment_method" value="card"><span><i data-lucide="credit-card"></i>Tarjeta</span></label>
           <label><input type="radio" name="payment_method" value="mixed"><span><i data-lucide="split"></i>Mixto</span></label>
         </fieldset>
 
@@ -759,14 +762,14 @@
             <select name="mixed_method_one">
               <option value="cash">Efectivo</option>
               <option value="transfer">Transferencia</option>
-              <option value="breb">Bre-B</option>
+              <option value="breb">Bre-B</option><option value="card">Tarjeta</option>
             </select>
           </label>
           <label>Valor<input name="mixed_amount_one" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input></label>
           <label>Segundo medio
             <select name="mixed_method_two">
               <option value="transfer">Transferencia</option>
-              <option value="breb">Bre-B</option>
+              <option value="breb">Bre-B</option><option value="card">Tarjeta</option>
               <option value="cash">Efectivo</option>
             </select>
           </label>
@@ -900,11 +903,12 @@
       <form class="modal-card" id="incomeEditForm">
         <input type="hidden" name="sale_id">
         <div class="section-head"><div><span class="eyebrow">Correccion auditada</span><h2>Editar venta cerrada</h2></div><button class="icon-btn" type="button" data-close-dialog aria-label="Cerrar"><i data-lucide="x"></i></button></div>
-        <div class="form-grid"><label>Origen / mesa<input name="table" type="text" maxlength="80" required></label><label>Responsable<input name="payer" type="text" maxlength="100"></label><label>Vendido por<input name="waiter" type="text" maxlength="100"></label><label>Fecha y hora<input name="date" type="datetime-local" required></label><label>Medio de pago<select name="payment_method"><option value="cash">Efectivo</option><option value="transfer">Transferencia</option><option value="breb">Bre-B</option><option value="mixed">Mixto</option></select></label><label>Referencia<input name="reference" type="text" maxlength="100"></label></div>
+        <div class="form-grid"><label>Origen / mesa<input name="table" type="text" maxlength="80" required></label><label>Responsable<input name="payer" type="text" maxlength="100"></label><label>Vendido por<input name="waiter" type="text" maxlength="100"></label><label>Fecha y hora<input name="date" type="datetime-local" required></label><label>Medio de pago<select name="payment_method"><option value="cash">Efectivo</option><option value="transfer">Transferencia</option><option value="breb">Bre-B</option><option value="card">Tarjeta</option><option value="mixed">Mixto</option></select></label><label>Referencia<input name="reference" type="text" maxlength="100"></label></div>
         <div class="income-edit-payments" id="incomeEditPayments" hidden>
           <strong>Distribución del pago mixto</strong>
           <label>Efectivo<input name="edit_payment_cash" type="text" inputmode="numeric" data-currency-input value="$0" disabled></label>
           <label>Transferencia<input name="edit_payment_transfer" type="text" inputmode="numeric" data-currency-input value="$0" disabled></label>
+          <label>Tarjeta<input name="edit_payment_card" type="text" inputmode="numeric" data-currency-input value="$0" disabled></label>
           <label>Bre-B<input name="edit_payment_breb" type="text" inputmode="numeric" data-currency-input value="$0" disabled></label>
           <small id="incomeEditPaymentBalance" role="status" aria-live="polite"></small>
         </div>
@@ -933,7 +937,8 @@
     <script defer src="vendor/lucide.min.js"></script>
     <script defer src="vendor/qrcode.min.js"></script>
     <script defer src="vendor/jspdf.umd.min.js"></script>
-    <script defer src="sales-shift.js?v=20261011-sales-shift-v1"></script>
-    <script defer src="app.js?v=20261011-sales-shift-v1"></script>
+    <script defer src="sales-shift.js?v=20261019-pos-integrity-v1"></script>
+    <script defer src="menu-cards.js?v=20261019-carta-compras-v1"></script>
+    <script defer src="app.js?v=20261019-carta-compras-v1"></script>
   </body>
 </html>

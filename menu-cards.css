@@ -1,0 +1,39 @@
+/* Estilos limitados a la biblioteca y al visor de Carta. */
+.menu-cards-admin { margin: 1.25rem 0; border: 1px solid #dce2e8; border-radius: 16px; background: #fff; }
+.menu-cards-admin > summary { padding: 1rem; cursor: pointer; font-weight: 800; }
+.menu-cards-body { padding: 0 1rem 1rem; }
+.menu-cards-body p { line-height: 1.5; }
+.menu-cards-admin .is-error { color: #a52a2a; }
+.menu-card-actions { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.menu-cards-upload, .menu-card-replace { position: relative; cursor: pointer; overflow: hidden; }
+.menu-cards-upload input, .menu-card-replace input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.menu-cards-upload:focus-within, .menu-card-replace:focus-within { outline: 3px solid #2164a6; outline-offset: 3px; }
+.menu-card-item { display: grid; grid-template-columns: 140px minmax(0,1fr); gap: 1rem; padding: 1rem 0; border-top: 1px solid #e4e8ec; }
+.menu-card-preview { width: 140px; height: 180px; object-fit: contain; background: #f4f6f8; border-radius: 8px; }
+.menu-card-fields { display: grid; gap: .8rem; min-width: 0; }
+.menu-card-fields > label { display: flex; gap: .5rem; align-items: center; }
+.menu-card-fields > label:first-child { display: grid; }
+.menu-card-fields input[type="checkbox"] { width: auto; min-height: auto; }
+.menu-card-tables { display: flex; flex-wrap: wrap; gap: .6rem; max-height: 200px; overflow: auto; border: 1px solid #dce2e8; border-radius: 8px; padding: .7rem; }
+.menu-card-tables label { display: flex; align-items: center; gap: .35rem; }
+.menu-cards-admin [hidden], .menu-cards-viewer [hidden] { display: none !important; }
+.menu-cards-viewer { width: min(1100px,96vw); max-width: 96vw; height: min(920px,94dvh); max-height: 94dvh; padding: 0; border: 1px solid #dce2e8; border-radius: 18px; background: #fff; color: #17202b; }
+.menu-cards-viewer[open] { display: grid; grid-template-rows: auto minmax(0,1fr) auto; }
+.menu-cards-viewer::backdrop { background: rgba(10,18,28,.8); }
+.menu-viewer-header, .menu-viewer-controls { display: flex; align-items: center; justify-content: space-between; gap: .6rem; padding: .8rem 1rem; }
+.menu-viewer-header { border-bottom: 1px solid #dce2e8; }
+.menu-viewer-header h2 { margin: 0; font-size: 1.15rem; overflow-wrap: anywhere; }
+.menu-viewer-header span { font-size: .85rem; color: #52606e; }
+.menu-cards-viewer button { min-height: 44px; padding: .6rem .8rem; border: 1px solid #cfd8e2; border-radius: 9px; background: #fff; color: #17202b; cursor: pointer; font: inherit; }
+.menu-cards-viewer button:disabled { opacity: .45; cursor: default; }
+.menu-viewer-stage { min-height: 0; overflow: auto; background: #edf1f5; overscroll-behavior: contain; touch-action: pan-x pan-y pinch-zoom; }
+.menu-viewer-stage img { display: block; width: 100%; max-width: none; height: auto; object-fit: contain; }
+.menu-viewer-stage p { padding: 2rem; text-align: center; line-height: 1.6; }
+.menu-viewer-controls { border-top: 1px solid #dce2e8; }
+@media(max-width:600px) {
+  .menu-card-item { grid-template-columns: 1fr; }
+  .menu-card-preview { width: 100%; height: 190px; }
+  .menu-cards-viewer { width: 96vw; }
+  .menu-viewer-controls { gap: .3rem; padding: .6rem; }
+  .menu-cards-viewer .menu-viewer-controls button { font-size: .8rem; padding: .6rem; }
+}

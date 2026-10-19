@@ -86,7 +86,7 @@ test('Preparar categorias no retrasa la interfaz ni devuelve al usuario a otra s
     showAdminSection: section => calls.push(section), updateAlarmButton() {}, bindAdmin() {},
     startSalesShift() {}, armAlarmOnFirstGesture() {}, subscribeAdmin() {}, startAdminPolling() {}, startAlarmLoop() {},
     ensurePresetCategories: () => new Promise(() => {}), renderTableFormQr() {},
-    initRemoteStorage: () => calls.push('storage'), startRemoteStoragePolling() {},
+    recoverPendingCheckouts: async () => true, initRemoteStorage: () => calls.push('storage'), startRemoteStoragePolling() {},
     refreshBackgroundReports: async () => true, refreshAdminNow: async () => true });
   vm.runInContext(section('initAdmin', 'resumeRealtimeReception') + ';globalThis.init = initAdmin;', context);
   await context.init();

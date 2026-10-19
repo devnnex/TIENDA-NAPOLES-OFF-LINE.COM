@@ -31,6 +31,7 @@ const statusContext = vm.createContext({
   refreshIcons: () => undefined,
   getOfflineSyncStatus: async () => queueStatus,
   flushDurableWrites: async () => true,
+  readLocalJson: () => ({}), CHECKOUT_INTENTS_KEY: 'intents',
   readAppsScriptOutbox: () => []
 });
 vm.runInContext(`${source.slice(statusStart, statusEnd)}
@@ -59,7 +60,8 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
 
 (async () => {
   await statusContext.testStatus.updateGlobalSyncStatus();
-  assert.equal(badge.hidden, true, "Al abrir con internet no se muestra un contador interno.");
+  assert.equal(badge.hidden, false);
+  assert.match(badge.innerHTML, /Respaldo pendiente/);
 
   navigator.onLine = false;
   await statusContext.testStatus.updateGlobalSyncStatus();
@@ -70,10 +72,13 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
   navigator.onLine = true;
   now = 2000;
   await statusContext.testStatus.updateGlobalSyncStatus();
-  assert.match(badge.innerHTML, /Conexión restablecida/);
+  assert.match(badge.innerHTML, /Respaldo pendiente/);
   assert.equal(pendingTimer.delay, 60000);
 
   now = 62000;
+  await statusContext.testStatus.updateGlobalSyncStatus();
+  assert.match(badge.innerHTML, /Respaldo pendiente/, "El tiempo transcurrido no confirma operaciones remotas.");
+  queueStatus = { ...queueStatus, pending: 0 };
   await statusContext.testStatus.updateGlobalSyncStatus();
   assert.match(badge.innerHTML, /Sincronizado/);
   assert.match(badge.className, /is-synced/);
@@ -94,15 +99,15 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
   queueStatus = { ...queueStatus, failed: 0, conflict: 1, issues: [legacyNotice] };
   const original = structuredClone(queueStatus);
   await statusContext.testStatus.updateGlobalSyncStatus();
-  assert.doesNotMatch(badge.innerHTML, /Error de sincronización|cuentas de mesa/);
-  assert.equal(badge.title, "");
+  assert.match(badge.innerHTML, /Error de sincronización/);
+  assert.match(badge.title, /PGRST116/);
   assert.deepEqual(queueStatus, original, "El cambio visual no elimina ni modifica la operación pendiente.");
   queueStatus = { ...queueStatus, failed: 1,
     issues: [legacyNotice, { entity: "menu_items", status: "failed", error: "Producto rechazado" }] };
   await statusContext.testStatus.updateGlobalSyncStatus();
-  assert.match(badge.innerHTML, /1 operación por revisar \(productos\)/);
+  assert.match(badge.innerHTML, /2 operaciones por revisar/);
   assert.match(badge.title, /Producto rechazado/);
-  assert.doesNotMatch(badge.title, /PGRST116/);
+  assert.match(badge.title, /PGRST116/);
   for (const error of ["400 · Importe inválido", "406 · PGRST116 · The result contains 2 rows"]) {
     queueStatus = { ...queueStatus, failed: 0, conflict: 1,
       issues: [{ entity: "table_sessions", status: "conflict", error }] };
@@ -122,5 +127,5 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
   assert.equal(pin.type, "password");
   assert.equal(toggle.attributes["aria-label"], "Mostrar PIN");
 
-  console.log("PASS conexión, aviso REST histórico omitido solo en presentación, errores reales visibles y PIN");
+  console.log("PASS conexión, pendientes nunca confirmados por tiempo, errores visibles y PIN");
 })().catch((error) => { console.error(error); process.exitCode = 1; });

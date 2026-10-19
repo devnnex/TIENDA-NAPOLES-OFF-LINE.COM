@@ -19,7 +19,7 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
     { id: 'line-1', menu_item_id: 'product-1', item_name: 'Producto', quantity: 1, unit_price: 100, status: 'served' }
   ] };
   const state = { paymentProcessing: false, sessions: [session], invoiceHistory: duplicate ? [{ sessionId: session.id }] : [],
-    authToken: 'valid-token', activePaymentTotal: 100, inventoryMeta: {}, localSupabaseWrites: 0, currentUser: { id: 'staff-1' } };
+    authToken: 'valid-token', activePaymentTotal: 100, inventoryMeta: {}, inventoryMovements: [], activeAdminSection: 'inventory', localSupabaseWrites: 0, currentUser: { id: 'staff-1' } };
   state.posFeatures = { remote_drawer: true };
   state.sb = { rpc: async (name) => { calls.push(name); return { data: { command: { id: 'remote-command', status: 'accepted' } } }; } };
   const buttons = [{ value: 'save', disabled: false }, { value: 'print', disabled: false }];
@@ -31,7 +31,13 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
   let finishClose;
   const closePromise = new Promise((resolve) => { finishClose = resolve; });
   const popup = { close() { calls.push('popup-close'); } };
+  const local = new Map();
   const context = vm.createContext({
+    hydrateDurableKey: async () => {},
+    readLocalJson: (key, fallback) => local.has(key) ? structuredClone(local.get(key)) : fallback,
+    persistDurableJson: async (key, value) => { local.set(key, structuredClone(value)); return true; },
+    persistCheckoutAtomically: async project => { project(); return savedLocally; },
+    persistInvoiceHistory() {}, readAppsScriptOutbox: () => [], writeAppsScriptOutbox: async () => true,
     state, console,
     INVENTORY_STORAGE_KEY: 'inventory', INVOICE_STORAGE_KEY: 'invoices',
     INVENTORY_MOVEMENTS_STORAGE_KEY: 'movements', APPS_SCRIPT_OUTBOX_KEY: 'outbox',
@@ -61,6 +67,7 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
     flushDurableWrites: async () => { calls.push('storage'); beforeDurableSave?.(state); return savedLocally; },
     closeSession: () => { calls.push('remote-close'); return closePromise; },
     rollbackLocalPayment: () => { calls.push('rollback'); },
+    renderAdminLive() {},
     renderInventory: () => calls.push('render-inventory'), renderInventoryMovements: () => {}, renderIncomeReport: () => {}, renderTips: () => {},
     printThermalReceipt: (paidSession, invoice, receiptWindow) => {
       assert.equal(paidSession.id, session.id);
@@ -78,12 +85,15 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
   return { context, state, form, buttons, dialog, listeners, calls, finishClose };
 };
 
-for (const method of ['cash', 'transfer', 'breb', 'mixed']) {
+for (const method of ['cash', 'transfer', 'breb', 'card', 'mixed']) {
   for (const action of ['save', 'print']) {
     test(`cobro ${method}/${action}: abre solo con efectivo y solo imprime cuando se solicita`, async () => {
       const app = setup({ method });
       const saving = app.context.api.processPayment(app.form, { value: action });
       await new Promise(setImmediate);
+      assert.equal(app.calls.includes('drawer'), false, 'No abre hardware antes del cierre durable.');
+      app.finishClose({ saved: { id: 'session-1' } });
+      await saving;
       const expectedPulses = ['cash', 'mixed'].includes(method) ? 1 : 0;
       assert.equal(app.calls.filter((call) => call === 'drawer').length, expectedPulses);
       assert.equal(app.calls.filter((call) => call === 'print').length, action === 'print' ? 1 : 0);
@@ -107,7 +117,8 @@ for (const device of ['mobile', 'desktop', 'controller']) for (const online of [
   test(`cobro desde ${device}, online=${online}: abre exclusivamente la caja local`, async () => {
     const app = setup({ device, online });
     const saving = app.context.api.processPayment(app.form, { value: 'print' });
-    await new Promise(setImmediate);
+    app.finishClose({ saved: { id: 'session-1' } });
+    await saving;
     assert.equal(app.calls.filter(call => call === 'drawer').length, device === 'controller' ? 1 : 0);
     assert.equal(app.calls.includes('request_pos_drawer'), false);
     assert.equal(app.calls.filter(call => call === 'print').length, 1);
@@ -186,7 +197,7 @@ test('un abono que llega mientras se guarda obliga a revisar y no imprime un sal
     state.sessions[0].session_payments = [{ id: 'abono-nuevo', amount: 40, payment_method: 'transfer' }];
   } });
   await app.context.api.processPayment(app.form, { value: 'print' });
-  assert.equal(app.calls.includes('rollback'), true);
+  assert.equal(app.calls.includes('rollback'), false, 'Conserva la intención protegida para revisión.');
   assert.equal(app.calls.includes('remote-close'), false);
   assert.equal(app.calls.includes('drawer'), false);
   assert.equal(app.calls.includes('print'), false);
@@ -220,4 +231,24 @@ test('Enter principal y numerico eligen sin imprimir incluso con foco en Imprimi
   app.dialog.open = false;
   assert.equal(press(), false);
   assert.equal(submitted.length, 2);
+});
+
+test('un fallo de impresión conserva la factura y no permite repetir el cobro', async () => {
+  const app = setup({ method: 'card' });
+  app.context.printThermalReceipt = () => { throw new Error('printer_unavailable'); };
+  app.finishClose({ saved: { id: 'session-1' } });
+  await app.context.api.processPayment(app.form, { value: 'print' });
+  assert.equal(app.state.invoiceHistory.length, 1);
+  assert.equal(app.state.paymentProcessing, false);
+  await app.context.api.processPayment(app.form, { value: 'save' });
+  assert.equal(app.state.invoiceHistory.length, 1);
+  assert.equal(app.calls.includes('rollback'), false);
+});
+
+test('cerrar el modal durante el guardado conserva la cuenta y su resultado pendiente', () => {
+  const app = setup(); app.state.paymentProcessing = true;
+  vm.runInContext(section('  const cancelPayment =', '  const paymentFromForm =') + ';globalThis.cancel=cancelPayment;', app.context);
+  app.context.cancel();
+  assert.equal(app.dialog.open, true);
+  assert.equal(app.state.sessions.length, 1);
 });

@@ -11,7 +11,8 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261011-sales-shift-v1">
+    <link rel="stylesheet" href="style.css?v=20261019-carta-compras-v1">
+    <link rel="stylesheet" href="menu-cards.css?v=20261019-carta-compras-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="client">
@@ -56,6 +57,8 @@
         </button>
       </section>
 
+      <section class="client-section" aria-label="Carta del negocio"><button class="ghost" type="button" id="openMenuCards"><i data-lucide="book-open"></i> Carta</button></section>
+
       <p class="song-turn-notice">🎵 Puedes pedir hasta 5 canciones por mesa. Respeta el orden: otras mesas también esperan. El chat no recibe más solicitudes cuando completas tus 5 canciones. Solo se atenderán solicitudes de mesas ocupadas, verificadas por cámaras.</p>
 
       <section id="clientQueueStatus" class="client-queue-status" aria-live="polite" hidden></section>
@@ -83,6 +86,7 @@
     </main>
 
     <script defer src="vendor/lucide.min.js"></script>
-    <script defer src="app.js?v=20261011-sales-shift-v1"></script>
+    <script defer src="menu-cards.js?v=20261019-carta-compras-v1"></script>
+    <script defer src="app.js?v=20261019-carta-compras-v1"></script>
   </body>
 </html>

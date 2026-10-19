@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.12.0",
+  version: "2.13.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -55,7 +55,7 @@ var HEADERS = {
   daily: [
     "fecha", "numero_ventas", "ingreso_bruto", "efectivo", "transferencia", "bre_b",
     "descuentos", "impuestos", "servicio", "costo_mercancia", "utilidad_bruta", "actualizado_en",
-    "ventas_procesadas"
+    "ventas_procesadas", "tarjeta"
   ]
 };
 
@@ -572,6 +572,7 @@ function getIncomeReport_(filters) {
     cash: 0,
     transfer: 0,
     breb: 0,
+    card: 0,
     other: 0
   };
   var records = [];
@@ -632,6 +633,7 @@ function getIncomeReport_(filters) {
       if (payment.method === "cash") totals.cash += payment.amount;
       else if (payment.method === "transfer") totals.transfer += payment.amount;
       else if (payment.method === "breb") totals.breb += payment.amount;
+      else if (payment.method === "card") totals.card += payment.amount;
       else totals.other += payment.amount;
     });
   });
@@ -854,10 +856,89 @@ function clearIncome_(user) {
     writeDataRows_(salesSheet, [], HEADERS.sales.length);
     writeDataRows_(spreadsheet.getSheetByName(APP.sheets.details), [], HEADERS.details.length);
     writeDataRows_(spreadsheet.getSheetByName(APP.sheets.payments), [], HEADERS.payments.length);
-    writeDataRows_(spreadsheet.getSheetByName(APP.sheets.daily), [], HEADERS.daily.length);
+    var dailySheet = spreadsheet.getSheetByName(APP.sheets.daily);
+    writeDataRows_(dailySheet, [], Math.max(HEADERS.daily.length, dailySheet.getLastColumn()));
     appendAudit_("INCOME_CLEAR_ALL", String(deleted), user.full_name || user.username, "OK", "Ingresos reiniciados desde el panel sin modificar existencias.");
     return { cleared: true, deleted: deleted };
   });
+}
+
+// One pending remote sale is completed before any later inventory mutation.
+// The plan is durable before applying stock; all effects have stable identities.
+var POS_SALE_JOURNAL = "POS_Operaciones";
+var POS_PENDING_SALE = "TN_PENDING_SALE_V1";
+function saleJournalSheet_(spreadsheet) {
+  var sheet = spreadsheet.getSheetByName(POS_SALE_JOURNAL);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(POS_SALE_JOURNAL);
+    sheet.getRange(1, 1, 1, 6).setValues([["sale_id", "session_id", "estado", "partes", "actualizado_en", "plan_1"]]);
+  }
+  return sheet;
+}
+function findSaleJournalRow_(sheet, saleId) {
+  if (sheet.getLastRow() < 2) return 0;
+  var found = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).createTextFinder(String(saleId)).matchEntireCell(true).findNext();
+  return found ? found.getRow() : 0;
+}
+function existingSaleRow_(sheet, saleId, sessionId) {
+  if (sheet.getLastRow() < 2) return null;
+  var found = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).createTextFinder(String(saleId)).matchEntireCell(true).findNext();
+  if (!found && sessionId) found = sheet.getRange(2, 3, sheet.getLastRow() - 1, 1).createTextFinder(String(sessionId)).matchEntireCell(true).findNext();
+  return found ? sheet.getRange(found.getRow(), 1, 1, HEADERS.sales.length).getValues()[0] : null;
+}
+function prepareSaleJournal_(spreadsheet, plan) {
+  var properties = PropertiesService.getScriptProperties();
+  var sheet = saleJournalSheet_(spreadsheet);
+  properties.setProperty(POS_PENDING_SALE, plan.saleId);
+  var text = JSON.stringify(plan), chunks = [];
+  for (var offset = 0; offset < text.length; offset += 28000) chunks.push(text.slice(offset, offset + 28000));
+  var row = sheet.getLastRow() + 1, columns = 5 + chunks.length;
+  if (sheet.getMaxColumns() < columns) sheet.insertColumnsAfter(sheet.getMaxColumns(), columns - sheet.getMaxColumns());
+  sheet.getRange(row, 1, 1, columns).setValues([[plan.saleId, plan.sessionId, "pending", chunks.length, new Date().toISOString()].concat(chunks)]);
+  SpreadsheetApp.flush();
+  return { row: row };
+}
+function applySaleJournal_(spreadsheet, journalRow, plan) {
+  var inventory = readInventoryTable_();
+  var rows = inventory.rows.map(function (row) { return row.slice(); });
+  (plan.inventoryChanges || []).forEach(function (change) {
+    var index = findInventoryIndex_(rows, change.after[0]);
+    var current = index < 0 ? null : rows[index];
+    var matches = function (left, right) {
+      return !left || !right ? left === right : String(left[0]) === String(right[0])
+        && asNumber_(left[7]) === asNumber_(right[7]) && String(left[11] || "") === String(right[11] || "")
+        && asNumber_(left[12]) === asNumber_(right[12]);
+    };
+    if (matches(current, change.after)) return;
+    if (!matches(current, change.before)) throw new Error("El inventario cambió fuera del cobro pendiente " + plan.saleId + ". Revisa POS_Operaciones antes de continuar.");
+    if (index < 0) rows.push(change.after); else rows[index] = change.after;
+  });
+  writeInventoryRows_(inventory.sheet, rows);
+  var movements = spreadsheet.getSheetByName(APP.sheets.movements);
+  appendRows_(movements, (plan.movements || []).filter(function (row) { return !hasValueInColumn_(movements, row[0], 1); }));
+  var details = spreadsheet.getSheetByName(APP.sheets.details), payments = spreadsheet.getSheetByName(APP.sheets.payments);
+  if (!hasValueInColumn_(details, plan.saleId, 1)) appendRows_(details, plan.details || []);
+  if (!hasValueInColumn_(payments, plan.saleId, 1)) appendRows_(payments, plan.payments || []);
+  var sales = spreadsheet.getSheetByName(APP.sheets.sales);
+  if (!existingSaleRow_(sales, plan.saleId, plan.sessionId)) appendRows_(sales, [plan.saleRow]);
+  updateDailyIncome_(spreadsheet.getSheetByName(APP.sheets.daily), plan.invoice, plan.totalCost, plan.saleId);
+  saleJournalSheet_(spreadsheet).getRange(journalRow, 3).setValue("committed");
+  SpreadsheetApp.flush();
+  PropertiesService.getScriptProperties().deleteProperty(POS_PENDING_SALE);
+}
+function recoverPendingSaleJournal_() {
+  var properties = PropertiesService.getScriptProperties(), saleId = properties.getProperty(POS_PENDING_SALE);
+  if (!saleId) return;
+  var spreadsheet = getSpreadsheet_(), sheet = saleJournalSheet_(spreadsheet);
+  var row = findSaleJournalRow_(sheet, saleId);
+  if (!row) { properties.deleteProperty(POS_PENDING_SALE); return; }
+  var metadata = sheet.getRange(row, 1, 1, 5).getValues()[0];
+  if (String(metadata[2]) === "committed") { properties.deleteProperty(POS_PENDING_SALE); return; }
+  var count = Number(metadata[3]);
+  if (!Number.isInteger(count) || count < 1) throw new Error("Plan de cobro incompleto en POS_Operaciones: " + saleId);
+  var plan = JSON.parse(sheet.getRange(row, 6, 1, count).getValues()[0].join(""));
+  if (String(plan.saleId) !== String(saleId)) throw new Error("Identidad de cobro inconsistente en POS_Operaciones.");
+  applySaleJournal_(spreadsheet, row, plan);
 }
 
 function recordSale_(invoice, user, authToken) {
@@ -868,9 +949,25 @@ function recordSale_(invoice, user, authToken) {
     var spreadsheet = getSpreadsheet_();
     var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
     if (saleExists_(salesSheet, saleId, sessionId)) {
-      updateDailyIncome_(spreadsheet.getSheetByName(APP.sheets.daily), invoice, invoiceCostFromInventory_(invoice), saleId);
+      var canonical = existingSaleRow_(salesSheet, saleId, sessionId);
+      if (!canonical) throw new Error("No se pudo verificar la venta existente. Se conserva el reintento.");
+      var canonicalId = String(canonical[0]);
+      var canonicalInvoice = { id: canonicalId, sessionId: String(canonical[2]), createdAt: canonical[5],
+        totals: { total: asNumber_(canonical[12]), discount: asNumber_(canonical[9]), tax: asNumber_(canonical[10]), serviceFee: asNumber_(canonical[11]) },
+        payments: readSheetRows_(spreadsheet.getSheetByName(APP.sheets.payments), HEADERS.payments.length)
+          .filter(function (row) { return String(row[0]) === canonicalId; })
+          .map(function (row) { return { method: String(row[2]), amount: asNumber_(row[3]) }; }) };
+      var canonicalCost = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length)
+        .filter(function (row) { return String(row[0]) === canonicalId; })
+        .reduce(function (total, row) { return total + asNumber_(row[9]); }, 0);
+      var paymentSignature = function (payments) { return (payments || []).map(function (p) { return String(p.method) + ":" + asNumber_(p.amount); }).sort().join("|"); };
+      if (asNumber_(invoice.totals.total) !== asNumber_(canonical[12])
+          || paymentSignature(invoice.payments) !== paymentSignature(canonicalInvoice.payments)) {
+        return { ok: false, conflict: true, retryable: false, saleId: canonicalId, error: "La cuenta ya tiene otra factura o distribución de pago. Revisa la venta existente; no se creó otro cobro." };
+      }
+      updateDailyIncome_(spreadsheet.getSheetByName(APP.sheets.daily), canonicalInvoice, canonicalCost, canonicalId);
       if (invoice.saleChannel !== "walk_in") archiveSupabaseSession_(sessionId, authToken);
-      return { duplicate: true, saleId: saleId, archivedSessionId: sessionId, items: getInventory_().items };
+      return { duplicate: true, saleId: canonicalId, archivedSessionId: sessionId, items: getInventory_().items };
     }
 
     var now = new Date().toISOString();
@@ -885,6 +982,8 @@ function recordSale_(invoice, user, authToken) {
 
     var inventoryTable = readInventoryTable_();
     var inventoryRows = inventoryTable.rows.slice();
+    var inventoryBefore = {};
+    inventoryTable.rows.forEach(function (row) { inventoryBefore[String(row[0])] = row.slice(); });
     var movementsSheet = spreadsheet.getSheetByName(APP.sheets.movements);
     var adjustedByProduct = consumptionAdjustedByProduct_(movementsSheet, sessionId);
     var details = [];
@@ -962,17 +1061,14 @@ function recordSale_(invoice, user, authToken) {
       return [saleId, safeText_(invoice.number), safeText_(payment.method), asNumber_(payment.amount), safeText_(invoice.reference), safeText_(invoice.createdAt || now)];
     });
 
-    var detailsSheet = spreadsheet.getSheetByName(APP.sheets.details);
-    var paymentsSheet = spreadsheet.getSheetByName(APP.sheets.payments);
-    if (!hasValueInColumn_(detailsSheet, saleId, 1)) appendRows_(detailsSheet, details);
-    if (!hasValueInColumn_(paymentsSheet, saleId, 1)) appendRows_(paymentsSheet, payments);
-    writeInventoryRows_(inventoryTable.sheet, inventoryRows);
-    if (movements.length) {
-      var newMovements = movements.filter(function (movement) { return !hasValueInColumn_(movementsSheet, movement[0], 1); });
-      appendRows_(movementsSheet, newMovements);
-    }
-    appendRows_(salesSheet, saleRow);
-    updateDailyIncome_(spreadsheet.getSheetByName(APP.sheets.daily), invoice, totalCost, saleId);
+    var plan = {
+      saleId: saleId, sessionId: sessionId, invoice: invoice, totalCost: totalCost,
+      saleRow: saleRow[0], details: details, payments: payments, movements: movements,
+      inventoryChanges: inventoryRows.filter(function (row) { return processedProducts[String(row[0])]; })
+        .map(function (row) { return { before: inventoryBefore[String(row[0])] || null, after: row }; })
+    };
+    var pending = prepareSaleJournal_(spreadsheet, plan);
+    applySaleJournal_(spreadsheet, pending.row, plan);
     if (invoice.saleChannel !== "walk_in") archiveSupabaseSession_(sessionId, authToken);
     CacheService.getScriptCache().put("sale_" + hash_(saleId + "|" + sessionId), "1", 21600);
     appendAudit_("SALE", saleId, user.full_name || user.username, "OK", safeText_(invoice.number));
@@ -1136,7 +1232,7 @@ function deleteSale_(saleIdValue, user) {
 
 function rebuildDailyIncome_(spreadsheet) {
   var dailySheet = spreadsheet.getSheetByName(APP.sheets.daily);
-  if (dailySheet.getLastRow() > 1) dailySheet.getRange(2, 1, dailySheet.getLastRow() - 1, HEADERS.daily.length).clearContent();
+  if (dailySheet.getLastRow() > 1) dailySheet.getRange(2, 1, dailySheet.getLastRow() - 1, Math.max(HEADERS.daily.length, dailySheet.getLastColumn())).clearContent();
   var sales = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.sales), HEADERS.sales.length);
   var details = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length);
   var payments = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.payments), HEADERS.payments.length);
@@ -1234,7 +1330,7 @@ function inventoryRowToObject_(row) {
 function updateDailyIncome_(sheet, invoice, totalCost, saleId) {
   var dateKey = Utilities.formatDate(new Date(invoice.createdAt || Date.now()), getTimezone_(), "yyyy-MM-dd");
   var lastRow = sheet.getLastRow();
-  var rows = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, HEADERS.daily.length).getValues() : [];
+  var rows = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, Math.max(HEADERS.daily.length, sheet.getLastColumn())).getValues() : [];
   var targetIndex = -1;
   for (var index = 0; index < rows.length; index += 1) {
     var existingDate = rows[index][0] instanceof Date
@@ -1243,15 +1339,17 @@ function updateDailyIncome_(sheet, invoice, totalCost, saleId) {
     if (existingDate === dateKey) { targetIndex = index; break; }
   }
   var row = targetIndex >= 0 ? rows[targetIndex] : [dateKey, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", ""];
-  var processedSales = String(row[12] || "");
+  row[13] = asNumber_(row[13]);
+  var processedChunks = [String(row[12] || "")].concat(row.slice(14).map(function (part) { return String(part || ""); }));
   var saleMarker = "|" + String(saleId || invoice.id || invoice.sessionId) + "|";
-  if (processedSales.indexOf(saleMarker) >= 0) return;
+  if (processedChunks.some(function (part) { return part.indexOf(saleMarker) >= 0; })) return;
   row[1] = asNumber_(row[1]) + 1;
   row[2] = asNumber_(row[2]) + asNumber_(invoice.totals.total);
   (invoice.payments || []).forEach(function (payment) {
     if (payment.method === "cash") row[3] = asNumber_(row[3]) + asNumber_(payment.amount);
     if (payment.method === "transfer") row[4] = asNumber_(row[4]) + asNumber_(payment.amount);
     if (payment.method === "breb") row[5] = asNumber_(row[5]) + asNumber_(payment.amount);
+    if (payment.method === "card") row[13] = asNumber_(row[13]) + asNumber_(payment.amount);
   });
   row[6] = asNumber_(row[6]) + asNumber_(invoice.totals.discount);
   row[7] = asNumber_(row[7]) + asNumber_(invoice.totals.tax);
@@ -1259,7 +1357,14 @@ function updateDailyIncome_(sheet, invoice, totalCost, saleId) {
   row[9] = asNumber_(row[9]) + totalCost;
   row[10] = asNumber_(row[10]) + asNumber_(invoice.totals.total) - totalCost;
   row[11] = new Date().toISOString();
-  row[12] = processedSales + saleMarker;
+  // Sheets limits a single cell to 50,000 characters. Spill the operation
+  // markers into appended columns instead of blocking an entire busy day.
+  var markerIndex = processedChunks.length - 1;
+  if (processedChunks[markerIndex].length + saleMarker.length > 28000) { processedChunks.push(""); markerIndex += 1; }
+  processedChunks[markerIndex] += saleMarker;
+  row[12] = processedChunks[0];
+  processedChunks.slice(1).forEach(function (part, index) { row[14 + index] = part; });
+  if (sheet.getMaxColumns() < row.length) sheet.insertColumnsAfter(sheet.getMaxColumns(), row.length - sheet.getMaxColumns());
   if (targetIndex >= 0) sheet.getRange(targetIndex + 2, 1, 1, row.length).setValues([row]);
   else appendRows_(sheet, [row]);
 }
@@ -1395,7 +1500,7 @@ function getTimezone_() {
 function withScriptLock_(callback) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) throw new Error("El sistema esta procesando otra venta. Se reintentara automaticamente.");
-  try { return callback(); } finally { lock.releaseLock(); }
+  try { recoverPendingSaleJournal_(); return callback(); } finally { lock.releaseLock(); }
 }
 
 function findInventoryIndex_(rows, productId) {

@@ -85,6 +85,8 @@ function harness(storage = new Map()) {
     readRealtimeData: async query => (await query)?.data || null,
     readOfflineAdminSnapshot: () => backend.cached, getOfflineSyncStatus: async () => ({ blockingRecords: backend.blockingRecords }),
     persistOfflineAdminSnapshot() {},
+    retryPosMutation: async factory => (await factory())?.data || null,
+    readRealtimeData: async query => (await query)?.data || null,
     retryQuiet: async factory => (await factory())?.data || null,
     mergeOptimisticSessions: rows => rows, renderAdminLive() {}, renderAdmin() {},
     stopAlarm() {}, toast: message => toasts.push(message),

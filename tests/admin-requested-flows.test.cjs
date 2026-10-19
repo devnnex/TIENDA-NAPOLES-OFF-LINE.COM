@@ -193,7 +193,7 @@ test('Editar venta guarda los nuevos medios e importes y rechaza un mixto que no
   const record = { saleId: 'sale-1', invoice: 'F1', items: [{ cost: 1000, quantity: 1 }] };
   const lineValues = { name: { value: 'Producto' }, quantity: { value: '1' }, price: { value: 10000 } };
   const row = { dataset: { incomeLine: '0', lineId: 'line-1' }, querySelector: selector => lineValues[selector.match(/"(.+)"/)[1]] };
-  const fieldValues = { edit_payment_cash: { value: 0 }, edit_payment_transfer: { value: 4000 }, edit_payment_breb: { value: 6000 } };
+  const fieldValues = { edit_payment_cash: { value: 0 }, edit_payment_transfer: { value: 4000 }, edit_payment_breb: { value: 6000 }, edit_payment_card: { value: 0 } };
   const form = { sale_id: { value: 'sale-1' }, payment_method: { value: 'mixed' }, date: { value: '2026-10-09T12:00' },
     table: { value: 'M1' }, payer: { value: '' }, waiter: { value: '' }, reference: { value: '' },
     elements: { namedItem: name => fieldValues[name] }, querySelector: () => ({ disabled: false }) };

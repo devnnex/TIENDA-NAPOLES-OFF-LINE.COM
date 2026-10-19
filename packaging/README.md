@@ -1,7 +1,7 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.23.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.24.exe` con Inno Setup 6.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el
@@ -10,6 +10,20 @@ crea un borrador, sube y verifica el archivo y después lo marca como la última
 publicación. Una versión antigua no desplaza una más reciente. Para cada cambio
 del paquete incrementa la versión, compila y sube el nuevo `.exe`. También se
 puede ejecutar el workflow manualmente desde Actions. No modifica la landing.
+
+Desde 1.0.24, `.github/workflows/build-installer-release.yml` también compila
+el código del commit en Windows de GitHub Actions y publica su instalador como
+Release. Se activa al subir una versión nueva en `TiendaNapolesOffline.iss` o
+manualmente. No basta con subir `app.js`: para distribuir cambios por la landing
+hay que incrementar AppVersion y completar esa publicación. Las versiones ya
+publicadas siguen siendo inmutables; no se reemplaza su ejecutable.
+
+La versión 1.0.24 incluye el código actual de main: optimización de lecturas
+Supabase, respaldo prioritario de solicitudes cada segundo, caché temporal de
+firmas privadas de Carta y protección de los textos de Marca durante edición y
+guardado. Incluye los ajustes previos de Carta de dos imágenes, compras y cobros.
+La caché de recursos es v56; es independiente de la versión del instalador.
+Esta actualización de rendimiento no cambia Code.gs ni requiere SQL adicional.
 
 La versión 1.0.23 prepara la sesión solo al enviar una solicitud explícita
 desde una mesa libre y evita el conflicto SQL de la ruta anterior. Usa el ID y

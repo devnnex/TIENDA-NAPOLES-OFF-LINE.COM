@@ -1,0 +1,35 @@
+name: Compilar y publicar instalador Windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packaging/TiendaNapolesOffline.iss'
+      - '.github/workflows/build-installer-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-installer
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Descargar el código de este commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Comprobar publicación segura e inmutable
+        run: node --test tests/publish-release.test.cjs
+      - name: Compilar el iniciador y el instalador con Inno Setup instalado
+        shell: powershell
+        run: .\packaging\build-installer.ps1
+      - name: Publicar y verificar el instalador antes de marcarlo como latest
+        run: node packaging/publish-release.cjs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

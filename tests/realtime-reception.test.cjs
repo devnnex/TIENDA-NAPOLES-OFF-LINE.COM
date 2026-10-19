@@ -80,7 +80,7 @@ function device(server, page = 'client') {
   };
   const document = { hidden: false, addEventListener: (name, callback) => events.set(name, callback) };
   const context = vm.createContext({
-    state, document, navigator: { onLine: true }, console, Date, AbortController, SUPABASE_CONFIG: { url: 'fixture' },
+    state, document, readBudgetClock:()=>clock, navigator: { onLine: true }, console, Date, AbortController, SUPABASE_CONFIG: { url: 'fixture' },
     SYNC_INTERVAL_MS: 5000, CHAT_SYNC_INTERVAL_MS: 1200,
     window: { setTimeout: (callback, delay) => schedule(callback, delay), clearTimeout: id => timers.delete(id),
       addEventListener: (name, callback) => events.set(name, callback) },
@@ -100,7 +100,7 @@ function device(server, page = 'client') {
     refreshBackgroundReports() { if(server.reportGate) { server.reportReads=(server.reportReads||0)+1; return server.reportGate; } }, notifyAdminPeers() {}, flushPeerRefreshes() {}, startConfirmedReportSync() {}, syncConfirmedReports() {}, refreshInventoryFromPeer() {}, isBoss: () => false,
     setRealtimeStatus() {}, refreshCoreNow() {}, loadUsers() {}
   });
-  vm.runInContext(section('dbQuiet', 'bootstrapCacheKey')
+  vm.runInContext(section('createReadBudget', 'state')+'state.readBudget=createReadBudget(readBudgetClock);'+section('dbQuiet', 'bootstrapCacheKey')
     + section('ensureOpenSession', 'bootstrapCacheKey')
       .split('  const dbQuiet =')[0]
     + section('loadClientSnapshot', 'pwaAssetUrl')

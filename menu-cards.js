@@ -8,6 +8,8 @@ window.MenuCards = (() => {
   let viewer, viewCards = [], viewIndex = 0, generation = 0, tableKey = '', zoom = 1;
   const images = new Map();
   const libraryPreviews = new Map();
+  const signedImages = new Map();
+  let signedImageScope = '';
   const storage = () => ctx.sb.storage.from('pos-menu-cards');
   const status = (message, error = false) => {
     for (const selector of ['#menuCardsStatus','#menuCardsEditorStatus']) {
@@ -24,11 +26,21 @@ window.MenuCards = (() => {
     return data;
   };
   const signedImage = async path => {
-    const {data, error} = await storage().createSignedUrl(path, 300);
-    if (error || !data?.signedUrl) throw new Error('No se pudo abrir la imagen. Vuelve a cargar la Carta.');
-    const url = new URL(data.signedUrl, location.href);
-    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Dirección de imagen inválida.');
-    return url.href;
+    const table=ctx.getCurrentTable?.();
+    const scope=`${ctx.page}:${ctx.getAuthToken?.() || ''}:${table?.id || ''}:${table?.qr_code || ''}`;
+    if(scope!==signedImageScope){signedImages.clear();signedImageScope=scope;}
+    const cached=signedImages.get(path);
+    if(cached && cached.expiresAt>Date.now())return cached.promise;
+    const entry={expiresAt:Date.now()+240000,promise:null};
+    entry.promise=(async()=>{
+      const {data, error} = await storage().createSignedUrl(path, 300);
+      if (error || !data?.signedUrl) throw new Error('No se pudo abrir la imagen. Vuelve a cargar la Carta.');
+      const url = new URL(data.signedUrl, location.href);
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Dirección de imagen inválida.');
+      return url.href;
+    })().catch(error=>{if(signedImages.get(path)===entry)signedImages.delete(path);throw error;});
+    signedImages.set(path,entry);
+    return entry.promise;
   };
   const activeTables = () => (ctx.getTables() || []).filter(t => t.is_active !== false).slice().sort((a,b) => Number(a.table_number)-Number(b.table_number));
   const tableOptions = card => activeTables().map(t => `<label><input type="checkbox" data-menu-table value="${escape(t.id)}" ${(card.table_ids || []).includes(t.id) ? 'checked' : ''}> Mesa ${escape(t.table_number)}${t.name ? ` · ${escape(t.name)}` : ''}</label>`).join('');
@@ -210,7 +222,7 @@ window.MenuCards = (() => {
         url=await signedImage(card.image_path);
         const check=new Image();check.src=url;await check.decode();
         if(request!==generation) return;
-        images.set(card.image_path,{url,expiresAt:Date.now()+270000});
+        images.set(card.image_path,{url,expiresAt:Math.min(Date.now()+270000,signedImages.get(card.image_path)?.expiresAt || Date.now())});
       }
       if (request!==generation || !viewer.open) return;
       img.src=url;img.alt=card.name;await img.decode();

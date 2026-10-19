@@ -1,0 +1,455 @@
+{
+  "method": "60 segundos virtuales tras arranque; respuestas JSON fijas; no representa facturación ni compresión HTTP",
+  "fixture": {
+    "tables": 30,
+    "products": 200,
+    "openSessions": 10,
+    "itemsPerSession": 8,
+    "users": 20,
+    "pendingRequests": 5,
+    "chatMessages": 40,
+    "responseBytes": {
+      "requests": 876,
+      "snapshot": 20714,
+      "bootstrap": 41728,
+      "users": 2129,
+      "reports": 35,
+      "client": 4689,
+      "queue": 15,
+      "payments": 15,
+      "chat": 6614
+    }
+  },
+  "projects": [
+    {
+      "project": "offline",
+      "scenarios": [
+        {
+          "before": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 160,
+            "jsonBytesPerMinute": 1321090,
+            "byResponse": {
+              "requests": 60,
+              "reports": 40,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 88,
+            "jsonBytesPerMinute": 435478,
+            "byResponse": {
+              "requests": 60,
+              "reports": 10,
+              "snapshot": 10,
+              "bootstrap": 4,
+              "users": 4
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 160,
+            "jsonBytesPerMinute": 1321090,
+            "byResponse": {
+              "requests": 60,
+              "reports": 40,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 70,
+            "jsonBytesPerMinute": 179413,
+            "byResponse": {
+              "requests": 60,
+              "reports": 4,
+              "snapshot": 4,
+              "bootstrap": 1,
+              "users": 1
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "admin",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 200,
+            "jsonBytesPerMinute": 1339310,
+            "byResponse": {
+              "requests": 80,
+              "reports": 60,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 44,
+            "channelErrors": 40
+          },
+          "after": {
+            "page": "admin",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 163,
+            "jsonBytesPerMinute": 1323718,
+            "byResponse": {
+              "requests": 63,
+              "reports": 40,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 10,
+            "channelErrors": 6
+          }
+        },
+        {
+          "before": {
+            "page": "client",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 211,
+            "jsonBytesPerMinute": 790634,
+            "byResponse": {
+              "chat": 91,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "client",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 171,
+            "jsonBytesPerMinute": 526074,
+            "byResponse": {
+              "chat": 51,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "client",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 211,
+            "jsonBytesPerMinute": 790634,
+            "byResponse": {
+              "chat": 91,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "client",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 41,
+            "jsonBytesPerMinute": 119944,
+            "byResponse": {
+              "chat": 11,
+              "client": 10,
+              "queue": 10,
+              "payments": 10
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "client",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 220,
+            "jsonBytesPerMinute": 850160,
+            "byResponse": {
+              "chat": 100,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 22,
+            "channelErrors": 20
+          },
+          "after": {
+            "page": "client",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 173,
+            "jsonBytesPerMinute": 539302,
+            "byResponse": {
+              "chat": 53,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 5,
+            "channelErrors": 3
+          }
+        }
+      ]
+    },
+    {
+      "project": "bca",
+      "scenarios": [
+        {
+          "before": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 160,
+            "jsonBytesPerMinute": 1321090,
+            "byResponse": {
+              "requests": 60,
+              "reports": 40,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 88,
+            "jsonBytesPerMinute": 435478,
+            "byResponse": {
+              "requests": 60,
+              "reports": 10,
+              "snapshot": 10,
+              "bootstrap": 4,
+              "users": 4
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 160,
+            "jsonBytesPerMinute": 1321090,
+            "byResponse": {
+              "requests": 60,
+              "reports": 40,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "admin",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 70,
+            "jsonBytesPerMinute": 179413,
+            "byResponse": {
+              "requests": 60,
+              "reports": 4,
+              "snapshot": 4,
+              "bootstrap": 1,
+              "users": 1
+            },
+            "activeChannels": 2,
+            "channelCreations": 2,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "admin",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 200,
+            "jsonBytesPerMinute": 1339310,
+            "byResponse": {
+              "requests": 80,
+              "reports": 60,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 44,
+            "channelErrors": 40
+          },
+          "after": {
+            "page": "admin",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 163,
+            "jsonBytesPerMinute": 1323718,
+            "byResponse": {
+              "requests": 63,
+              "reports": 40,
+              "snapshot": 40,
+              "bootstrap": 10,
+              "users": 10
+            },
+            "activeChannels": 2,
+            "channelCreations": 10,
+            "channelErrors": 6
+          }
+        },
+        {
+          "before": {
+            "page": "client",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 211,
+            "jsonBytesPerMinute": 790634,
+            "byResponse": {
+              "chat": 91,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "client",
+            "healthy": true,
+            "hidden": false,
+            "requestsPerMinute": 171,
+            "jsonBytesPerMinute": 526074,
+            "byResponse": {
+              "chat": 51,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "client",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 211,
+            "jsonBytesPerMinute": 790634,
+            "byResponse": {
+              "chat": 91,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          },
+          "after": {
+            "page": "client",
+            "healthy": true,
+            "hidden": true,
+            "requestsPerMinute": 41,
+            "jsonBytesPerMinute": 119944,
+            "byResponse": {
+              "chat": 11,
+              "client": 10,
+              "queue": 10,
+              "payments": 10
+            },
+            "activeChannels": 1,
+            "channelCreations": 1,
+            "channelErrors": 0
+          }
+        },
+        {
+          "before": {
+            "page": "client",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 220,
+            "jsonBytesPerMinute": 850160,
+            "byResponse": {
+              "chat": 100,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 22,
+            "channelErrors": 20
+          },
+          "after": {
+            "page": "client",
+            "healthy": false,
+            "hidden": false,
+            "requestsPerMinute": 173,
+            "jsonBytesPerMinute": 539302,
+            "byResponse": {
+              "chat": 53,
+              "client": 40,
+              "queue": 40,
+              "payments": 40
+            },
+            "activeChannels": 1,
+            "channelCreations": 5,
+            "channelErrors": 3
+          }
+        }
+      ]
+    }
+  ]
+}

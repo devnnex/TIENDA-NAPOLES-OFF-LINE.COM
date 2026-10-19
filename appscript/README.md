@@ -17,6 +17,15 @@ No crea otros libros, no divide la información por años y no necesita archivos
 
 Cada vez que modifique `Code.gs`, edite la implementación y publique una versión nueva. Guardar el código sin actualizar la implementación no cambia la URL `/exec` que usa la caja.
 
+La versión 2.14.0 incorpora `sync_sales_batch`: hasta 20 altas, ediciones y
+borrados en un objeto, con una validación de sesión y un bloqueo por petición.
+Confirma cada operación por su ID en `Operaciones_Sync`; un corte o una respuesta
+perdida permite reintentar el mismo lote sin repetir operaciones anteriores.
+Las ediciones y devoluciones tienen un plan recuperable en `POS_Operaciones`.
+Un lote puede confirmar solo un prefijo por tiempo disponible: el cliente
+conserva y reenvía el resto. No es una transacción SQL entre servicios.
+Los resúmenes diarios se reconstruyen en memoria y se escriben juntos.
+
 ## Pestañas creadas
 
 - `Configuracion`: conexión privada y orígenes autorizados.
@@ -46,4 +55,4 @@ El panel **Ingresos** consulta estas pestañas para calcular KPIs por hoy, ayer,
 
 ## Comprobación rápida
 
-Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.7.0"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.
+Después de publicar la implementación nueva, abra su URL `/exec` en el navegador. Debe responder un JSON con `"ok":true`, `"version":"2.14.0"` y el ID del archivo. Al hacerlo también se verifica y crea la estructura de pestañas.

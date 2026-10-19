@@ -7,7 +7,7 @@
  */
 
 var APP = {
-  version: "2.13.0",
+  version: "2.14.0",
   spreadsheetId: "1hjl2H0aMLUCwf3p74YbcnXviPAoVQTbNulyehfZU53s",
   properties: {
     schemaVersion: "TN_SCHEMA_VERSION",
@@ -151,6 +151,7 @@ function apiRequest(payloadText) {
     var user = validateSupabaseUser_(request.authToken);
     var payload = request.payload || {};
     var result;
+    if (request.action === "sync_sales_batch") return syncSalesBatch_(payload.operations, user, request.authToken);
     if (request.action === "get_inventory") result = getInventory_();
     else if (request.action === "get_inventory_movements") {
       requireSection_(user, "movements");
@@ -174,11 +175,11 @@ function apiRequest(payloadText) {
     }
     else if (request.action === "edit_sale") {
       requireBoss_(user);
-      result = editSale_(payload.invoice, user);
+      result = editSale_(payload.invoice, user, request.operationId);
     }
     else if (request.action === "delete_sale") {
       requireBoss_(user);
-      result = deleteSale_(payload.saleId, user);
+      result = deleteSale_(payload.saleId, user, request.operationId);
     }
     else if (request.action === "adjust_inventory") {
       requireSection_(user, "inventory");
@@ -237,8 +238,101 @@ function apiRequest(payloadText) {
     } catch (auditError) {
       // La respuesta original tiene prioridad.
     }
-    return { ok: false, error: String(error.message || error) };
+    return { ok: false, retryable: error.retryable !== false, code: error.code || "", error: String(error.message || error) };
   }
+}
+
+
+function syncSalesBatch_(operations, user, authToken) {
+  requireManager_(user);
+  if (!Array.isArray(operations) || !operations.length || operations.length > 20) throw new Error("Lote de ventas inválido.");
+  operations.forEach(function (op) {
+    if (!op || !/^[a-zA-Z0-9:_-]{1,180}$/.test(String(op.operationId || ""))
+      || ["record_sale", "edit_sale", "delete_sale"].indexOf(op.action) < 0) throw new Error("Operación de lote inválida.");
+    if (op.action !== "record_sale") requireBoss_(user);
+  });
+  return withScriptLock_(function () {
+    var spreadsheet = getSpreadsheet_(), sheet = spreadsheet.getSheetByName("Operaciones_Sync");
+    if (!sheet) { sheet = spreadsheet.insertSheet("Operaciones_Sync"); appendRows_(sheet, [["operation_id", "firma", "resultado", "fecha"]]); }
+    var receipts = readSheetRows_(sheet, 4), saved = {}, results = [], started = Date.now();
+    receipts.forEach(function (row) { saved[String(row[0])] = row; });
+    for (var index = 0; index < operations.length; index++) {
+      if (index && Date.now() - started > 18000) break;
+      var op = operations[index], payload = op.payload || {};
+      var signaturePayload = JSON.parse(JSON.stringify(payload));
+      if (signaturePayload.invoice) { delete signaturePayload.invoice.checkoutAccepted; delete signaturePayload.invoice.googlePending; }
+      var signature = hash_(JSON.stringify([user.id, op.action, signaturePayload]));
+      var result;
+      if (saved[op.operationId]) {
+        if (String(saved[op.operationId][1]) !== signature) {
+          results.push({ operationId: op.operationId, result: { ok: false, retryable: false, conflict: true, error: "La operación ya existe con otro contenido." } });
+          break;
+        }
+        result = JSON.parse(saved[op.operationId][2]);
+      } else {
+        try {
+          if (op.action === "record_sale") result = recordSale_(payload.invoice, user, authToken);
+          else if (op.action === "edit_sale") result = editSale_(payload.invoice, user, op.operationId);
+          else result = deleteSale_(payload.saleId, user, op.operationId);
+          if (result.ok !== false) {
+            result.ok = true;
+            // Invalidate before the receipt: a crash must never leave an
+            // acknowledged mutation hidden behind an unchanged report revision.
+            var revision = String(Date.now()) + "-" + Math.random();
+            PropertiesService.getScriptProperties().setProperty("TN_HISTORY_REVISION", revision);
+            PropertiesService.getScriptProperties().setProperty("TN_MOVEMENT_REVISION", revision);
+            var compact = Object.assign({}, result); delete compact.items;
+            appendRows_(sheet, [[op.operationId, signature, JSON.stringify(compact), new Date().toISOString()]]);
+            SpreadsheetApp.flush();
+            saved[op.operationId] = [op.operationId, signature, JSON.stringify(compact)];
+          }
+        } catch (error) {
+          result = { ok: false, retryable: error.retryable !== false, error: String(error.message || error) };
+        }
+      }
+      results.push({ operationId: op.operationId, result: Object.assign({}, result, { batchReceipt: true }) });
+      if (result.ok === false) break;
+    }
+    // One inventory snapshot for the whole envelope, not one per receipt.
+    var items = getInventory_().items;
+    if (results.length) results[results.length - 1].result.items = items;
+    return { ok: true, results: results };
+  });
+}
+
+function salesMutationResult_(operationId) {
+  if (!operationId) return null;
+  var sheet = saleJournalSheet_(getSpreadsheet_());
+  var row = findSaleJournalRow_(sheet, "mutation:" + operationId);
+  if (!row) return null;
+  var metadata = sheet.getRange(row, 1, 1, 5).getValues()[0];
+  if (String(metadata[2]) !== "committed") throw new Error("Cambio pendiente de recuperación.");
+  var plan = JSON.parse(sheet.getRange(row, 6, 1, Number(metadata[3])).getValues()[0].join(""));
+  return Object.assign({}, plan.result, { duplicate: true, items: getInventory_().items });
+}
+
+function commitSalesMutation_(spreadsheet, operationId, tables, result) {
+  // Journal only this sale and its affected products, never a copy of the
+  // complete sales history for every click.
+  var productIds = {};
+  readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length).forEach(function (row) {
+    if (String(row[0]) === String(result.saleId) && row[3]) productIds[String(row[3])] = true;
+  });
+  tables.forEach(function (table) {
+    if (table.key === "details") table.rows.forEach(function (row) {
+      if (String(row[0]) === String(result.saleId) && row[3]) productIds[String(row[3])] = true;
+    });
+  });
+  tables = tables.map(function (table) {
+    return { key: table.key, width: table.width, rows: table.rows.filter(function (row) {
+      return table.key === "inventory" ? productIds[String(row[0])]
+        : table.key === "movements" || String(row[0]) === String(result.saleId);
+    }) };
+  });
+  var plan = { kind: "mutation", saleId: "mutation:" + (operationId || Utilities.getUuid()),
+    targetSaleId: result.saleId, sessionId: "", tables: tables, result: result };
+  var pending = prepareSaleJournal_(spreadsheet, plan);
+  applySaleJournal_(spreadsheet, pending.row, plan);
 }
 
 function ensureSystemReady_() {
@@ -899,6 +993,26 @@ function prepareSaleJournal_(spreadsheet, plan) {
   return { row: row };
 }
 function applySaleJournal_(spreadsheet, journalRow, plan) {
+  if (plan.kind === "mutation") {
+    plan.tables.forEach(function (table) {
+      var sheet = spreadsheet.getSheetByName(APP.sheets[table.key]);
+      var current = readSheetRows_(sheet, table.width);
+      if (table.key === "movements") {
+        var ids = {}; current.forEach(function (row) { ids[String(row[0])] = true; });
+        appendRows_(sheet, table.rows.filter(function (row) { return !ids[String(row[0])]; }));
+      } else if (table.key === "inventory") {
+        var after = {}; table.rows.forEach(function (row) { after[String(row[0])] = row; });
+        writeDataRows_(sheet, current.map(function (row) { return after[String(row[0])] || row; }), table.width);
+      } else {
+        writeDataRows_(sheet, current.filter(function (row) { return String(row[0]) !== String(plan.targetSaleId); }).concat(table.rows), table.width);
+      }
+    });
+    rebuildDailyIncome_(spreadsheet);
+    saleJournalSheet_(spreadsheet).getRange(journalRow, 3).setValue("committed");
+    SpreadsheetApp.flush();
+    PropertiesService.getScriptProperties().deleteProperty(POS_PENDING_SALE);
+    return;
+  }
   var inventory = readInventoryTable_();
   var rows = inventory.rows.map(function (row) { return row.slice(); });
   (plan.inventoryChanges || []).forEach(function (change) {
@@ -1088,9 +1202,11 @@ function writeDataRows_(sheet, rows, width) {
   if (previous > rows.length) sheet.getRange(rows.length + 2, 1, previous - rows.length, width).clearContent();
 }
 
-function editSale_(invoice, user) {
+function editSale_(invoice, user, operationId) {
   if (!invoice || !invoice.id || !invoice.totals || !Array.isArray(invoice.items) || !invoice.items.length) throw new Error("Correccion de venta incompleta.");
   return withScriptLock_(function () {
+    var duplicate = salesMutationResult_(operationId);
+    if (duplicate) return duplicate;
     var spreadsheet = getSpreadsheet_();
     var saleId = safeText_(invoice.id);
     var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
@@ -1135,8 +1251,7 @@ function editSale_(invoice, user) {
       inventory.rows[inventoryIndex] = row;
       editMovements.push(["EDIT-" + saleId + "-" + productId + "-" + new Date().getTime(), productId, safeText_(row[1]), safeText_(row[2]), "CORRECCION_VENTA", delta, before, after, asNumber_(row[5]), safeText_(invoice.number), safeText_(invoice.sessionId), new Date().toISOString(), safeText_(user.full_name || user.username)]);
     });
-    writeInventoryRows_(inventory.sheet, inventory.rows);
-    appendRows_(movementsSheet, editMovements);
+
 
     var totals = invoice.totals || {};
     var sale = sales[saleIndex];
@@ -1154,7 +1269,7 @@ function editSale_(invoice, user) {
     sale[14] = safeText_(invoice.reference);
     sale[16] = new Date().toISOString();
     sales[saleIndex] = sale;
-    writeDataRows_(salesSheet, sales, HEADERS.sales.length);
+
 
     var nextDetails = oldDetails.filter(function (row) { return String(row[0] || "") !== saleId; });
     invoice.items.forEach(function (line) {
@@ -1164,21 +1279,28 @@ function editSale_(invoice, user) {
       var price = Math.max(0, asNumber_(line.unit_price));
       nextDetails.push([saleId, safeText_(invoice.number), safeText_(line.id), safeText_(line.menu_item_id), safeText_(line.item_name), quantity, price, quantity * price, cost, quantity * cost, quantity * (price - cost)]);
     });
-    writeDataRows_(detailsSheet, nextDetails, HEADERS.details.length);
+
 
     var oldPayments = readSheetRows_(paymentsSheet, HEADERS.payments.length).filter(function (row) { return String(row[0] || "") !== saleId; });
     (invoice.payments || []).forEach(function (payment) { oldPayments.push([saleId, safeText_(invoice.number), safeText_(payment.method), asNumber_(payment.amount), safeText_(invoice.reference), safeText_(invoice.createdAt)]); });
-    writeDataRows_(paymentsSheet, oldPayments, HEADERS.payments.length);
-    rebuildDailyIncome_(spreadsheet);
+    commitSalesMutation_(spreadsheet, operationId, [
+      { key: "inventory", rows: inventory.rows, width: HEADERS.inventory.length },
+      { key: "movements", rows: editMovements, width: HEADERS.movements.length },
+      { key: "sales", rows: sales, width: HEADERS.sales.length },
+      { key: "details", rows: nextDetails, width: HEADERS.details.length },
+      { key: "payments", rows: oldPayments, width: HEADERS.payments.length }
+    ], { saleId: saleId, corrected: true });
     appendAudit_("SALE_EDIT", saleId, user.full_name || user.username, "OK", "Venta corregida desde el panel");
     return { saleId: saleId, corrected: true, items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_) };
   });
 }
 
-function deleteSale_(saleIdValue, user) {
+function deleteSale_(saleIdValue, user, operationId) {
   var saleId = safeText_(saleIdValue);
   if (!saleId) throw new Error("Venta inválida.");
   return withScriptLock_(function () {
+    var duplicate = salesMutationResult_(operationId);
+    if (duplicate) return duplicate;
     var spreadsheet = getSpreadsheet_();
     var salesSheet = spreadsheet.getSheetByName(APP.sheets.sales);
     var detailsSheet = spreadsheet.getSheetByName(APP.sheets.details);
@@ -1219,30 +1341,48 @@ function deleteSale_(saleIdValue, user) {
       restoredMovements.push(["DELETE-SALE-" + saleId + "-" + productId, productId, safeText_(row[1]), safeText_(row[2]), "VENTA_ELIMINADA", quantities[productId], before, after, asNumber_(row[5]), safeText_(sale[1]), safeText_(sale[2]), now, safeText_(user.full_name || user.username)]);
     });
 
-    writeInventoryRows_(inventory.sheet, inventory.rows);
-    if (restoredMovements.length) appendRows_(movementsSheet, restoredMovements);
-    writeDataRows_(salesSheet, remainingSales, HEADERS.sales.length);
-    writeDataRows_(detailsSheet, remainingDetails, HEADERS.details.length);
-    writeDataRows_(paymentsSheet, remainingPayments, HEADERS.payments.length);
-    rebuildDailyIncome_(spreadsheet);
+    commitSalesMutation_(spreadsheet, operationId, [
+      { key: "inventory", rows: inventory.rows, width: HEADERS.inventory.length },
+      { key: "movements", rows: restoredMovements, width: HEADERS.movements.length },
+      { key: "sales", rows: remainingSales, width: HEADERS.sales.length },
+      { key: "details", rows: remainingDetails, width: HEADERS.details.length },
+      { key: "payments", rows: remainingPayments, width: HEADERS.payments.length }
+    ], { deleted: true, saleId: saleId, restoredProducts: Object.keys(quantities).length });
     appendAudit_("SALE_DELETE", saleId, user.full_name || user.username, "OK", "Venta eliminada desde el panel: " + safeText_(sale[1]));
     return { deleted: true, saleId: saleId, restoredProducts: Object.keys(quantities).length, items: inventory.rows.filter(function (row) { return row[0]; }).map(inventoryRowToObject_) };
   });
 }
 
 function rebuildDailyIncome_(spreadsheet) {
-  var dailySheet = spreadsheet.getSheetByName(APP.sheets.daily);
-  if (dailySheet.getLastRow() > 1) dailySheet.getRange(2, 1, dailySheet.getLastRow() - 1, Math.max(HEADERS.daily.length, dailySheet.getLastColumn())).clearContent();
-  var sales = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.sales), HEADERS.sales.length);
-  var details = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length);
-  var payments = readSheetRows_(spreadsheet.getSheetByName(APP.sheets.payments), HEADERS.payments.length);
-  sales.forEach(function (row) {
-    var saleId = String(row[0] || "");
-    if (!saleId) return;
-    var invoice = { id: saleId, createdAt: row[5], totals: { subtotal: asNumber_(row[8]), discount: asNumber_(row[9]), tax: asNumber_(row[10]), serviceFee: asNumber_(row[11]), total: asNumber_(row[12]) }, payments: payments.filter(function (payment) { return String(payment[0] || "") === saleId; }).map(function (payment) { return { method: String(payment[2] || ""), amount: asNumber_(payment[3]) }; }) };
-    var cost = details.filter(function (detail) { return String(detail[0] || "") === saleId; }).reduce(function (sum, detail) { return sum + asNumber_(detail[9]); }, 0);
-    updateDailyIncome_(dailySheet, invoice, cost, saleId);
+  var groups = {}, costs = {}, paymentsBySale = {};
+  readSheetRows_(spreadsheet.getSheetByName(APP.sheets.details), HEADERS.details.length).forEach(function (row) {
+    costs[String(row[0])] = asNumber_(costs[String(row[0])]) + asNumber_(row[9]);
   });
+  readSheetRows_(spreadsheet.getSheetByName(APP.sheets.payments), HEADERS.payments.length).forEach(function (row) {
+    var id = String(row[0]); if (!paymentsBySale[id]) paymentsBySale[id] = [];
+    paymentsBySale[id].push(row);
+  });
+  readSheetRows_(spreadsheet.getSheetByName(APP.sheets.sales), HEADERS.sales.length).forEach(function (sale) {
+    var id = String(sale[0] || ""); if (!id) return;
+    var date = Utilities.formatDate(new Date(sale[5]), getTimezone_(), "yyyy-MM-dd");
+    var row = groups[date] || (groups[date] = [date,0,0,0,0,0,0,0,0,0,0,new Date().toISOString(),"",0]);
+    row[1]++; row[2] += asNumber_(sale[12]);
+    (paymentsBySale[id] || []).forEach(function (payment) {
+      var col = { cash:3, transfer:4, breb:5, card:13 }[String(payment[2])];
+      if (col !== undefined) row[col] += asNumber_(payment[3]);
+    });
+    row[6] += asNumber_(sale[9]); row[7] += asNumber_(sale[10]); row[8] += asNumber_(sale[11]);
+    row[9] += asNumber_(costs[id]); row[10] += asNumber_(sale[12]) - asNumber_(costs[id]);
+    var col = row.length > 14 ? row.length - 1 : 12, marker = "|" + id + "|";
+    if (String(row[col]).length + marker.length > 28000) { col = Math.max(14, row.length); row[col] = ""; }
+    row[col] += marker;
+  });
+  var sheet = spreadsheet.getSheetByName(APP.sheets.daily);
+  var rows = Object.keys(groups).sort().map(function (key) { return groups[key]; });
+  var width = Math.max.apply(null, [HEADERS.daily.length, sheet.getLastColumn()].concat(rows.map(function (row) { return row.length; })));
+  if (sheet.getMaxColumns() < width) sheet.insertColumnsAfter(sheet.getMaxColumns(), width - sheet.getMaxColumns());
+  rows.forEach(function (row) { while (row.length < width) row.push(""); });
+  writeDataRows_(sheet, rows, width);
 }
 
 function archiveSupabaseSession_(sessionId, authToken) {
@@ -1497,10 +1637,16 @@ function getTimezone_() {
   return getConfig_().timezone || "America/Bogota";
 }
 
+var salesScriptLockHeld_ = false;
 function withScriptLock_(callback) {
+  if (salesScriptLockHeld_) return callback();
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(15000)) throw new Error("El sistema esta procesando otra venta. Se reintentara automaticamente.");
-  try { recoverPendingSaleJournal_(); return callback(); } finally { lock.releaseLock(); }
+  if (!lock.tryLock(1000)) {
+    var error = new Error("Sincronización ocupada; reintento automático."); error.code = "SYNC_BUSY"; error.retryable = true; throw error;
+  }
+  salesScriptLockHeld_ = true;
+  try { recoverPendingSaleJournal_(); return callback(); }
+  finally { salesScriptLockHeld_ = false; lock.releaseLock(); }
 }
 
 function findInventoryIndex_(rows, productId) {

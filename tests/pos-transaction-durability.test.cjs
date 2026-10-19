@@ -160,6 +160,20 @@ test('respuesta de cierre perdida y fallo al guardar su estado conservan la iden
 });
 
 if (offline) {
+  test('clics consecutivos sin esperar IndexedDB conservan todos los trabajos y sus borrados', async () => {
+    const h = harness();
+    const first = h.api.outbox([{ id: 'one', updatedAt: '2026-10-19T10:00:00Z' }]);
+    assert.equal(h.api.read('outbox').length, 1);
+    const second = h.api.outbox([...h.api.read('outbox'), { id: 'two', updatedAt: '2026-10-19T10:00:01Z' }]);
+    assert.equal(h.api.read('outbox').length, 2);
+    await first;
+    assert.equal(h.api.read('outbox').length, 2, 'El commit anterior no sustituye la proyección nueva.');
+    await second;
+    await h.api.outbox(h.api.read('outbox').filter(job => job.id !== 'one'), ['one']);
+    const reload = harness(h.indexedDB, storage());
+    await reload.api.hydrate('outbox');
+    assert.deepEqual(plain(reload.api.read('outbox')).map(job => job.id), ['two']);
+  });
   test('confirmar un envío antiguo no borra la venta recién guardada durante ese envío', async () => {
     const h = harness();
     await h.api.outbox([{ id: 'old-job', action: 'record_sale' }]);

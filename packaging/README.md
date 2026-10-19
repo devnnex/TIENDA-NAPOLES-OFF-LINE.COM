@@ -1,7 +1,18 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.24.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.25.exe` con Inno Setup 6.
+
+La versión 1.0.25 oculta los pendientes de respaldo del encabezado y de Ventas;
+Ventas conserva el número de facturas. Conserva las altas antes de sus ediciones
+y borrados aunque se interrumpa la conexión. Envía hasta 20 operaciones de ventas
+en una petición y retira de la cola solamente las confirmadas. Los bloqueos
+temporales se reintentan en segundo plano. La caché de recursos pasa a v57.
+
+Para habilitar los lotes y la recuperación de ediciones/borrados, actualizar
+la implementación web existente con `appscript/Code.gs` 2.14.0, conservando su URL.
+Mientras el backend anterior siga desplegado, la aplicación usa el envío individual
+compatible y conserva los reintentos. No requiere SQL nuevo.
 
 La landing consulta GitHub Releases (`releases/latest`), no los archivos de `main`.
 El workflow `.github/workflows/publish-installer.yml` publica automáticamente el

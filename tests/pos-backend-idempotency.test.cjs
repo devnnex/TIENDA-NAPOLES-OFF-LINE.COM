@@ -126,3 +126,51 @@ test('un día con miles de ventas no desborda la celda de idempotencia ni duplic
   assert.ok(daily.rows[1].length > 14);
   assert.ok([daily.rows[1][12], ...daily.rows[1].slice(14)].every(chunk => chunk.length <= 28000));
 });
+
+const batchOperations = () => [
+  { operationId: 'create-sale', action: 'record_sale', payload: { invoice: invoice('batch-sale', 2) } },
+  { operationId: 'edit-sale', action: 'edit_sale', payload: { invoice: invoice('batch-sale', 3) } },
+  { operationId: 'delete-sale', action: 'delete_sale', payload: { saleId: 'batch-sale' } }
+];
+const boss = { id: 'boss', role: 'boss', full_name: 'Caja' };
+test('un lote confirma altas, ediciones y borrados en orden y repetir la respuesta perdida no revive la venta', () => {
+  const h = backend(), operations = batchOperations();
+  const reply = h.context.syncSalesBatch_(operations, boss, 'token');
+  assert.equal(reply.ok, true);
+  assert.equal(reply.results.length, 3);
+  assert.ok(reply.results.every(entry => entry.result.ok));
+  for (let retry = 0; retry < 3; retry++) h.context.syncSalesBatch_(operations, boss, 'token');
+  assert.equal(h.sheet('inventory').rows[1][7], 10);
+  for (const key of ['sales', 'details', 'payments', 'daily']) assert.equal(h.sheet(key).rows.filter((row, i) => i && row[0]).length, 0, key);
+  assert.equal(h.sheet('movements').rows.filter((row, i) => i && row[0]).length, 3);
+  assert.equal(h.sheets.get('Operaciones_Sync').rows.length, 4);
+});
+
+test('recupera cada escritura interrumpida de un lote sin duplicar stock, ediciones ni devoluciones', () => {
+  const reference = backend(); reference.context.syncSalesBatch_(batchOperations(), boss, 'token');
+  const count = reference.writes();
+  for (let failure = 1; failure <= count; failure++) {
+    const h = backend(); h.faultAt(failure);
+    try { h.context.syncSalesBatch_(batchOperations(), boss, 'token'); } catch (_) {}
+    h.faultAt(0);
+    for (let retry = 0; retry < 3; retry++) {
+      const reply = h.context.syncSalesBatch_(batchOperations(), boss, 'token');
+      assert.ok(reply.results.every(entry => entry.result.ok), 'receipt, fault ' + failure);
+    }
+    assert.equal(h.sheet('inventory').rows[1][7], 10, 'stock, fault ' + failure);
+    assert.equal(h.sheet('sales').rows.filter((row, i) => i && row[0]).length, 0, 'sales, fault ' + failure);
+    assert.equal(h.sheet('movements').rows.filter((row, i) => i && row[0]).length, 3, 'movements, fault ' + failure);
+  }
+  console.log('Escrituras del lote interrumpidas y recuperadas:', count);
+});
+
+test('un lote mantiene permisos por operación y rechaza reutilizar un ID con otro contenido', () => {
+  const h = backend();
+  assert.throws(() => h.context.syncSalesBatch_(batchOperations(), { id: 'admin', role: 'admin' }, 'token'));
+  assert.equal(h.sheet('sales').rows.length, 1, 'Valida todo el lote antes de escribir.');
+  h.context.syncSalesBatch_(batchOperations(), boss, 'token');
+  const changed = batchOperations(); changed[0].payload.invoice.totals.total = 999;
+  const reply = h.context.syncSalesBatch_(changed, boss, 'token');
+  assert.equal(reply.results[0].result.conflict, true);
+  assert.equal(reply.results[0].result.retryable, false);
+});

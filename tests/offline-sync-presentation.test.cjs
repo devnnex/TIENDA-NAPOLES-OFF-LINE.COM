@@ -60,8 +60,7 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
 
 (async () => {
   await statusContext.testStatus.updateGlobalSyncStatus();
-  assert.equal(badge.hidden, false);
-  assert.match(badge.innerHTML, /Respaldo pendiente/);
+  assert.equal(badge.hidden, true, "Los pendientes se conservan sin mostrar el indicador.");
 
   navigator.onLine = false;
   await statusContext.testStatus.updateGlobalSyncStatus();
@@ -72,12 +71,13 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
   navigator.onLine = true;
   now = 2000;
   await statusContext.testStatus.updateGlobalSyncStatus();
-  assert.match(badge.innerHTML, /Respaldo pendiente/);
+  assert.equal(badge.hidden, true);
   assert.equal(pendingTimer.delay, 60000);
 
   now = 62000;
   await statusContext.testStatus.updateGlobalSyncStatus();
-  assert.match(badge.innerHTML, /Respaldo pendiente/, "El tiempo transcurrido no confirma operaciones remotas.");
+  assert.equal(badge.hidden, true, "El tiempo no convierte pendientes en confirmados.");
+  assert.equal(queueStatus.pending, 2);
   queueStatus = { ...queueStatus, pending: 0 };
   await statusContext.testStatus.updateGlobalSyncStatus();
   assert.match(badge.innerHTML, /Sincronizado/);

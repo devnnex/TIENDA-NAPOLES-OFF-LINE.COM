@@ -1525,7 +1525,7 @@ const App = (() => {
     } else if (displayPhase === "offline") {
       setGlobalSyncStatus("Sin conexión · listo para sincronizar", "offline", "cloud-off");
     } else if (pending) {
-      setGlobalSyncStatus(`Respaldo pendiente · ${pending} ${pending === 1 ? "operación" : "operaciones"}`, "pending", "refresh-cw");
+      $("#globalSyncStatus").hidden = true;
     } else if (displayPhase === "reconnecting") {
       setGlobalSyncStatus("Conexión restablecida", "offline", "wifi");
     } else if (displayPhase === "synced") {
@@ -1568,8 +1568,13 @@ const App = (() => {
 
   const nextReadyAppsScriptJob = (jobs, counts, force, now = Date.now()) => {
     let skippedSale = false;
-    for (const job of jobs) {
+    for (const [index, job] of jobs.entries()) {
       if (job.status !== "pending" || (!force && Number(job.nextAttemptAt || 0) > now)) continue;
+      const previous = jobs.slice(0, index);
+      const saleId = entry => String(entry.payload?.invoice?.id || entry.payload?.saleId || "");
+      if (previous.some(entry => entry.action === "clear_income"
+        || (job.action !== "record_sale" && !["synced"].includes(entry.status))
+        || (saleId(job) && saleId(entry) === saleId(job)))) continue;
       if (state.localSupabaseWrites > 0 || isSupabaseWriteBlockingJob(job, counts)) {
         if (job.action !== "record_sale") return null;
         skippedSale = true;
@@ -2728,6 +2733,13 @@ const App = (() => {
   const persistAppsScriptOutbox = (incoming, removedIds = []) => {
     if (checkoutBatch) return persistDurableJson(APPS_SCRIPT_OUTBOX_KEY, incoming);
     const snapshot = JSON.parse(JSON.stringify(incoming));
+    // Publish the local projection synchronously so a second click sees the
+    // operation queued by the first click before its IndexedDB commit finishes.
+    const projected = mergeOutboxJobs(readLocalJson(APPS_SCRIPT_OUTBOX_KEY, []), snapshot,
+      Object.fromEntries(removedIds.map(id => [id, true])));
+    const projectionRevision = nextDurableRevision();
+    durableMemory.set(APPS_SCRIPT_OUTBOX_KEY, projected);
+    durableMemoryRevision.set(APPS_SCRIPT_OUTBOX_KEY, projectionRevision);
     const save = async () => {
       const database = await openLocalDataDb();
       if (!database) { durableIndexedStatus.set(APPS_SCRIPT_OUTBOX_KEY, false); return false; }
@@ -2753,7 +2765,7 @@ const App = (() => {
         } catch (_) { resolve(false); }
       });
       durableIndexedStatus.set(APPS_SCRIPT_OUTBOX_KEY, saved);
-      if (saved) {
+      if (saved && Number(durableMemoryRevision.get(APPS_SCRIPT_OUTBOX_KEY) || 0) <= projectionRevision) {
         durableMemory.set(APPS_SCRIPT_OUTBOX_KEY, jobs);
         durableMemoryRevision.set(APPS_SCRIPT_OUTBOX_KEY, revision);
         try {
@@ -2839,34 +2851,49 @@ const App = (() => {
       try { result = JSON.parse(text); } catch (error) {
         throw transientAppsScriptError("La respuesta del respaldo remoto todavía se está confirmando.");
       }
-      if (result?.ok && action === "record_sale" && result.saleId && payload.invoice
-        && String(result.saleId) !== String(payload.invoice.id)) {
-        const previousId = String(payload.invoice.id);
-        const canonical = { ...payload.invoice, id: String(result.saleId) };
-        const saved = await persistCheckoutAtomically(() => {
-          state.invoiceHistory = state.invoiceHistory.map(invoice => String(invoice.id) === previousId ? { ...invoice, id: canonical.id } : invoice);
-          state.inventoryMovements = state.inventoryMovements.map(movement => String(movement.movementId).startsWith(`SALE-${previousId}-`)
-            ? { ...movement, movementId: `SALE-${canonical.id}-${String(movement.movementId).slice(previousId.length + 6)}` } : movement);
-          persistInvoiceHistory();
-          persistInventoryMovements();
-        });
-        if (!saved) throw transientAppsScriptError("La venta existe; falta conciliar su identidad local.");
-        payload.invoice = canonical;
-      }
-      if (result?.ok && action !== "status" && !action.startsWith("get_")) {
-        if (typeof notifyAdminPeers === "function") notifyAdminPeers({
-          reports: true,
-          inventory: ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock",
-            "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].includes(action)
-        });
-        appsScriptStatusAt = 0;
-        appsScriptStatusEpoch += 1;
-        appsScriptStatusPromise = null;
-      }
-      if (result?.ok && ["record_sale", "edit_sale", "delete_sale", "clear_income", "adjust_inventory", "upsert_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "clear_inventory_movements"].includes(action)) {
-        window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
-      }
-      if (typeof queueConfirmedReportChange === "function") await queueConfirmedReportChange(action, payload, result, operationId);
+      const batchRequest = action === "sync_sales_batch";
+      const acceptResult = async (action, payload, result, operationId) => {
+        if (result?.ok && action === "record_sale" && result.saleId && payload.invoice
+          && String(result.saleId) !== String(payload.invoice.id)) {
+          const previousId = String(payload.invoice.id);
+          const canonical = { ...payload.invoice, id: String(result.saleId) };
+          const saved = await persistCheckoutAtomically(() => {
+            state.invoiceHistory = state.invoiceHistory.map(invoice => String(invoice.id) === previousId ? { ...invoice, id: canonical.id } : invoice);
+            state.inventoryMovements = state.inventoryMovements.map(movement => String(movement.movementId).startsWith(`SALE-${previousId}-`)
+              ? { ...movement, movementId: `SALE-${canonical.id}-${String(movement.movementId).slice(previousId.length + 6)}` } : movement);
+            persistInvoiceHistory();
+            persistInventoryMovements();
+          });
+          if (!saved) throw transientAppsScriptError("La venta existe; falta conciliar su identidad local.");
+          payload.invoice = canonical;
+        }
+        if (!batchRequest && result?.ok && action !== "status" && !action.startsWith("get_")) {
+          if (typeof notifyAdminPeers === "function") notifyAdminPeers({
+            reports: true,
+            inventory: ["upsert_inventory", "sync_inventory", "adjust_inventory", "set_inventory_stock",
+              "delete_inventory", "clear_inventory", "record_sale", "edit_sale", "delete_sale"].includes(action)
+          });
+          appsScriptStatusAt = 0;
+          appsScriptStatusEpoch += 1;
+          appsScriptStatusPromise = null;
+        }
+        if (!batchRequest && result?.ok && ["record_sale", "edit_sale", "delete_sale", "clear_income", "adjust_inventory", "upsert_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory", "update_inventory_movement_cost", "clear_inventory_movements"].includes(action)) {
+          window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+        }
+        if (typeof queueConfirmedReportChange === "function") await queueConfirmedReportChange(action, payload, result, operationId);
+
+      };
+      if (action === "sync_sales_batch" && Array.isArray(result?.results)) {
+        for (const receipt of result.results) {
+          const operation = payload.operations.find(entry => entry.operationId === receipt.operationId);
+          if (operation) await acceptResult(operation.action, operation.payload, receipt.result, operation.operationId);
+        }
+        if (result.results.some(entry => entry.result?.ok)) {
+          if (typeof notifyAdminPeers === "function") notifyAdminPeers({ reports: true, inventory: true });
+          if (typeof appsScriptStatusAt !== "undefined") { appsScriptStatusAt = 0; appsScriptStatusEpoch += 1; appsScriptStatusPromise = null; }
+          window.setTimeout(() => void refreshBackgroundReports({ force: true }), 0);
+        }
+      } else await acceptResult(action, payload, result, operationId);
       return result || { ok: false, error: "Respuesta vacia del respaldo remoto." };
     } catch (error) {
       if (error?.name === "AbortError") throw transientAppsScriptError("La sincronización remota continúa en segundo plano.");
@@ -2926,7 +2953,8 @@ const App = (() => {
       }
       if (job.action === "adjust_inventory") ids.add(String(job.payload?.adjustment?.productId || ""));
       if (job.action === "sync_inventory") (job.payload?.items || []).forEach((item) => ids.add(String(item.productId || "")));
-      if (job.action === "record_sale") (job.payload?.invoice?.items || []).forEach((line) => ids.add(String(line.menu_item_id || "")));
+      if (["record_sale", "edit_sale"].includes(job.action)) (job.payload?.invoice?.items || []).forEach((line) => ids.add(String(line.menu_item_id || "")));
+      (job.payload?.productIds || []).forEach(id => ids.add(String(id)));
     });
     ids.delete("");
     return ids;
@@ -3024,6 +3052,7 @@ const App = (() => {
     if (state.appsScriptOutboxBusy) return false;
     state.appsScriptOutboxBusy = true;
     let activeJob = null;
+    let batchSupported = true;
     try {
       let jobs = readAppsScriptOutbox();
       while (true) {
@@ -3045,18 +3074,76 @@ const App = (() => {
         const pendingCount = jobs.filter((entry) => ["pending", "syncing"].includes(entry.status)).length;
         setInventorySyncStatus(`Sincronizando ${pendingCount} pendiente${pendingCount === 1 ? "" : "s"}`, "pending", "refresh-cw");
         recordSyncEvent("sending", job);
-        const result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.operationId || job.id);
+        let result;
+        {
+          const batch = [job];
+          const salesActions = ["record_sale", "edit_sale", "delete_sale"];
+          let remaining = jobs.filter(entry => entry.id !== job.id);
+          while (batchSupported && salesActions.includes(job.action) && batch.length < 20) {
+            const next = nextReadyAppsScriptJob(remaining, supabaseStatus, force, now);
+            if (!next || !salesActions.includes(next.action)) break;
+            batch.push(next);
+            remaining = remaining.filter(entry => entry.id !== next.id);
+          }
+          if (batch.length > 1) {
+            const reply = await appsScriptRequest("sync_sales_batch", { operations: batch.map(entry => ({
+              operationId: entry.operationId || entry.id, action: entry.action, payload: entry.payload
+            })) }, Math.max(APPS_SCRIPT_TIMEOUT_MS, 90000));
+            if (/accion no permitida:\s*sync_sales_batch/i.test(normalizeText(reply?.error || ""))) {
+              // Compatibility until Code.gs has been deployed.
+              batchSupported = false;
+              result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.operationId || job.id);
+            } else {
+              const receipts = new Map((reply?.results || []).map(entry => [entry.operationId, entry.result]));
+              const confirmed = batch.filter(entry => receipts.get(entry.operationId || entry.id)?.ok === true);
+              const confirmedIds = new Set(confirmed.map(entry => entry.id));
+              const rejected = [];
+              await flushDurableWrites();
+              const latest = readAppsScriptOutbox();
+              const remainingJobs = latest.filter(entry => !confirmedIds.has(entry.id)).map(entry => {
+                const receipt = receipts.get(entry.operationId || entry.id);
+                if (!receipt || receipt.ok === true) return { ...entry, ...(entry.id === job.id ? { status: "pending" } : {}) };
+                const permanent = receipt.retryable === false;
+                const updated = { ...entry, status: permanent ? (receipt.conflict ? "conflict" : "failed") : "pending",
+                  attempts: Number(entry.attempts || 0) + 1, updatedAt: new Date().toISOString(),
+                  lastError: receipt.error || "Lote pendiente de confirmación.",
+                  nextAttemptAt: permanent ? 0 : Date.now() + appsScriptRetryDelay(Number(entry.attempts || 0) + 1) };
+                rejected.push(updated);
+                return updated;
+              });
+              // One durable commit removes exactly the IDs confirmed in this
+              // envelope and merges operations queued while it was in flight.
+              if (!await writeAppsScriptOutbox(remainingJobs, [...confirmedIds])) throw new Error("No se pudo proteger la confirmación local del lote.");
+              const pendingIds = new Set(remainingJobs.flatMap(entry => [
+                entry.payload?.item?.productId, entry.payload?.adjustment?.productId, entry.payload?.productId,
+                ...(entry.payload?.invoice?.items || []).map(line => line.menu_item_id), ...(entry.payload?.productIds || [])
+              ]).filter(Boolean).map(String));
+              const lastReceipt = (reply?.results || []).at(-1)?.result;
+              const freshItems = (lastReceipt?.items || []).filter(item => !pendingIds.has(String(item.productId)));
+              if (freshItems.length) applyRemoteInventoryItems(freshItems);
+              confirmed.forEach(entry => recordSyncEvent("confirmed", { ...entry, status: "synced", durationMs: performance.now() - startedAt }));
+              for (const entry of rejected) {
+                recordSyncEvent(entry.status === "pending" ? "retry" : entry.status, { ...entry, error: entry.lastError });
+                if (entry.status !== "pending") toast(entry.lastError, "error", "inventory-job-rejected:" + entry.id);
+              }
+              activeJob = null;
+              jobs = readAppsScriptOutbox();
+              if (confirmed.length < batch.length) {
+                scheduleAppsScriptRetry(rejected.some(entry => entry.status === "pending") || !confirmed.length ? 1500 : 500);
+                return false;
+              }
+              continue;
+
+            }
+          } else result = await appsScriptRequest(job.action, job.payload, APPS_SCRIPT_TIMEOUT_MS, job.operationId || job.id);
+        }
+        await flushDurableWrites();
         const queuedAfterRequest = readAppsScriptOutbox();
         const pendingAfterCurrent = queuedAfterRequest.filter((entry) => entry.id !== job.id);
-        const pendingProductIds = new Set(pendingAfterCurrent.map((entry) =>
-          entry.action === "upsert_inventory"
-            ? entry.payload?.item?.productId
-            : entry.action === "adjust_inventory"
-              ? entry.payload?.adjustment?.productId
-              : entry.action === "set_inventory_stock"
-                ? entry.payload?.productId
-              : ""
-        ).filter(Boolean));
+        const pendingProductIds = new Set(pendingAfterCurrent.flatMap(entry => [
+          entry.payload?.item?.productId, entry.payload?.adjustment?.productId, entry.payload?.productId,
+          ...(entry.payload?.invoice?.items || []).map(line => line.menu_item_id), ...(entry.payload?.productIds || [])
+        ]).filter(Boolean).map(String));
         const applyFreshRemoteInventory = () => {
           const remoteItems = job.action === "upsert_inventory" && result?.item
             ? [result.item]
@@ -3072,7 +3159,7 @@ const App = (() => {
             job.status = result?.conflict ? "conflict" : "failed";
             job.lastError = result?.error || "Operacion rechazada";
             job.updatedAt = new Date().toISOString();
-            jobs = [...pendingAfterCurrent, job];
+            jobs = queuedAfterRequest.map(entry => entry.id === job.id ? job : entry);
             await writeAppsScriptOutbox(jobs);
             recordSyncEvent(job.status, {
               ...job,
@@ -8218,10 +8305,9 @@ const App = (() => {
         ? `<button class="ghost" type="button" data-show-more-income>Mostrar ${Math.min(60, allRecords.length - visibleRecords.length)} ventas más</button>`
         : "")
       : emptyState("Sin ventas en este rango", "Prueba otro periodo, medio de pago o término de búsqueda.", "receipt-text");
-    const pendingText = report.pendingCount ? ` · ${report.pendingCount} pendiente${report.pendingCount === 1 ? "" : "s"} de respaldo` : "";
     const limitedText = report.truncated ? " · mostrando las 300 más recientes" : "";
     const visibleText = allRecords.length > visibleRecords.length ? ` · ${visibleRecords.length} visibles` : "";
-    setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${pendingText}${visibleText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
+    setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${visibleText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
     state.incomeRenderedReport = report;
     state.incomeRenderedShiftSignature = shiftSignature;
     refreshIcons();
@@ -8626,7 +8712,6 @@ const App = (() => {
     const reportBefore = state.incomeReport;
     state.incomeRequestId = Number(state.incomeRequestId || 0) + 1;
     state.incomeLoading = false;
-    const outboxBefore = readAppsScriptOutbox();
     const remainingRecords = (reportBefore.records || []).filter((entry) => String(entry.saleId) !== String(saleId));
     const updatedTotals = { ...(reportBefore.totals || {}) };
     updatedTotals.income = Math.max(0, Number(updatedTotals.income || 0) - Number(record.total || 0));
@@ -8661,15 +8746,12 @@ const App = (() => {
       const current = inventoryFor(item);
       state.inventoryMeta[item.id] = { ...current, stock: current.stock + Number(line.quantity || 0), updatedAt: new Date().toISOString() };
     });
-    const hadPendingSale = outboxBefore.some((job) => job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId));
-    writeAppsScriptOutbox(outboxBefore.filter((job) => !(job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId))), outboxBefore.filter(job => job.action === "record_sale" && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(saleId)).map(job => job.id));
     persistInvoiceHistory();
     persistInventoryStore();
     $("#deleteIncomeDialog")?.close();
     renderIncomeReport();
     renderInventory();
-    if (!hadPendingSale) enqueueAppsScriptJob("delete_sale", { saleId, saleLink }, `sale-delete:${saleId}`);
-    else void queueConfirmedReportChange("delete_sale", { saleId, saleLink }, { ok: true }, `sale-delete:${saleId}`);
+    enqueueAppsScriptJob("delete_sale", { saleId, saleLink, productIds: (record.items || []).map(line => line.menuItemId || line.menu_item_id).filter(Boolean) }, `sale-delete:${saleId}`);
     toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
   };
 
@@ -8742,19 +8824,7 @@ const App = (() => {
     };
     state.incomeRequestId += 1;
     state.incomeLoading = false;
-    const jobs = readAppsScriptOutbox();
-    const pendingSaleIndex = jobs.findIndex((job) => job.action === "record_sale"
-      && String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId) === String(record.saleId));
-    if (pendingSaleIndex >= 0) {
-      jobs[pendingSaleIndex] = {
-        ...jobs[pendingSaleIndex],
-        payload: { invoice: { ...jobs[pendingSaleIndex].payload.invoice, ...corrected } }
-      };
-      writeAppsScriptOutbox(jobs);
-      void flushAppsScriptOutbox();
-    } else {
-      enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}:${uid()}`);
-    }
+    enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}:${uid()}`);
     const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
     if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
     else state.invoiceHistory.push(corrected);

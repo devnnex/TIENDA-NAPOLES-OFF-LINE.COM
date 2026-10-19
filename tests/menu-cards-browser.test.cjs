@@ -7,7 +7,7 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
  const server=http.createServer((req,res)=>{
   const url=new URL(req.url,'http://localhost');
   if(url.pathname.startsWith('/image/')){const buffer=objects.get(decodeURIComponent(url.pathname.slice(7)));res.writeHead(buffer?200:404,{'Content-Type':'image/png'});res.end(buffer);return;}
-  if(url.pathname==='/admin'){res.setHeader('Content-Type','text/html; charset=utf-8');res.end('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/menu-cards.css"><main><section id="brand"><form id="businessForm"></form></section></main><script src="/menu-cards.js"></script>');return;}
+  if(url.pathname==='/admin'){const form=fs.readFileSync(path.join(root,'admin.html'),'utf8').match(/<form class="form-grid" id="businessForm">[\s\S]*?<\/form>/)?.[0];assert.ok(form);res.setHeader('Content-Type','text/html; charset=utf-8');res.end('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/menu-cards.css"><main><section id="brand">'+form+'</section></main><script src="/menu-cards.js"></script>');return;}
   if(url.pathname==='/client'){res.setHeader('Content-Type','text/html');res.end(fs.readFileSync(path.join(root,'index.html'),'utf8').replace(/<script\b[^>]*>[\s\S]*?<\/script>/g,''));return;}
   const file=url.pathname.slice(1);if(!['style.css','menu-cards.css','menu-cards.js'].includes(file)){res.writeHead(404);res.end();return;}
   res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':'text/css');res.end(fs.readFileSync(path.join(root,file)));
@@ -54,6 +54,17 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
   await admin.locator('#menuCardsUpload').setInputFiles([first,second]);
   await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===2 && !document.querySelector('#menuCardsUpload').disabled);
   assert.equal(records.size,2);assert.equal(objects.size,2);assert.equal(await admin.locator('.menu-card-preview:visible').count(),2);
+  assert.equal(await admin.locator('#menuLibraryCount').textContent(),'2/20');
+  assert.equal(await admin.locator('#menuLibraryProgress').getAttribute('value'),'2');
+  assert.equal(await admin.locator('#menuLibraryStack [data-menu-library-image]').count(),2);
+  const layout=await admin.evaluate(()=>{const tile=document.querySelector('#menuCardLibrary').getBoundingClientRect(),save=document.querySelector('#saveBusinessBrand').getBoundingClientRect(),cover=document.querySelector('[data-upload-box="cover_url"]').getBoundingClientRect();return {tile:{x:tile.x,y:tile.y,right:tile.right},save:{x:save.x,y:save.y},cover:{x:cover.x,y:cover.y}};});
+  assert.ok(layout.cover.x<layout.tile.x && layout.tile.right<=layout.save.x,'Guardar marca debe quedar a la derecha de Cartas');
+  assert.ok(Math.abs(layout.tile.y-layout.save.y)<8 && Math.abs(layout.cover.y-layout.tile.y)<3,'Logo, Portada, Carta y Guardar permanecen en la misma fila');
+  if(process.env.POS_QA_ARTIFACTS){fs.mkdirSync(process.env.POS_QA_ARTIFACTS,{recursive:true});await admin.locator('#businessForm').screenshot({path:path.join(process.env.POS_QA_ARTIFACTS,'marca-cartas-fila.png')});}
+  await admin.setViewportSize({width:375,height:812});
+  assert.equal(await admin.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'La fila de Marca se adapta al móvil sin desbordarse');
+  assert.equal(await admin.evaluate(()=>document.querySelector('#saveBusinessBrand').getBoundingClientRect().top>=document.querySelector('#menuCardLibrary').getBoundingClientRect().bottom),true);
+  await admin.setViewportSize({width:1280,height:720});
   await admin.locator('#menuCardsUpload').setInputFiles(first);await admin.waitForFunction(()=>!document.querySelector('#menuCardsUpload').disabled);assert.equal(records.size,2);
   // Segundo contexto de navegador: no comparte almacenamiento con la administración.
   const clientContext=await browser.newContext({viewport:{width:375,height:812},isMobile:true,hasTouch:true});

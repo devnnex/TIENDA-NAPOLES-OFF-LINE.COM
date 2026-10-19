@@ -22,11 +22,12 @@
 #menuCardLibrary [hidden] { display: none !important; }
 @media(max-width:1100px) { #businessForm.has-menu-library > .brand-save-actions { grid-column: auto; } }
 @media(max-width:640px) { #businessForm.has-menu-library > .brand-save-actions { grid-column: 1 / -1; } }
-.menu-cards-admin { margin: 1.25rem 0; border: 1px solid #dce2e8; border-radius: 16px; background: #fff; }
-.menu-cards-admin > summary { padding: 1rem; cursor: pointer; font-weight: 800; }
+.menu-cards-admin { width: min(900px,94vw); max-width: 94vw; max-height: 90dvh; padding: 0; border: 1px solid #dce2e8; border-radius: 16px; background: #fff; color: #17202b; }
+.menu-cards-admin::backdrop { background: rgba(10,18,28,.65); }
+.menu-cards-editor-close { display: flex; justify-content: flex-end; padding: .5rem; }
 .menu-cards-body { padding: 0 1rem 1rem; }
 .menu-cards-body p { line-height: 1.5; }
-.menu-cards-admin .is-error { color: #a52a2a; }
+.menu-cards-admin .is-error, #menuCardLibrary .is-error { color: #a52a2a; }
 .menu-card-actions { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
 .menu-cards-upload, .menu-card-replace { position: relative; cursor: pointer; overflow: hidden; }
 .menu-cards-upload input, .menu-card-replace input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }

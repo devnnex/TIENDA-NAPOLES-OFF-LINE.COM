@@ -10,8 +10,10 @@ window.MenuCards = (() => {
   const libraryPreviews = new Map();
   const storage = () => ctx.sb.storage.from('pos-menu-cards');
   const status = (message, error = false) => {
-    const node = $('#menuCardsStatus');
-    if (node) { node.textContent = message; node.classList.toggle('is-error', error); }
+    for (const selector of ['#menuCardsStatus','#menuCardsEditorStatus']) {
+      const node = $(selector);
+      if (node) { node.textContent = error ? message : ''; node.hidden = !error; node.classList.toggle('is-error', error); }
+    }
   };
   const requireOnline = () => { if (!navigator.onLine) throw new Error('Conéctate a internet para consultar o guardar la Carta.'); };
   const rpc = async (name, args) => {
@@ -33,11 +35,13 @@ window.MenuCards = (() => {
   const renderLibrary = () => {
     const stack=$('#menuLibraryStack');
     if (!stack) return;
-    $('#menuLibraryCount').textContent=`${cards.length}/20`;
+    $('#menuCardLibrary').setAttribute('aria-busy',String(busy));
+    $('#menuCardLibrary').dataset.loaded=String(loaded);
+    $('#menuLibraryCount').textContent=`${cards.length}/2`;
     $('#menuLibraryProgress').value=cards.length;
     $('#menuLibraryUploadStatus').textContent=busy?'Subiendo imágenes…':loaded?'Subir imágenes · JPG, PNG o WebP':'Cargando biblioteca…';
-    const disabled=busy || !loaded || cards.length>=20;
-    stack.innerHTML=cards.length?cards.slice(0,5).map((card,index)=>`<button type="button" class="menu-library-card" data-menu-library-upload style="--card-index:${index};--card-depth:${5-index}" aria-label="Subir otra imagen de Carta" ${disabled?'disabled':''}>
+    const disabled=busy || !loaded;
+    stack.innerHTML=cards.length?cards.slice(0,2).map((card,index)=>`<button type="button" class="menu-library-card" data-menu-library-upload style="--card-index:${index};--card-depth:${2-index}" aria-label="Administrar imágenes de Carta" ${disabled?'disabled':''}>
       <img data-menu-library-image="${escape(card.id)}" ${libraryPreviews.has(card.image_path)?`src="${escape(libraryPreviews.get(card.image_path))}"`: 'hidden'} alt="${escape(card.name)}"><span>${escape(card.name)}</span></button>`).join('')
       :`<button type="button" class="menu-library-empty" data-menu-library-upload ${busy?'disabled':''}><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="5" y="3" width="16" height="16" rx="2"/><path d="M2 7v13a2 2 0 0 0 2 2h13M5 15l5-5 5 5 3-3 3 3"/><circle cx="16" cy="7" r="1"/></svg><span>${loaded?'Subir imágenes de Carta':'Cargar biblioteca'}</span></button>`;
   };
@@ -54,10 +58,9 @@ window.MenuCards = (() => {
       <label class="ghost menu-card-replace">Reemplazar imagen<input type="file" accept="image/jpeg,image/png,image/webp" data-menu-replace></label>
       <button type="button" class="ghost" data-menu-action="up" aria-label="Subir ${escape(c.name)} en el orden" ${i === 0 ? 'disabled' : ''}>↑</button>
       <button type="button" class="ghost" data-menu-action="down" aria-label="Bajar ${escape(c.name)} en el orden" ${i === cards.length-1 ? 'disabled' : ''}>↓</button>
-      <button type="button" class="ghost danger-text" data-menu-action="delete">Eliminar</button></div></div></article>`).join('') || '<p>Aún no hay imágenes publicadas.</p>';
-    $('#menuCardsUpload').disabled = busy || !loaded || cards.length >= 20;
+      <button type="button" class="ghost danger-text" data-menu-action="delete">Eliminar</button></div></div></article>`).join('');
+    $('#menuCardsUpload').disabled = busy || !loaded || cards.length >= 2;
     renderLibrary();
-    $('#menuCardsReload').disabled = busy;
     list.querySelectorAll('input,button').forEach(node => { if (busy) node.disabled = true; });
     cards.forEach(async c => {
       try {
@@ -80,7 +83,7 @@ window.MenuCards = (() => {
         cards = await rpc('pos_list_menu_cards',{p_auth_token:ctx.getAuthToken()});
         if (!Array.isArray(cards)) throw new Error('La biblioteca recibida no es válida.');
         loaded = true;
-        renderAdmin(); status(`${cards.length} imagen(es) publicada(s). Los cambios se guardan por carta.`);
+        renderAdmin(); status('');
         return true;
       } catch (error) { status(`No se pudo cargar la Carta. ${error.message}`,true); return false; }
       finally { loadJob = null; }
@@ -120,7 +123,7 @@ window.MenuCards = (() => {
     try {
       requireOnline();
       if (!loaded) throw new Error('Recarga la biblioteca antes de subir imágenes.');
-      if (cards.length + (replacing ? 0 : files.length) > 20) throw new Error('Puedes guardar hasta 20 imágenes de Carta.');
+      if (cards.length + (replacing ? 0 : files.length) > 2) throw new Error('Puedes guardar hasta 2 imágenes de Carta.');
       const hashes = [];
       for (const file of files) hashes.push(await validateFile(file));
       for (let i=0;i<files.length;i++) {
@@ -236,17 +239,18 @@ window.MenuCards = (() => {
     if(ctx.page==='admin') {
       const form=$('#businessForm');
       const library=document.createElement('div');library.className='menu-library upload-field';library.id='menuCardLibrary';
-      library.innerHTML=`<label class="menu-library-upload"><input id="menuCardsUpload" type="file" accept="image/jpeg,image/png,image/webp" multiple disabled><span><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="5" y="3" width="16" height="16" rx="2"/><path d="M2 7v13a2 2 0 0 0 2 2h13M5 15l5-5 5 5 3-3 3 3"/><circle cx="16" cy="7" r="1"/></svg> Cartas del negocio</span><small id="menuLibraryUploadStatus">Cargando biblioteca…</small></label><div class="menu-library-stack" id="menuLibraryStack" aria-label="Biblioteca de cartas"></div><div class="menu-library-progress"><label for="menuLibraryProgress">Imágenes subidas <strong id="menuLibraryCount">0/20</strong></label><progress id="menuLibraryProgress" value="0" max="20">0 de 20</progress></div>`;
+      library.innerHTML=`<label class="menu-library-upload"><input id="menuCardsUpload" type="file" accept="image/jpeg,image/png,image/webp" multiple disabled><span><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="5" y="3" width="16" height="16" rx="2"/><path d="M2 7v13a2 2 0 0 0 2 2h13M5 15l5-5 5 5 3-3 3 3"/><circle cx="16" cy="7" r="1"/></svg> Cartas del negocio</span><small id="menuLibraryUploadStatus">Cargando biblioteca…</small></label><div class="menu-library-stack" id="menuLibraryStack" aria-label="Biblioteca de cartas"></div><div class="menu-library-progress"><label for="menuLibraryProgress">Imágenes subidas <strong id="menuLibraryCount">0/2</strong></label><progress id="menuLibraryProgress" value="0" max="2">0 de 2</progress></div><small id="menuCardsStatus" role="status" aria-live="polite" hidden></small>`;
       const saveActions=$('.brand-save-actions',form);
       if(saveActions)saveActions.before(library);else form?.append(library);
       form?.classList.add('has-menu-library');
-      admin=document.createElement('details');admin.className='menu-cards-admin';
-      admin.innerHTML=`<summary>Carta · administrar imágenes</summary><div class="menu-cards-body"><p>Sube hasta 20 imágenes JPG, PNG o WebP (15 MB por imagen). Se publican al terminar la carga. Puedes elegir su orden y sus mesas.</p><div class="menu-card-actions"><button class="ghost" id="menuCardsReload" type="button">Recargar biblioteca</button></div><p id="menuCardsStatus" role="status" aria-live="polite">Abre la biblioteca para cargar las imágenes.</p><img id="menuCardsPending" class="menu-card-preview" alt="Vista previa · carga sin confirmar" hidden><div id="menuCardsList"></div></div>`;
-      $('#businessForm')?.insertAdjacentElement('afterend',admin);
-      admin.addEventListener('toggle',()=>{if(admin.open && !busy) void loadLibrary();});
-      $('#menuCardsReload').addEventListener('click',()=>void loadLibrary());
+      admin=document.createElement('dialog');admin.className='menu-cards-admin';admin.id='menuCardsEditor';
+      admin.setAttribute('aria-label','Editar imágenes de Carta');
+      admin.innerHTML=`<div class="menu-cards-editor-close"><button type="button" class="icon-btn" id="closeMenuCardsEditor" aria-label="Cerrar imágenes de Carta">✕</button></div><div class="menu-cards-body"><p id="menuCardsEditorStatus" role="status" aria-live="polite" hidden></p><div id="menuCardsList"></div></div>`;
+      document.body.append(admin);
+      const pending=document.createElement('img');pending.id='menuCardsPending';pending.className='menu-card-preview';pending.alt='Vista previa · carga sin confirmar';pending.hidden=true;library.append(pending);
+      $('#closeMenuCardsEditor').addEventListener('click',()=>admin.close());
       $('#menuCardsUpload').addEventListener('change',e=>void uploadFiles(e.target.files));
-      library.addEventListener('click',e=>{if(e.target.closest('[data-menu-library-upload]')){if(!loaded)void loadLibrary();else if(!$('#menuCardsUpload').disabled)$('#menuCardsUpload').click();}});
+      library.addEventListener('click',e=>{if(e.target.closest('[data-menu-library-upload]')){if(!loaded)void loadLibrary();else if(cards.length){admin.showModal();void loadLibrary();}else if(!$('#menuCardsUpload').disabled)$('#menuCardsUpload').click();}});
       renderLibrary();
       const observer=new IntersectionObserver(entries=>{if(entries.some(entry=>entry.isIntersecting) && ctx.canManage() && !loaded && !busy)void loadLibrary();});
       observer.observe(library);

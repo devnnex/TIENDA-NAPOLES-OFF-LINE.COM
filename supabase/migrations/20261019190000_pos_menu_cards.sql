@@ -52,7 +52,7 @@ begin
   end if;
   if p_expected_version is null or coalesce(old.version,0) <> p_expected_version then raise exception 'Otra persona cambió esta carta. Recarga la biblioteca antes de guardar.'; end if;
   if p_id is null or length(trim(coalesce(p_name,''))) not between 1 and 80 or p_all_tables is null then raise exception 'Nombre de carta inválido.'; end if;
-  if old.id is null and (select count(*) from public.pos_menu_cards)>=20 then raise exception 'Máximo 20 imágenes. Elimina una antes de subir otra.'; end if;
+  if old.id is null and (select count(*) from public.pos_menu_cards)>=2 then raise exception 'Máximo 2 imágenes. Elimina una antes de subir otra.'; end if;
   if p_image_path !~ ('^cards/' || p_id::text || '/[a-f0-9]{64}\.(jpg|png|webp)$')
     or not exists(select 1 from storage.objects where bucket_id='pos-menu-cards' and name=p_image_path) then
     raise exception 'Primero sube una imagen válida de esta carta.';

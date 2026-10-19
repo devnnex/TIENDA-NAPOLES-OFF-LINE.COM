@@ -27,6 +27,8 @@ test('Carta: SQL idempotente, permisos reales RLS, mesas, concurrencia, orden y 
    insert into restaurant_tables(id) values('${ids[0]}'),('${ids[1]}');`);
   const sql=fs.readFileSync(path.join(__dirname,'../supabase/migrations/20261019190000_pos_menu_cards.sql'),'utf8');
   await db.exec(sql);await db.exec(sql);
+  const limitSql=fs.readFileSync(path.join(__dirname,'../supabase/migrations/20261019220000_pos_menu_cards_limit_two.sql'),'utf8');
+  await db.exec(limitSql);await db.exec(limitSql);
   const value=async(sql,args)=>(await db.query(sql,args)).rows[0]?.result;
   const list=token=>value('select pos_list_menu_cards($1) result',[token]);
   const save=(n,token='boss',tables=[],all=true,version=0,name='Carta '+n)=>value('select pos_save_menu_card($1,$2,$3,$4,$5::uuid[],$6,$7) result',[cardId(n),name,imagePath(n),all,tables,version,token]);
@@ -45,6 +47,7 @@ test('Carta: SQL idempotente, permisos reales RLS, mesas, concurrencia, orden y 
   await assert.rejects(save(1,'brand',[ids[1]],false,0),/Otra persona/);
   await assert.rejects(save(2,'boss',[cardId(99)],false),/mesas inactivas/);
   await save(2);assert.equal((await get(ids[0])).length,2);assert.equal((await get(ids[1])).length,1);
+  await upload(99);await assert.rejects(save(99),/Máximo 2/);
   await assert.rejects(get(ids[0],'bad'),/QR válido/);
   await db.query('select pos_reorder_menu_cards($1::uuid[],$2)',[[cardId(2),cardId(1)],'boss']);
   assert.equal((await get(ids[0]))[0].id,cardId(2));
@@ -69,9 +72,9 @@ test('Carta: SQL idempotente, permisos reales RLS, mesas, concurrencia, orden y 
   await db.query("select set_config('test.x_app_token','brand',false)");await db.exec('set role anon');
   assert.equal((await db.query('delete from storage.objects where name=$1 returning *',[imagePath(1)])).rows.length,1);
   await db.exec('reset role');assert.equal((await get(ids[0])).length,1);
-  for(let n=3;n<=21;n++){if(n>3)await upload(n);await save(n);}
-  await upload(22);await assert.rejects(save(22),/Máximo 20/);
-  assert.equal((await list('boss')).length,20);
+  await save(3);
+  await upload(4);await assert.rejects(save(4),/Máximo 2/);
+  assert.equal((await list('boss')).length,2);
   assert.deepEqual((await db.query('select * from service_requests')).rows,[{id:1,message:'Sin modificar'}]);
   assert.equal((await db.query('select count(*)::int n from restaurant_tables')).rows[0].n,2);
  }finally{await db.close();}

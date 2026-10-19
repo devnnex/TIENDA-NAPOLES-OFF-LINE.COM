@@ -45,16 +45,26 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
    }}};
    MenuCards.init({page:admin?'admin':'client',sb,getAuthToken:()=> 'brand',getTables:()=>tables,getCurrentTable:()=>currentMenuTable,canManage:()=>true,confirm:async()=>true});
   },{admin,tables});
-  if(admin){await page.locator('summary').click();await page.waitForFunction(()=>!document.querySelector('#menuCardsUpload').disabled);}
+  if(admin)await page.waitForFunction(()=>document.querySelector('#menuCardLibrary').dataset.loaded==='true');
+ };
+ const openEditor=async page=>{
+  if(await page.locator('#menuCardsEditor').evaluate(n=>n.open))await page.locator('#closeMenuCardsEditor').click();
+  await page.locator('#menuLibraryStack button').first().click();
+  await page.waitForFunction(()=>document.querySelector('#menuCardsEditor').open && document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');
  };
  const fixture=async(page,color,name)=>({name,mimeType:'image/png',buffer:Buffer.from(await page.evaluate(color=>{const canvas=document.createElement('canvas');canvas.width=600;canvas.height=1000;const ctx=canvas.getContext('2d');ctx.fillStyle=color;ctx.fillRect(0,0,600,1000);ctx.fillStyle='black';ctx.font='32px sans-serif';ctx.fillText('Carta de prueba · $ 12.500',20,100);return canvas.toDataURL().split(',')[1];},color),'base64')});
  try{
   const admin=await browser.newPage();await setup(admin,true);
   const first=await fixture(admin,'#eef4ff','Bebidas.png'),second=await fixture(admin,'#fff4ed','Comidas.png'),replacement=await fixture(admin,'#e3f8ec','Nueva.png');
   await admin.locator('#menuCardsUpload').setInputFiles([first,second]);
-  await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===2 && !document.querySelector('#menuCardsUpload').disabled);
-  assert.equal(records.size,2);assert.equal(objects.size,2);assert.equal(await admin.locator('.menu-card-preview:visible').count(),2);
-  assert.equal(await admin.locator('#menuLibraryCount').textContent(),'2/20');
+  await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===2 && document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');
+  assert.equal(records.size,2);assert.equal(objects.size,2);
+  assert.equal(await admin.locator('#menuCardsUpload').isDisabled(),true);
+  assert.equal(await admin.locator('details.menu-cards-admin, #menuCardsReload').count(),0);
+  assert.equal(await admin.locator('#menuCardsEditor').isVisible(),false);
+  await openEditor(admin);assert.equal(await admin.locator('.menu-card-preview:visible').count(),2);
+  await admin.locator('#closeMenuCardsEditor').click();
+  assert.equal(await admin.locator('#menuLibraryCount').textContent(),'2/2');
   assert.equal(await admin.locator('#menuLibraryProgress').getAttribute('value'),'2');
   assert.equal(await admin.locator('#menuLibraryStack [data-menu-library-image]').count(),2);
   const layout=await admin.evaluate(()=>{const tile=document.querySelector('#menuCardLibrary').getBoundingClientRect(),save=document.querySelector('#saveBusinessBrand').getBoundingClientRect(),cover=document.querySelector('[data-upload-box="cover_url"]').getBoundingClientRect();return {tile:{x:tile.x,y:tile.y,right:tile.right},save:{x:save.x,y:save.y},cover:{x:cover.x,y:cover.y}};});
@@ -65,7 +75,7 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
   assert.equal(await admin.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'La fila de Marca se adapta al móvil sin desbordarse');
   assert.equal(await admin.evaluate(()=>document.querySelector('#saveBusinessBrand').getBoundingClientRect().top>=document.querySelector('#menuCardLibrary').getBoundingClientRect().bottom),true);
   await admin.setViewportSize({width:1280,height:720});
-  await admin.locator('#menuCardsUpload').setInputFiles(first);await admin.waitForFunction(()=>!document.querySelector('#menuCardsUpload').disabled);assert.equal(records.size,2);
+  await admin.locator('#menuCardsUpload').setInputFiles(first);await admin.waitForFunction(()=>document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');assert.equal(records.size,2);
   // Segundo contexto de navegador: no comparte almacenamiento con la administración.
   const clientContext=await browser.newContext({viewport:{width:375,height:812},isMobile:true,hasTouch:true});
   const client=await clientContext.newPage();await setup(client,false);
@@ -77,10 +87,10 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
   await client.locator('#menuViewerZoom').click();await client.locator('#menuViewerClose').click();assert.equal(await client.locator('#openMenuCards').evaluate(n=>n===document.activeElement),true);
   assert.equal(await client.locator('[data-request=waiter]').count(),1);assert.equal(await client.locator('[data-request=bill]').count(),1);
   // Edita nombre, asignación y orden sin tocar las mesas reales.
-  let row=admin.locator('[data-menu-card]').first();await row.locator('[data-menu-name]').fill('Bebidas de afuera');await row.locator('[data-menu-all]').uncheck();await row.locator('[data-menu-table][value=a]').check();
-  await row.locator('[data-menu-action=save]').click();await admin.waitForFunction(()=>!document.querySelector('#menuCardsReload').disabled);
-  row=admin.locator('[data-menu-card]').first();await row.locator('[data-menu-action=down]').click();await admin.waitForFunction(()=>document.querySelector('[data-menu-name]').value==='Comidas'&&!document.querySelector('#menuCardsReload').disabled);
-  row=admin.locator('[data-menu-card]').last();await row.locator('[data-menu-replace]').setInputFiles(replacement);await admin.waitForFunction(()=>!document.querySelector('#menuCardsUpload').disabled);
+  await openEditor(admin);let row=admin.locator('[data-menu-card]').first();await row.locator('[data-menu-name]').fill('Bebidas de afuera');await row.locator('[data-menu-all]').uncheck();await row.locator('[data-menu-table][value=a]').check();
+  await row.locator('[data-menu-action=save]').click();await admin.waitForFunction(()=>document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');
+  row=admin.locator('[data-menu-card]').first();await row.locator('[data-menu-action=down]').click();await admin.waitForFunction(()=>document.querySelector('[data-menu-name]').value==='Comidas'&&document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');
+  row=admin.locator('[data-menu-card]').last();await row.locator('[data-menu-replace]').setInputFiles(replacement);await admin.waitForFunction(()=>document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');
   assert.equal(objects.size,2);assert.equal(records.size,2);
   await client.reload();await client.addScriptTag({path:path.join(root,'menu-cards.js')});
   // Recargar el documento restablece el módulo y lee nuevamente el servidor.
@@ -89,8 +99,8 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
   assert.equal(await client.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
   await client.locator('#menuViewerClose').click();
   await admin.reload();await admin.evaluate(({tables})=>{const sb={rpc:(name,args)=>menuBackend('rpc',{name,args}),storage:{from:()=>({createSignedUrl:p=>menuBackend('sign',p),remove:p=>menuBackend('remove',p),upload:async(path,file)=>menuBackend('upload',{path,bytes:Array.from(new Uint8Array(await file.arrayBuffer()))})})}};MenuCards.init({page:'admin',sb,getAuthToken:()=> 'brand',getTables:()=>tables,canManage:()=>true,confirm:async()=>true});},{tables});
-  await admin.locator('summary').click();await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===2);
-  await admin.locator('[data-menu-card]').last().locator('[data-menu-action=delete]').click();await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===1&&!document.querySelector('#menuCardsReload').disabled);assert.equal(records.size,1);assert.equal(objects.size,1);
+  await admin.waitForFunction(()=>document.querySelector('#menuCardLibrary').dataset.loaded==='true');await openEditor(admin);await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===2);
+  await admin.locator('[data-menu-card]').last().locator('[data-menu-action=delete]').click();await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===1&&document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');assert.equal(records.size,1);assert.equal(objects.size,1);
   // Un archivo falso y un fallo de red no se presentan como publicados.
   await admin.locator('#menuCardsUpload').setInputFiles({name:'falsa.png',mimeType:'image/png',buffer:Buffer.from('<svg onload="alert(1)">')});await admin.waitForFunction(()=>document.querySelector('#menuCardsStatus').classList.contains('is-error'));assert.equal(records.size,1);
   await admin.locator('#menuCardsUpload').setInputFiles({name:'grande.png',mimeType:'image/png',buffer:Buffer.alloc(15*1024*1024+1)});await admin.waitForFunction(()=>document.querySelector('#menuCardsStatus').textContent.includes('15 MB'));assert.equal(records.size,1);
@@ -100,10 +110,10 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
   failUpload=true;await admin.locator('#menuCardsUpload').setInputFiles(first);await admin.waitForFunction(()=>document.querySelector('#menuCardsStatus').textContent.includes('Red interrumpida'));assert.equal(records.size,1);failUpload=false;
   // Respuesta perdida después del commit: recargar y reintentar no duplica.
   lostResponse=true;await admin.locator('#menuCardsUpload').setInputFiles(first);await admin.waitForFunction(()=>document.querySelector('#menuCardsStatus').textContent.includes('Se perdió'));assert.equal(records.size,2);
-  await admin.locator('#menuCardsUpload').setInputFiles(first);await admin.waitForFunction(()=>!document.querySelector('#menuCardsUpload').disabled);assert.equal(records.size,2);
-  allowed=false;await admin.locator('#menuCardsReload').click();await admin.waitForFunction(()=>document.querySelector('#menuCardsStatus').textContent.includes('No tienes permiso'));allowed=true;
+  await admin.locator('#menuCardsUpload').setInputFiles(first);await admin.waitForFunction(()=>document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');assert.equal(records.size,2);
+  allowed=false;await openEditor(admin);await admin.waitForFunction(()=>document.querySelector('#menuCardsStatus').textContent.includes('No tienes permiso'));allowed=true;
   assert.equal(calls.some(([,arg])=>arg?.name && !arg.name.startsWith('pos_')),false);
-  if(process.env.POS_QA_ARTIFACTS){fs.mkdirSync(process.env.POS_QA_ARTIFACTS,{recursive:true});await admin.locator('#menuCardsReload').click();await admin.waitForFunction(()=>!document.querySelector('#menuCardsStatus').classList.contains('is-error'));await admin.screenshot({path:path.join(process.env.POS_QA_ARTIFACTS,'carta-admin.png'),fullPage:true});await client.evaluate(()=>currentMenuTable={id:'a',qr_code:'qr-a'});await client.locator('#openMenuCards').click();await client.locator('#menuViewerImage').waitFor({state:'visible'});await client.screenshot({path:path.join(process.env.POS_QA_ARTIFACTS,'carta-movil.png')});}
+  if(process.env.POS_QA_ARTIFACTS){fs.mkdirSync(process.env.POS_QA_ARTIFACTS,{recursive:true});await openEditor(admin);await admin.waitForFunction(()=>!document.querySelector('#menuCardsStatus').classList.contains('is-error'));await admin.locator('#closeMenuCardsEditor').click();await admin.screenshot({path:path.join(process.env.POS_QA_ARTIFACTS,'carta-admin.png'),fullPage:true});await client.evaluate(()=>currentMenuTable={id:'a',qr_code:'qr-a'});await client.locator('#openMenuCards').click();await client.locator('#menuViewerImage').waitFor({state:'visible'});await client.screenshot({path:path.join(process.env.POS_QA_ARTIFACTS,'carta-movil.png')});}
  }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}
 });
 

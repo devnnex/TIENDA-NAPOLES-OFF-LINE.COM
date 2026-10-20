@@ -11,8 +11,8 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261019-inventory-burst-v1">
-    <link rel="stylesheet" href="menu-cards.css?v=20261019-dos-cartas-v3">
+    <link rel="stylesheet" href="style.css?v=20261019-visual-details-v1">
+    <link rel="stylesheet" href="menu-cards.css?v=20261019-visual-details-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
   <body data-page="admin">
@@ -382,9 +382,9 @@
         <div class="movement-summary" id="movementSummary"></div>
         <div class="panel movement-panel">
           <div class="inventory-toolbar">
-            <label class="movement-product-field">Producto<span class="movement-product-picker" id="movementProductPicker">
+            <label class="movement-product-field" for="movementProductToggle">Producto<span class="movement-product-picker" id="movementProductPicker">
               <select id="movementProductFilter" class="visually-hidden" tabindex="-1" aria-hidden="true"><option value="all">Todos los productos</option></select>
-              <button type="button" id="movementProductToggle" role="combobox" aria-label="Producto" aria-expanded="false" aria-controls="movementProductOptions" aria-haspopup="listbox">Todos los productos</button>
+              <input type="text" id="movementProductToggle" role="combobox" aria-label="Buscar o seleccionar producto" aria-autocomplete="list" aria-expanded="false" aria-controls="movementProductOptions" aria-haspopup="listbox" autocomplete="off" placeholder="Todos los productos"><span class="movement-product-chevron" aria-hidden="true">⌄</span>
               <span class="movement-product-options" id="movementProductOptions" role="listbox" aria-label="Productos" hidden></span>
             </span></label>
           </div>
@@ -938,7 +938,7 @@
     <script defer src="vendor/qrcode.min.js"></script>
     <script defer src="vendor/jspdf.umd.min.js"></script>
     <script defer src="sales-shift.js?v=20261019-pos-integrity-v1"></script>
-    <script defer src="menu-cards.js?v=20261019-consumo-v1"></script>
-    <script defer src="app.js?v=20261019-inventory-burst-v1"></script>
+    <script defer src="menu-cards.js?v=20261019-visual-details-v1"></script>
+    <script defer src="app.js?v=20261019-visual-details-v1"></script>
   </body>
 </html>

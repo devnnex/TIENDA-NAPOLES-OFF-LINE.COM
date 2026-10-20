@@ -58,7 +58,7 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
   const first=await fixture(admin,'#eef4ff','Bebidas.png'),second=await fixture(admin,'#fff4ed','Comidas.png'),replacement=await fixture(admin,'#e3f8ec','Nueva.png');
   await admin.locator('#menuCardsUpload').setInputFiles([first,second]);
   await admin.waitForFunction(()=>document.querySelectorAll('[data-menu-card]').length===2 && document.querySelector('#menuCardLibrary').getAttribute('aria-busy')==='false');
-  assert.equal(records.size,2);assert.equal(objects.size,2);
+  assert.equal(records.size,2);assert.equal(objects.size,2);assert.ok([...records.values()].every(card=>card.all_tables && card.table_ids.length===0),"Cada carta nueva queda disponible para todas las mesas por defecto.");
   assert.equal(await admin.locator('#menuCardsUpload').isDisabled(),true);
   assert.equal(await admin.locator('details.menu-cards-admin, #menuCardsReload').count(),0);
   assert.equal(await admin.locator('#menuCardsEditor').isVisible(),false);
@@ -82,7 +82,7 @@ test('Carta: carga múltiple, confirmación, persistencia entre dispositivos, re
   await client.locator('#openMenuCards').click();await client.locator('#menuViewerImage').waitFor({state:'visible'});
   assert.equal(await client.locator('#menuViewerTitle').textContent(),'Bebidas');assert.equal(await client.locator('#menuViewerCounter').textContent(),'1 de 2');
   await client.locator('#menuViewerNext').click();await client.waitForFunction(()=>document.querySelector('#menuViewerTitle').textContent==='Comidas'&&!document.querySelector('#menuViewerImage').hidden);
-  await client.locator('#menuViewerZoom').click();assert.equal(await client.locator('#menuViewerImage').evaluate(n=>n.style.width),'250%');
+  await client.locator('#menuViewerZoom').click();await client.waitForFunction(()=>document.querySelector('#menuViewerImage').style.transform.includes('scale(2.5)'));assert.equal(await client.locator('#menuViewerZoom').getAttribute('aria-pressed'),'true');
   assert.equal(await client.locator('#menuViewerImage').evaluate(n=>Math.abs(n.width/n.height-n.naturalWidth/n.naturalHeight)<.01),true);
   await client.locator('#menuViewerZoom').click();await client.locator('#menuViewerClose').click();assert.equal(await client.locator('#openMenuCards').evaluate(n=>n===document.activeElement),true);
   assert.equal(await client.locator('[data-request=waiter]').count(),1);assert.equal(await client.locator('[data-request=bill]').count(),1);

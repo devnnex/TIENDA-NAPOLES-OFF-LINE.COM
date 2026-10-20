@@ -3247,7 +3247,7 @@ const App = (() => {
           jobs[currentIndex] = job;
           await writeAppsScriptOutbox(jobs);
           recordSyncEvent("retry", { ...job, durationMs: performance.now() - startedAt, error: job.lastError });
-          setInventorySyncStatus(`${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}; reintento automatico`, "error", "cloud-off");
+          setInventorySyncStatus(`${jobs.length} pendiente${jobs.length === 1 ? "" : "s"}; reintento automatico`, "local", "cloud-off");
           scheduleAppsScriptRetry(job.nextAttemptAt - Date.now());
           return false;
         }
@@ -3292,7 +3292,7 @@ const App = (() => {
           scheduleAppsScriptRetry(activeJob.nextAttemptAt - Date.now());
         }
       }
-      setInventorySyncStatus("Sin conexion; cambios protegidos localmente", "error", "cloud-off");
+      setInventorySyncStatus("Sin conexion; cambios protegidos localmente", "local", "cloud-off");
       return false;
     } finally {
       state.appsScriptOutboxBusy = false;
@@ -6916,33 +6916,44 @@ const App = (() => {
   const syncMovementProductPicker = () => {
     const select=$("#movementProductFilter"),toggle=$("#movementProductToggle"),list=$("#movementProductOptions");
     if(!select || !toggle || !list) return;
-    toggle.innerHTML=escapeHTML(select.selectedOptions[0]?.textContent || "Todos los productos")+icon("chevron-down",18);
-    const markup=[...select.options].map((option,index)=>`<button type="button" role="option" id="movement-product-option-${index}" data-movement-product="${escapeHTML(option.value)}" aria-selected="${String(option.selected)}">${escapeHTML(option.textContent)}</button>`).join("");
+    const label=select.selectedOptions[0]?.textContent || "Todos los productos";
+    if(!toggle.dataset.searching) toggle.value=label;
+    toggle.placeholder=label;
+    const terms=normalizeText(toggle.dataset.searching ? toggle.value : "").split(/\s+/).filter(Boolean);
+    const options=[...select.options].filter(option=>{
+      const words=option.textContent.split(/\s+/).map(word=>word[0] || "").join("");
+      const text=normalizeText(option.textContent+" "+(state.inventoryMeta?.[option.value]?.code || "")+" "+words);
+      return option.value==="all" || terms.every(term=>text.includes(term));
+    });
+    const markup=options.map(option=>'<button type="button" role="option" id="movement-product-option-'+option.index+'" data-movement-product="'+escapeHTML(option.value)+'" aria-selected="'+String(option.selected)+'">'+escapeHTML(option.textContent)+'</button>').join("")
+      +(terms.length && options.length===1 && options[0].value==="all" ? '<span class="movement-product-empty" role="status">Sin coincidencias</span>' : '');
     if(list.innerHTML!==markup)list.innerHTML=markup;
   };
   const bindMovementProductPicker = () => {
     const select=$("#movementProductFilter"),toggle=$("#movementProductToggle"),list=$("#movementProductOptions"),picker=$("#movementProductPicker");
     if(!select || !toggle || !list || !picker || toggle.dataset.bound) return;
     toggle.dataset.bound="1";
-    const close=()=>{list.hidden=true;toggle.setAttribute("aria-expanded","false");toggle.removeAttribute("aria-activedescendant");};
-    const choose=option=>{select.value=option.dataset.movementProduct;select.dispatchEvent(new Event("change",{bubbles:true}));close();toggle.focus({preventScroll:true});};
+    const close=()=>{if(list.hidden&&!toggle.dataset.searching)return;list.hidden=true;toggle.setAttribute("aria-expanded","false");toggle.removeAttribute("aria-activedescendant");delete toggle.dataset.searching;toggle.value=select.selectedOptions[0]?.textContent || "Todos los productos";};
+    const choose=option=>{if(!option)return;select.value=option.dataset.movementProduct;select.dispatchEvent(new Event("change",{bubbles:true}));close();};
     const open=()=>{
       syncMovementProductPicker();
       if(toggle.getBoundingClientRect().bottom>window.innerHeight-180)toggle.scrollIntoView({block:"center",behavior:"instant"});
       list.style.maxHeight=Math.max(96,Math.min(280,window.innerHeight-toggle.getBoundingClientRect().bottom-12))+"px";
       list.hidden=false;toggle.setAttribute("aria-expanded","true");
     };
-    toggle.addEventListener("click",()=>{if(list.hidden)open();else close();});
+    toggle.addEventListener("focus",()=>{toggle.dataset.searching="1";toggle.value="";open();});
+    toggle.addEventListener("click",()=>{if(list.hidden){toggle.dataset.searching="1";toggle.value="";open();}});
+    toggle.addEventListener("input",()=>{toggle.dataset.searching="1";toggle.removeAttribute("aria-activedescendant");open();});
+    list.addEventListener("pointerdown",event=>{if(event.target.closest("[data-movement-product]"))event.preventDefault();});
     list.addEventListener("click",event=>{const option=event.target.closest("[data-movement-product]");if(option)choose(option);});
     toggle.addEventListener("keydown",event=>{
-      if(event.key==="Escape"){close();return;}
-      if(!["ArrowDown","ArrowUp","Home","End","Enter"," "].includes(event.key))return;
+      if(event.key==="Escape"||event.key==="Tab"){close();return;}
+      if(!["ArrowDown","ArrowUp","Enter"].includes(event.key))return;
       event.preventDefault();if(list.hidden)open();
-      const options=[...list.querySelectorAll('[role="option"]')];
+      const options=[...list.querySelectorAll('[role="option"]')];if(!options.length)return;
       let index=options.findIndex(option=>option.id===toggle.getAttribute("aria-activedescendant"));
-      if(index<0)index=Math.max(0,options.findIndex(option=>option.getAttribute("aria-selected")==="true"));
-      if(event.key==="Enter"||event.key===" "){choose(options[index]);return;}
-      index=event.key==="Home"?0:event.key==="End"?options.length-1:Math.max(0,Math.min(options.length-1,index+(event.key==="ArrowDown"?1:-1)));
+      if(event.key==="Enter"){choose(options[index<0 ? (options.length>1 ? 1 : 0) : index]);return;}
+      index=Math.max(0,Math.min(options.length-1,index+(event.key==="ArrowDown"?1:-1)));
       toggle.setAttribute("aria-activedescendant",options[index].id);options[index].scrollIntoView({block:"nearest"});
     });
     document.addEventListener("click",event=>{if(!picker.contains(event.target))close();});

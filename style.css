@@ -5487,3 +5487,11 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 #incomeRecords > .income-record { content-visibility: auto; contain-intrinsic-size: auto 190px; }
 #inventoryList > .inventory-row { content-visibility: auto; contain-intrinsic-size: auto 120px; }
 #inventoryMovementList > .movement-row { content-visibility: auto; contain-intrinsic-size: auto 88px; }
+
+/* Indicadores informativos alineados y selector de productos editable. */
+#realtimeStatus, #softwareStatus { vertical-align: middle; min-height: 38px; }
+#realtimeStatus svg, #softwareStatus svg { width: 18px; height: 18px; flex: 0 0 18px; }
+#movementProductToggle { padding-right: 2.5rem; }
+.movement-product-chevron { position: absolute; right: .9rem; top: 50%; transform: translateY(-50%); pointer-events: none; color: #566478; }
+.movement-product-empty { padding: .65rem; color: #667085; font-weight: 400; }
+.inventory-sync-status.is-pending, .income-report-status.is-warning { color: #117343; border-color: rgba(22,150,83,.2); background: #ecf9f1; }

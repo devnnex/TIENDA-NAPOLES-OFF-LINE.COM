@@ -6,6 +6,10 @@ window.MenuCards = (() => {
   const types = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
   let ctx, admin, cards = [], busy = false, loaded = false, loadJob, adminRender = 0;
   let viewer, viewCards = [], viewIndex = 0, generation = 0, tableKey = '', zoom = 1;
+  let zoomX=0, zoomY=0, zoomFrame=null, gestureStart=null, gesturePinched=false, lastTap=null;
+  let imageFit={width:0,height:0,viewportWidth:0,viewportHeight:0};
+  const pointers=new Map();
+  const moveViewer=delta=>{const next=viewIndex+delta;if(next<0 || next>=viewCards.length)return;viewIndex=next;void renderViewer();};
   const images = new Map();
   const libraryPreviews = new Map();
   const signedImages = new Map();
@@ -202,10 +206,117 @@ window.MenuCards = (() => {
     } catch (error) { status(`${error.message} Recarga la biblioteca antes de reintentar.`,true); }
     finally { busy=false;renderAdmin(); }
   };
-  const resetZoom = () => {
-    zoom=1;$('#menuViewerImage').style.width='100%';$('#menuViewerZoom').textContent='Ampliar';
-    $('#menuViewerStage').scrollTo(0,0);
+  const clampViewerPan = () => {
+    const limitX = Math.max(0, (imageFit.width * zoom - imageFit.viewportWidth) / 2);
+    const limitY = Math.max(0, (imageFit.height * zoom - imageFit.viewportHeight) / 2);
+    zoomX = Math.max(-limitX, Math.min(limitX, zoomX));
+    zoomY = Math.max(-limitY, Math.min(limitY, zoomY));
   };
+  const paintViewerZoom = () => {
+    if (zoomFrame !== null) return;
+    zoomFrame = requestAnimationFrame(() => {
+      zoomFrame = null;
+      const image = $("#menuViewerImage");
+      const wrap = $("#menuViewerImageWrap");
+      const button = $("#menuViewerZoom");
+      const zoomed = zoom > 1.01;
+      image.style.transform = `translate3d(${zoomX}px, ${zoomY}px, 0) scale(${zoom})`;
+      wrap.classList.toggle("is-zoomed", zoomed);
+      const pressed = String(zoomed);
+      if (button.getAttribute("aria-pressed") !== pressed || !button.querySelector("svg")) {
+        button.setAttribute("aria-pressed", pressed);
+        button.setAttribute("aria-label", zoomed ? "Restablecer tamaño de imagen" : "Ampliar imagen");
+        button.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5M7 10.5h7${zoomed ? "" : "M10.5 7v7"}"/></svg>`;
+      }
+    });
+  };
+  const fitViewerImage = () => {
+    const image = $("#menuViewerImage");
+    const wrap = $("#menuViewerImageWrap");
+    if (!image.naturalWidth || !wrap.clientWidth || !wrap.clientHeight) return;
+    const ratio = Math.min(wrap.clientWidth / image.naturalWidth, wrap.clientHeight / image.naturalHeight);
+    imageFit = {width: image.naturalWidth * ratio, height: image.naturalHeight * ratio, viewportWidth: wrap.clientWidth, viewportHeight: wrap.clientHeight};
+    image.style.width = `${imageFit.width}px`;
+    image.style.height = `${imageFit.height}px`;
+    clampViewerPan(); paintViewerZoom();
+  };
+  const resetZoom = () => {
+    zoom = 1; zoomX = 0; zoomY = 0;
+    pointers.clear(); gestureStart = null; gesturePinched = false; lastTap = null;
+    $("#menuViewerImageWrap").classList.remove("is-dragging");
+    fitViewerImage(); paintViewerZoom();
+  };
+  const zoomViewerAt = (scale, clientX, clientY) => {
+    const bounds = $("#menuViewerImageWrap").getBoundingClientRect();
+    const x = (clientX ?? bounds.left + bounds.width / 2) - bounds.left - bounds.width / 2;
+    const y = (clientY ?? bounds.top + bounds.height / 2) - bounds.top - bounds.height / 2;
+    const next = Math.max(1, Math.min(6, scale));
+    const ratio = next / zoom;
+    zoomX = x - (x - zoomX) * ratio;
+    zoomY = y - (y - zoomY) * ratio;
+    zoom = next;
+    clampViewerPan(); paintViewerZoom();
+  };
+  const bindViewerGestures = () => {
+    const wrap = $("#menuViewerImageWrap");
+    const midpoint = (points) => ({x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2});
+    const distance = (points) => Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y);
+    wrap.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || $("#menuViewerImage").hidden) return;
+      event.preventDefault();
+      wrap.setPointerCapture(event.pointerId);
+      pointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+      if (pointers.size === 1) {
+        gestureStart = {x: event.clientX, y: event.clientY, at: performance.now()};
+        gesturePinched = false;
+      } else { gesturePinched = true; lastTap = null; }
+      wrap.classList.toggle("is-dragging", zoom > 1 || pointers.size > 1);
+    });
+    wrap.addEventListener("pointermove", (event) => {
+      if (!pointers.has(event.pointerId)) return;
+      const previous = pointers.get(event.pointerId);
+      const before = [...pointers.values()].slice(0, 2);
+      pointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+      if (pointers.size > 1) {
+        const after = [...pointers.values()].slice(0, 2);
+        const oldCenter = midpoint(before), center = midpoint(after);
+        zoomViewerAt(zoom * distance(after) / Math.max(1, distance(before)), oldCenter.x, oldCenter.y);
+        zoomX += center.x - oldCenter.x; zoomY += center.y - oldCenter.y;
+      } else if (zoom > 1) {
+        zoomX += event.clientX - previous.x; zoomY += event.clientY - previous.y;
+      }
+      clampViewerPan(); paintViewerZoom();
+    });
+    const endPointer = (event) => {
+      if (!pointers.has(event.pointerId)) return;
+      pointers.delete(event.pointerId);
+      if (wrap.hasPointerCapture(event.pointerId)) wrap.releasePointerCapture(event.pointerId);
+      if (pointers.size) return;
+      wrap.classList.remove("is-dragging");
+      const start = gestureStart; gestureStart = null;
+      if (!start || gesturePinched || event.type === "pointercancel") { lastTap = null; return; }
+      const dx = event.clientX - start.x, dy = event.clientY - start.y;
+      if (Math.hypot(dx, dy) < 10 && performance.now() - start.at < 350) {
+        const now = performance.now();
+        if (lastTap && now - lastTap.at < 320 && Math.hypot(event.clientX - lastTap.x, event.clientY - lastTap.y) < 35) {
+          zoomViewerAt(zoom > 1.01 ? 1 : 2.5, event.clientX, event.clientY);
+          lastTap = null;
+        } else lastTap = {x: event.clientX, y: event.clientY, at: now};
+      } else {
+        lastTap = null;
+        if (zoom <= 1.01 && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) moveViewer(dx < 0 ? 1 : -1);
+      }
+    };
+    wrap.addEventListener("pointerup", endPointer);
+    wrap.addEventListener("pointercancel", endPointer);
+    wrap.addEventListener("wheel", (event) => {
+      if ($("#menuViewerImage").hidden) return;
+      event.preventDefault();
+      zoomViewerAt(zoom * Math.exp(-event.deltaY * .002), event.clientX, event.clientY);
+    }, {passive: false});
+    new ResizeObserver(fitViewerImage).observe(wrap);
+  };
+
   const renderViewer = async () => {
     const request=++generation, card=viewCards[viewIndex], img=$('#menuViewerImage'), message=$('#menuViewerStatus');
     resetZoom();img.hidden=true;message.hidden=false;
@@ -213,6 +324,8 @@ window.MenuCards = (() => {
     $('#menuViewerCounter').textContent=card ? `${viewIndex+1} de ${viewCards.length}` : '';
     $('#menuViewerPrevious').disabled=viewIndex<=0;$('#menuViewerNext').disabled=viewIndex>=viewCards.length-1;
     $('#menuViewerZoom').disabled=!card;
+    $('#menuViewerPrevious').hidden=viewCards.length<=1;$('#menuViewerNext').hidden=viewCards.length<=1;
+    $('#menuViewerDots').innerHTML=viewCards.map((entry,index)=>`<button type="button" data-menu-view-index="${index}" aria-label="Carta ${index+1}" aria-current="${index===viewIndex}"></button>`).join('');
     if (!card) { message.textContent='Todavía no hay imágenes de Carta para esta mesa. Consulta con el mesero.'; return; }
     message.textContent='Cargando imagen…';
     try {
@@ -227,7 +340,7 @@ window.MenuCards = (() => {
       if (request!==generation || !viewer.open) return;
       img.src=url;img.alt=card.name;await img.decode();
       if (request!==generation || !viewer.open) return;
-      img.hidden=false;message.hidden=true;
+      img.hidden=false;message.hidden=true;resetZoom();
     } catch (error) { if(request===generation) {images.delete(card.image_path);message.textContent=`No se pudo cargar la imagen. ${error.message}`;} }
   };
   const openViewer = async () => {
@@ -274,17 +387,17 @@ window.MenuCards = (() => {
     } else if(ctx.page==='client') {
       viewer=document.createElement('dialog');viewer.id='menuCardsViewer';viewer.className='menu-cards-viewer';
       viewer.setAttribute('aria-labelledby','menuViewerTitle');
-      viewer.innerHTML=`<div class="menu-viewer-header"><div><h2 id="menuViewerTitle">Carta</h2><span id="menuViewerCounter"></span></div><button type="button" id="menuViewerClose" aria-label="Cerrar Carta">✕</button></div><div id="menuViewerStage" class="menu-viewer-stage" tabindex="0" aria-label="Imagen de Carta; desplaza para leer al ampliar"><p id="menuViewerStatus" role="status" aria-live="polite"></p><img id="menuViewerImage" alt="Carta" hidden></div><div class="menu-viewer-controls"><button id="menuViewerPrevious" type="button" aria-label="Imagen anterior">← Anterior</button><button id="menuViewerZoom" type="button">Ampliar</button><button id="menuViewerNext" type="button" aria-label="Imagen siguiente">Siguiente →</button></div>`;
+      viewer.innerHTML="\n      <header class=\"menu-viewer-head\"><div><span class=\"eyebrow\">La carta de tu mesa</span><h2 id=\"menuViewerTitle\">Carta</h2><small id=\"menuViewerCounter\" aria-live=\"polite\"></small></div><div class=\"menu-viewer-tools\"><button class=\"icon-btn\" id=\"menuViewerZoom\" type=\"button\" aria-label=\"Ampliar imagen\" aria-pressed=\"false\"><i data-lucide=\"zoom-in\"></i></button><button class=\"icon-btn\" id=\"menuViewerClose\" type=\"button\" aria-label=\"Cerrar carta\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"3.5\" stroke-linecap=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"m6 6 12 12M18 6 6 18\"/></svg></button></div></header>\n      <div class=\"menu-viewer-stage\" id=\"menuViewerStage\"><button class=\"menu-viewer-arrow previous\" id=\"menuViewerPrevious\" type=\"button\" aria-label=\"Carta anterior\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"m15 18-6-6 6-6\"/></svg></button><div class=\"menu-viewer-image-wrap\" id=\"menuViewerImageWrap\"><img id=\"menuViewerImage\" alt=\"\" hidden><p id=\"menuViewerStatus\" role=\"status\" aria-live=\"polite\">Cargando cartas…</p></div><button class=\"menu-viewer-arrow next\" id=\"menuViewerNext\" type=\"button\" aria-label=\"Siguiente carta\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\" focusable=\"false\"><path d=\"m9 18 6-6-6-6\"/></svg></button></div>\n      <footer class=\"menu-viewer-footer\"><div id=\"menuViewerDots\" role=\"group\" aria-label=\"Elegir carta\"></div><small>Mira la carta y pide en línea por el chat.</small></footer>\n    ";
       document.body.append(viewer);
       $('#openMenuCards')?.addEventListener('click',()=>void openViewer());
       $('#menuViewerClose').addEventListener('click',()=>viewer.close());
       viewer.addEventListener('close',()=>{generation++;resetZoom();images.clear();$('#menuViewerImage').removeAttribute('src');$('#openMenuCards')?.focus();});
       viewer.addEventListener('click',e=>{if(e.target===viewer)viewer.close();});
-      const move=delta=>{const next=viewIndex+delta;if(next<0 || next>=viewCards.length)return;viewIndex=next;void renderViewer();};
-      $('#menuViewerPrevious').addEventListener('click',()=>move(-1));$('#menuViewerNext').addEventListener('click',()=>move(1));
-      viewer.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'||e.key==='ArrowRight'){if(zoom===1){e.preventDefault();move(e.key==='ArrowLeft'?-1:1);}}});
-      const toggleZoom=()=>{zoom=zoom===1?2.5:1;$('#menuViewerImage').style.width=`${100*zoom}%`;$('#menuViewerZoom').textContent=zoom===1?'Ampliar':'Restablecer';};
-      $('#menuViewerZoom').addEventListener('click',toggleZoom);$('#menuViewerImage').addEventListener('dblclick',toggleZoom);
+      $('#menuViewerPrevious').addEventListener('click',()=>moveViewer(-1));$('#menuViewerNext').addEventListener('click',()=>moveViewer(1));
+      viewer.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'||e.key==='ArrowRight'){if(zoom===1){e.preventDefault();moveViewer(e.key==='ArrowLeft'?-1:1);}}});
+      $('#menuViewerDots').addEventListener('click',event=>{const dot=event.target.closest('[data-menu-view-index]');if(dot){viewIndex=Number(dot.dataset.menuViewIndex);void renderViewer();}});
+      $('#menuViewerZoom').addEventListener('click',()=>zoomViewerAt(zoom>1.01?1:2.5));
+      bindViewerGestures();
       // Solo consulta mientras el visor está abierto. No toca el sondeo de solicitudes.
       setInterval(()=>{if(viewer.open && ctx.getCurrentTable() && tableKey!==`${ctx.getCurrentTable().id}:${ctx.getCurrentTable().qr_code}`)viewer.close();},1000);
     }

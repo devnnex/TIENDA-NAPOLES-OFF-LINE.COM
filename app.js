@@ -2688,6 +2688,8 @@ const App = (() => {
   const setInventorySyncStatus = (message, tone = "local", iconName = "hard-drive") => {
     const badge = $("#inventorySyncStatus");
     if (!badge) return;
+    badge.hidden = tone === "pending";
+    if (badge.hidden) { badge.innerHTML = ""; return; }
     badge.className = `inventory-sync-status is-${tone}`;
     badge.innerHTML = `${icon(iconName, 15)} ${escapeHTML(message)}`;
     refreshIcons();
@@ -2885,11 +2887,15 @@ const App = (() => {
 
       };
       if (action === "sync_sales_batch" && Array.isArray(result?.results)) {
+        const inventorySnapshot = result.results.findLast(receipt => Array.isArray(receipt.result?.items))?.result.items;
+        const lastConfirmed = result.results.findLast(receipt => receipt.result?.ok);
         reportChangeBatchDepth += 1;
         try {
           for (const receipt of result.results) {
             const operation = payload.operations.find(entry => entry.operationId === receipt.operationId);
-            if (operation) await acceptResult(operation.action, operation.payload, receipt.result, operation.operationId);
+            if (operation) await acceptResult(operation.action, operation.payload,
+              inventorySnapshot ? { ...receipt.result, items: receipt === lastConfirmed ? inventorySnapshot : [], reportBatchInventory: receipt === lastConfirmed } : receipt.result,
+              operation.operationId);
           }
         } finally {
           reportChangeBatchDepth -= 1;
@@ -6409,8 +6415,32 @@ const App = (() => {
   let reportChangeBatchDepth = 0;
   const queueConfirmedReportChange = async (action, payload, result, operationId = "") => {
     const supported = ["record_sale","edit_sale","delete_sale","clear_income","adjust_inventory","upsert_inventory","set_inventory_stock","delete_inventory","clear_inventory","update_inventory_movement_cost","clear_inventory_movements"];
-    if (!result?.ok || !supported.includes(action)) return;
-    const invoice = payload.invoice;
+    if (!supported.includes(action)) return;
+    if (!result?.ok) {
+      const previewId = "mutation:" + operationId;
+      const published = readLocalJson(publishedCheckoutKey, []).includes(previewId)
+        || readLocalJson(reportChangeOutboxKey, []).some(change => change.operationId === previewId);
+      if (result?.retryable === false && operationId && ["edit_sale", "delete_sale"].includes(action) && published) {
+        // A rejected Google write must also withdraw its fast report projection.
+        const saleId = String(payload.invoice?.id || payload.saleId || "");
+        const snapshot = await appsScriptRequest("get_income_report", { filters: { dateFrom: "2000-01-01", dateTo: "2099-12-31", query: saleId } });
+        if (!snapshot?.ok || snapshot.stale || !Array.isArray(snapshot.records)) throw transientAppsScriptError("Falta conciliar la operacion rechazada.");
+        const record = snapshot.records.find(row => String(row.saleId) === saleId);
+        const invoice = record ? { id: record.saleId, sessionId: record.sessionId, number: record.invoice, table: record.table,
+          createdAt: record.date, payerName: record.payer, waiterName: record.waiter, reference: record.reference,
+          payments: record.payments, paymentMethod: record.isMixed ? "mixed" : record.payments?.[0]?.method,
+          totals: { total: record.total, subtotal: record.subtotal, discount: record.discount, tax: record.tax, serviceFee: record.service },
+          items: (record.items || []).map(line => ({ id: line.lineId, menu_item_id: line.menuItemId, item_name: line.name,
+            quantity: line.quantity, unit_price: line.unitPrice, unit_cost: Number(line.cost || 0) / Math.max(1, Number(line.quantity || 1)) })),
+          reportRejected: true, reportMovementSettled: true } : { id: saleId, reportRejected: true };
+        await queueConfirmedReportChange(record ? "edit_sale" : "delete_sale", { invoice, mutationId: operationId,
+          ...(payload.saleLink ? { saleLink: payload.saleLink } : {}) }, { ok: true }, "mutation-rejected:" + operationId);
+      }
+      return;
+    }
+    const original = payload.previousRecord;
+    const invoice = payload.invoice ? { ...payload.invoice, ...(original ? { reportPrevious: original } : {}), ...(action === "edit_sale" ? { reportMutation: true } : {}) }
+      : original ? { id: payload.saleId, sessionId: original.sessionId, number: original.invoice, reportPrevious: original } : null;
     const saleId = String(invoice?.id || invoice?.sessionId || payload.saleId || "");
     const ids = new Set((invoice?.items || []).map(line => String(line.menu_item_id || "")).filter(Boolean));
     const productId = String(payload.adjustment?.productId || payload.item?.productId || payload.productId || "");
@@ -6420,7 +6450,8 @@ const App = (() => {
       : action === "record_sale" && (String(row.movementId).startsWith(`SALE-${saleId}-`) || (invoice?.sessionId && String(row.sessionId) === String(invoice.sessionId))));
     const change = { operationId: operationId || `${action}:${eventId || saleId || uid()}:${action === "record_sale" ? "saved" : uid()}`, action,
       payload: { occurredAt: new Date().toISOString(), ...(invoice ? { invoice } : {}), ...(saleId ? { saleId } : {}), ...(payload.saleLink ? { saleLink: payload.saleLink } : {}), ...(productId ? { productId } : {}),
-        movements, items: (result.items || (result.item ? [result.item] : [])).filter(item => action === "delete_sale" || ids.has(String(item.productId))) } };
+        ...(["edit_sale", "delete_sale"].includes(action) ? { mutationId: payload.mutationId || operationId } : {}),
+        movements, items: (result.items || (result.item ? [result.item] : [])).filter(item => result.reportBatchInventory || action === "delete_sale" || ids.has(String(item.productId))) } };
     const queued = readLocalJson(reportChangeOutboxKey, []);
     if (!queued.some(entry => entry.operationId === change.operationId)) {
       if (!await saveReportSyncValue(reportChangeOutboxKey, [...queued, change])) throw transientAppsScriptError("El cambio quedó guardado; falta proteger su aviso de sincronización.");
@@ -6442,11 +6473,26 @@ const App = (() => {
     reportChangeBatchDepth += 1;
     try {
       const status = typeof getOfflineSyncStatus === "function" ? await getOfflineSyncStatus() : null;
+      const blockedSales = new Set();
       for (const job of readAppsScriptOutbox()) {
-        if (job.action !== "record_sale" || !job.payload?.invoice?.checkoutAccepted) continue;
-        if (reportMirror().sales[String(job.payload.invoice.id)] || readLocalJson(publishedCheckoutKey, []).includes(String(job.payload.invoice.id)) || readLocalJson(reportChangeOutboxKey, []).some(change => change.operationId === "checkout:" + job.payload.invoice.id)) continue;
-        if (state.localSupabaseWrites > 0 || (typeof isSupabaseWriteBlockingJob === "function" && isSupabaseWriteBlockingJob(job,status))) continue;
-        await queueConfirmedReportChange("record_sale", { invoice: { ...job.payload.invoice, googlePending: true } }, { ok: true }, `checkout:${job.payload.invoice.id}`);
+        if (!["record_sale", "edit_sale", "delete_sale"].includes(job.action)) continue;
+        const saleId = String(job.payload?.invoice?.id || job.payload?.saleId || "");
+        if (!saleId) continue;
+        if ((job.action !== "record_sale" && state.currentUser?.role !== "boss")
+          || ["failed", "conflict"].includes(job.status) || blockedSales.has(saleId)
+          || (job.action === "record_sale" && !job.payload?.invoice?.checkoutAccepted)
+          || state.localSupabaseWrites > 0 || (typeof isSupabaseWriteBlockingJob === "function" && isSupabaseWriteBlockingJob(job,status))) {
+          blockedSales.add(saleId); continue;
+        }
+        const operationId = job.action === "record_sale" ? "checkout:" + saleId : "mutation:" + (job.operationId || job.id);
+        const publishedId = job.action === "record_sale" ? saleId : operationId;
+        if ((job.action === "record_sale" && reportMirror().sales[saleId])
+          || readLocalJson(publishedCheckoutKey, []).includes(publishedId)
+          || readLocalJson(reportChangeOutboxKey, []).some(change => change.operationId === operationId || change.operationId === (job.operationId || job.id))) continue;
+        await queueConfirmedReportChange(job.action, { ...job.payload, mutationId: job.operationId || job.id,
+          invoice: { ...(job.payload.invoice || { id: saleId, sessionId: job.payload.saleLink?.sessionId, number: job.payload.saleLink?.invoice }),
+            ...(job.payload.previousRecord ? { reportPrevious: job.payload.previousRecord } : {}),
+            googlePending: true, ...(job.action !== "record_sale" ? { reportMutation: true } : {}) } }, { ok: true }, operationId);
       }
     } catch (_) { return false; } finally { checkoutReportPreparing = false; reportChangeBatchDepth -= 1; if (!reportChangeBatchDepth) void flushConfirmedReportChanges(); }
   };
@@ -6478,10 +6524,10 @@ const App = (() => {
           confirmedIds.add(change.operationId);
         }
         if (!confirmedIds.size) return false;
-        const checkoutIds = batch.filter(change => confirmedIds.has(change.operationId) && change.operationId.startsWith("checkout:"));
+        const checkoutIds = batch.filter(change => confirmedIds.has(change.operationId) && /^(checkout|mutation):/.test(change.operationId));
         if (checkoutIds.length) {
           const ids = new Set(readLocalJson(publishedCheckoutKey, []));
-          checkoutIds.forEach(change => ids.add(String(change.payload.invoice.id)));
+          checkoutIds.forEach(change => ids.add(change.operationId.startsWith("checkout:") ? String(change.payload.invoice.id) : change.operationId));
           if (!await saveReportSyncValue(publishedCheckoutKey, [...ids])) return false;
         }
         const remaining = readLocalJson(reportChangeOutboxKey, []).filter(entry => !confirmedIds.has(entry.operationId));
@@ -6496,12 +6542,28 @@ const App = (() => {
       if (Number(change.sequence) <= Number(mirror.cursor)) continue;
       const payload = change.payload || {};
       const id = String(payload.saleId || payload.invoice?.id || payload.invoice?.sessionId || "");
-      if (change.action === "clear_income") { mirror.sales = {}; mirror.deleted = {}; mirror.salesClearAt = change.confirmedAt || payload.occurredAt; }
-      if (payload.invoice && ["record_sale","edit_sale"].includes(change.action)) { mirror.sales[id] = { ...payload.invoice, reportConfirmedAt: change.confirmedAt || payload.occurredAt }; delete mirror.deleted[id]; }
-      if (change.action === "delete_sale" && id) {
-        mirror.deletedSaleLinks ||= {};
-        mirror.deletedSaleLinks[id] = payload.saleLink || mirror.sales[id] || {};
-        delete mirror.sales[id]; mirror.deleted[id] = change.confirmedAt || payload.occurredAt || true;
+      if (change.action === "clear_income") { mirror.sales = {}; mirror.deleted = {}; mirror.pendingSaleMutations = {}; mirror.deletedSaleRecords = {}; mirror.salesClearAt = change.confirmedAt || payload.occurredAt; }
+      mirror.pendingSaleMutations ||= {};
+      mirror.deletedSaleRecords ||= {};
+      const mutation = mirror.pendingSaleMutations[id];
+      const isMutation = ["edit_sale", "delete_sale"].includes(change.action);
+      const pendingMutation = isMutation && payload.invoice?.googlePending && payload.invoice?.reportMutation;
+      // A delayed Google receipt cannot undo a later mutation accepted by Supabase.
+      const superseded = mutation && !pendingMutation && !payload.invoice?.reportRejected && ["record_sale", "edit_sale", "delete_sale"].includes(change.action)
+        && mutation !== payload.mutationId;
+      if (!superseded) {
+        if (change.action === "edit_sale" && mirror.sales[id]?.reportPrevious && payload.invoice) {
+          payload.invoice = { ...payload.invoice, reportPrevious: mirror.sales[id].reportPrevious };
+        }
+        if (pendingMutation) mirror.pendingSaleMutations[id] = payload.mutationId;
+        else if (isMutation) delete mirror.pendingSaleMutations[id];
+        if (payload.invoice && ["record_sale","edit_sale"].includes(change.action)) { mirror.sales[id] = { ...payload.invoice, reportConfirmedAt: change.confirmedAt || payload.occurredAt }; delete mirror.deleted[id]; }
+        if (change.action === "delete_sale" && id) {
+          mirror.deletedSaleLinks ||= {};
+          mirror.deletedSaleLinks[id] = payload.saleLink || mirror.sales[id] || {};
+          if (payload.invoice?.reportPrevious || mirror.sales[id]?.reportPrevious) mirror.deletedSaleRecords[id] ||= mirror.sales[id]?.reportPrevious || payload.invoice.reportPrevious;
+          delete mirror.sales[id]; mirror.deleted[id] = change.confirmedAt || payload.occurredAt || true;
+        }
       }
       if (change.action === "clear_inventory_movements") { mirror.movements = {}; mirror.movementsClearAt = change.confirmedAt || payload.occurredAt; }
       (payload.movements || []).forEach(row => { if (row.movementId) mirror.movements[row.movementId] = { ...row, googlePending: Boolean(payload.invoice?.googlePending), reportConfirmedAt: change.confirmedAt || payload.occurredAt }; });
@@ -6554,7 +6616,10 @@ const App = (() => {
         const items = applyConfirmedReportChanges(nextMirror, changes, { applyInventory: false });
         if (!await saveReportSyncValue(reportMirrorKey(), nextMirror)) return false;
         Object.assign(mirror, nextMirror);
-        if (items.length) applyRemoteInventoryItems(items);
+        if (items.length) {
+          if (typeof pendingInventoryIds === "function") applyRemoteInventoryItems(items);
+          else applyRemoteInventoryItems(items, { preserveProductIds: typeof pendingInventoryProductIds === "function" ? pendingInventoryProductIds() : new Set() });
+        }
         const invoiceMap = new Map((state.invoiceHistory || []).filter(invoice => !mirror.salesClearAt || String(invoice.createdAt) > mirror.salesClearAt).map(invoice => [String(invoice.id || invoice.sessionId), invoice]));
         Object.keys(mirror.deleted).forEach(id => invoiceMap.delete(id));
         Object.entries(mirror.sales).forEach(([id, invoice]) => invoiceMap.set(id, invoice));
@@ -6602,7 +6667,7 @@ const App = (() => {
     const mirror = reportMirror();
     const currentAfterClear = !mirror.movementsClearAt || (authoritative && readStartedAt >= Date.parse(mirror.movementsClearAt))
       || Number(String(revision || "").split("-")[0]) >= Date.parse(mirror.movementsClearAt);
-    const map = new Map((currentAfterClear ? rows : []).map(row => [String(row.movementId), row]));
+    const map = new Map((currentAfterClear ? rows : []).filter(row => !row.reportProjection).map(row => [String(row.movementId), row]));
     const oldest = hasMore ? rows.reduce((date,row) => !date || String(row.date || "") < date ? String(row.date || "") : date, "") : "";
     let retired = false;
     Object.values(mirror.movements).forEach(row => {
@@ -6614,6 +6679,31 @@ const App = (() => {
       if (map.has(id) && Number(String(revision || "").split("-")[0]) >= Date.parse(row.reportConfirmedAt || "")) return;
       map.set(id, row);
     });
+    for (const invoice of Object.values(mirror.sales)) {
+      if (!invoice.reportMutation || invoice.reportMovementSettled) continue;
+      if (!invoice.googlePending && authoritative && readStartedAt >= Date.parse(invoice.reportConfirmedAt || "")) {
+        invoice.reportMovementSettled = true; retired = true; continue;
+      }
+      const quantities = new Map();
+      (invoice.reportPrevious?.items || []).forEach(line => {
+        const id = String(line.menuItemId || line.menu_item_id || "");
+        if (id) quantities.set(id, Number(quantities.get(id) || 0) + Number(line.quantity || 0));
+      });
+      (invoice.items || []).forEach(line => {
+        const id = String(line.menu_item_id || "");
+        if (id) quantities.set(id, Number(quantities.get(id) || 0) - Number(line.quantity || 0));
+      });
+      for (const [productId, delta] of quantities) {
+        if (!delta) continue;
+        const original = [...map.values()].find(row => String(row.productId) === productId && movementBelongsToSale(row, invoice));
+        const line = (invoice.items || []).find(line => String(line.menu_item_id) === productId);
+        map.set("EDIT-REPORT-" + invoice.id + "-" + productId, { ...original,
+          movementId: "EDIT-REPORT-" + invoice.id + "-" + productId, reportProjection: true,
+          productId, product: line?.item_name || original?.product || "Producto", type: "CORRECCION_VENTA", delta,
+          before: Number(original?.after || 0), after: Number(original?.after || 0) + delta,
+          reference: invoice.number, sessionId: invoice.sessionId, date: invoice.reportConfirmedAt });
+      }
+    }
     if (retired) void saveReportSyncValue(reportMirrorKey(), mirror);
     return removeDeletedSaleMovements([...map.values()]);
   };
@@ -6623,6 +6713,7 @@ const App = (() => {
     const snapshotAfterClear = !mirror.salesClearAt || Date.parse(remote.generatedAt || "") >= Date.parse(mirror.salesClearAt);
     const baseRows = snapshotAfterClear ? (remote.records || []) : [];
     const records = new Map(baseRows.map(row => [String(row.saleId), row]));
+    const applied = { ...(remote.appliedReportMutations || {}) };
     const totals = { ...(baseRows.length === (remote.records || []).length ? remote.totals : incomeTotalsFromRecords(baseRows)) };
     const adjust = (record, direction) => {
       const values = incomeTotalsFromRecords([record]);
@@ -6630,19 +6721,24 @@ const App = (() => {
     };
     for (const id of Object.keys(mirror.deleted)) {
       if (records.has(id)) { adjust(records.get(id), -1); records.delete(id); }
+      else if (keys.has(id) && !applied[id] && mirror.deletedSaleRecords?.[id]) adjust(mirror.deletedSaleRecords[id], -1);
+      applied[id] = "deleted";
     }
     const visible = new Map(localIncomeRecords(filters, Object.values(mirror.sales)).map(row => [String(row.saleId), row]));
     for (const [id, invoice] of Object.entries(mirror.sales)) {
       const old = records.get(id), fresh = visible.get(id);
-      if ((!invoice.googlePending && Date.parse(remote.generatedAt || "") >= Date.parse(invoice.reportConfirmedAt || "")) || (invoice.googlePending && old && keys.has(id))) continue;
+      if ((!invoice.googlePending && Date.parse(remote.generatedAt || "") >= Date.parse(invoice.reportConfirmedAt || "")) || (invoice.googlePending && !invoice.reportMutation && old && keys.has(id))) continue;
       // Una edición confirmada se sustituye por ID; nunca agrega una segunda venta.
       if (old) { adjust(old, -1); records.delete(id); }
-      if (fresh) { records.set(id, fresh); if (old || !keys.has(id)) adjust(fresh, 1); }
+      const previous = !old && keys.has(id) && !applied[id] && invoice.reportMutation ? invoice.reportPrevious : null;
+      if (previous) adjust(previous, -1);
+      if (fresh) { records.set(id, fresh); if (old || previous || !keys.has(id)) adjust(fresh, 1); }
+      if (invoice.reportMutation) applied[id] = "edited";
     }
     totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
     const queued = new Set(readAppsScriptOutbox().filter(job => job.action === "record_sale").map(job => String(job.payload?.invoice?.id || "")));
     const pendingCount = [...visible].filter(([id]) => mirror.sales[id]?.googlePending && !queued.has(id) && !keys.has(id)).length;
-    return { ...remote, filters, records: [...records.values()].sort((a,b) => String(b.date).localeCompare(String(a.date))), totals, pendingCount: Number(remote.pendingCount || 0) + pendingCount,
+    return { ...remote, filters, appliedReportMutations: applied, records: [...records.values()].sort((a,b) => String(b.date).localeCompare(String(a.date))), totals, pendingCount: Number(remote.pendingCount || 0) + pendingCount,
       totalRecords: Math.max(Number(totals.sales || 0), records.size) };
   };
   const startConfirmedReportSync = () => {
@@ -8803,8 +8899,28 @@ const App = (() => {
     $("#deleteIncomeDialog")?.close();
     renderIncomeReport();
     renderInventory();
-    enqueueAppsScriptJob("delete_sale", { saleId, saleLink, productIds: (record.items || []).map(line => line.menuItemId || line.menu_item_id).filter(Boolean) }, `sale-delete:${saleId}`);
+    enqueueAppsScriptJob("delete_sale", { saleId, saleLink, previousRecord: record, productIds: (record.items || []).map(line => line.menuItemId || line.menu_item_id).filter(Boolean) }, `sale-delete:${saleId}`);
     toast("Venta eliminada y existencias restauradas.", "ok", `income-deleted:${saleId}`);
+  };
+
+  const applyEditedSaleStock = (previous, invoice) => {
+    if (!state.items || !state.inventoryMeta) return;
+    const changes = new Map();
+    (previous.items || []).forEach(line => {
+      const id = String(line.menuItemId || line.menu_item_id || "");
+      if (id) changes.set(id, Number(changes.get(id) || 0) + Number(line.quantity || 0));
+    });
+    (invoice.items || []).forEach(line => {
+      const id = String(line.menu_item_id || "");
+      if (id) changes.set(id, Number(changes.get(id) || 0) - Number(line.quantity || 0));
+    });
+    for (const [id, delta] of changes) {
+      if (!delta || !Object.prototype.hasOwnProperty.call(state.inventoryMeta, id)) continue;
+      const current = state.inventoryMeta[id];
+      state.inventoryMeta[id] = { ...current, stock: Math.max(0, Number(current.stock || 0) + delta), updatedAt: new Date().toISOString() };
+    }
+    if (typeof persistInventoryStore === "function") persistInventoryStore();
+    if (state.activeAdminSection === "inventory" && typeof renderInventory === "function") renderInventory();
   };
 
   const replaceEditedIncomeRecord = (previous, next) => {
@@ -8876,7 +8992,7 @@ const App = (() => {
     };
     state.incomeRequestId += 1;
     state.incomeLoading = false;
-    enqueueAppsScriptJob("edit_sale", { invoice: corrected }, `sale-edit:${record.saleId}:${uid()}`);
+    enqueueAppsScriptJob("edit_sale", { invoice: corrected, previousRecord: record, productIds: [...new Set([...(record.items || []).map(line => line.menuItemId || line.menu_item_id), ...corrected.items.map(line => line.menu_item_id)].filter(Boolean))] }, `sale-edit:${record.saleId}:${uid()}`);
     const localIndex = state.invoiceHistory.findIndex((invoice) => String(invoice.id || invoice.sessionId) === String(record.saleId));
     if (localIndex >= 0) state.invoiceHistory[localIndex] = { ...state.invoiceHistory[localIndex], ...corrected };
     else state.invoiceHistory.push(corrected);
@@ -8910,6 +9026,7 @@ const App = (() => {
         profit: item.quantity * (item.unit_price - item.unit_cost)
       }))
     };
+    if (typeof applyEditedSaleStock === "function") applyEditedSaleStock(record, corrected);
     replaceEditedIncomeRecord(record, correctedRecord);
     $("#incomeEditDialog")?.close();
     renderIncomeReport();

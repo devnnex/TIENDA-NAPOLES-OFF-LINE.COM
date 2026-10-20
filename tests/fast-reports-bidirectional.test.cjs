@@ -35,11 +35,11 @@ function device(backend,id){
  const storage=new Map(),timers=[],renders=[];
  const state={currentUser:{id,role:'boss'},authToken:id,page:'admin',invoiceHistory:[],inventoryMovements:[],inventoryMeta:{},tables:[],incomeRequestId:1,activeAdminSection:'income',localSupabaseWrites:0};
  const store=(key,value)=>{storage.set(key,structuredClone(value));return true;};
- const context=vm.createContext({state,Map,Set,Object,Date,Number,JSON,navigator:{onLine:true},SUPABASE_CONFIG:{url:'https://test.invalid'},SYNC_INTERVAL_MS:1500,
+ const context=vm.createContext({state,Map,Set,Object,Date,Number,JSON,AbortController,clearTimeout,APPS_SCRIPT_TIMEOUT_MS:45000,isAppsScriptConfigured:()=>true,getAppsScriptUrl:()=>"https://test.invalid",location:{origin:"https://test.invalid"},pendingInventoryProductIds:()=>state.pendingProducts||new Set(),navigator:{onLine:true},SUPABASE_CONFIG:{url:'https://test.invalid'},SYNC_INTERVAL_MS:1500,
   SalesShift:require('../sales-shift.js'),normalizeText:value=>String(value).toLowerCase().trim(),incomeRecordSaleType:()=> 'table',
   readLocalJson:(key,fallback)=>structuredClone(storage.has(key)?storage.get(key):fallback),persistDurableJson:async(key,value)=>store(key,value),
   readAppsScriptOutbox:()=>structuredClone(storage.get('jobs')||[]),writeAppsScriptOutbox:async jobs=>store('jobs',jobs),
-  persistInvoiceHistory(){},persistInventoryMovements(){},applyRemoteInventoryItems:items=>items.forEach(item=>{state.inventoryMeta[item.productId]=item;}),
+  persistInvoiceHistory(){},persistInventoryMovements(){},applyRemoteInventoryItems:(items,{preserveProductIds=new Set()}={})=>items.forEach(item=>{if(!preserveProductIds.has(item.productId))state.inventoryMeta[item.productId]=item;}),
   incomeFiltersFromForm:()=>({...filters}),isManager:()=>true,canAccessAdminSection:()=>true,$:()=>null,
   renderIncomeReport:()=>renders.push('sales'),renderInventoryMovements:()=>renders.push('movements'),renderInventory(){},renderPurchaseProductOptions(){},renderPurchaseHistory(){},loadMovementSalesTotals(){},
   transientAppsScriptError:message=>new Error(message),uid:()=> 'op-'+Math.random(),
@@ -48,7 +48,7 @@ function device(backend,id){
  });
  state.sb={rpc:backend.rpc};
  vm.runInContext(section('incomeTotalsFromRecords','localIncomeReport')+section('localIncomeReport','mergeIncomeReport')
-  +section('reportMirrorKey','clientBillEnabled')+';globalThis.api={protectCheckoutForFastSync,queueReadyCheckoutReports,queueConfirmedReportChange,flushConfirmedReportChanges,syncConfirmedReports,mergeConfirmedIncomeReport,mergeConfirmedMovements,reportMirror};',context);
+  +section('reportMirrorKey','clientBillEnabled')+section('appsScriptRequest',source.includes('  const readAppsScriptStatus =')?'readAppsScriptStatus':'inventoryPayload')+';globalThis.api={appsScriptRequest,protectCheckoutForFastSync,queueReadyCheckoutReports,queueConfirmedReportChange,flushConfirmedReportChanges,syncConfirmedReports,mergeConfirmedIncomeReport,mergeConfirmedMovements,reportMirror};',context);
  return {context,state,storage,renders,api:context.api};
 }
 const invoice=(id,quantity=2)=>({id,sessionId:'session-'+id,number:'TN-'+id,createdAt:'2026-10-13T17:00:00Z',totals:{subtotal:quantity*100,total:quantity*100},items:[{id:'line-'+id,menu_item_id:'product',item_name:'Agua',quantity,unit_price:100,unit_cost:40}],payments:[{method:'cash',amount:quantity*100}]});
@@ -161,3 +161,140 @@ test('el informe posterior confirmado conserva correcciones de Google al concili
  assert.equal(await sender.api.flushConfirmedReportChanges(),false);
  assert.deepEqual(sender.storage.get('napoles_report_change_outbox_v1').map(change=>change.operationId),['partial-1','partial-2']);
  });
+
+const billedMovement = sale => ({ movementId:'SALE-'+sale.id+'-product', productId:'product', product:'Agua', type:'SALIDA_VENTA', delta:-sale.items[0].quantity, before:100, after:100-sale.items[0].quantity, sessionId:sale.sessionId, reference:sale.number });
+async function stockedReceiver(backend,receiver,count=50) {
+ const invoices=Array.from({length:count},(_,i)=>invoice('existing-'+i));
+ backend.events.push(...invoices.map((sale,i)=>({sequence:i+1,action:'record_sale',payload:{invoice:sale,movements:[billedMovement(sale)]}})));
+ await receiver.api.syncConfirmedReports();
+ receiver.state.incomeReport.recordRows=receiver.state.incomeReport.records.map((record,i)=>({saleId:record.saleId,row:i+2}));
+ receiver.renders.length=0;return invoices;
+}
+test('borrar cincuenta ventas sin red actualiza BCA en bloque al reconectar sin esperar Google',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const invoices=await stockedReceiver(backend,receiver),stale=structuredClone(receiver.state.incomeReport);
+ sender.context.navigator.onLine=false;
+ sender.storage.set('jobs',invoices.map((sale,i)=>({id:'delete-'+i,operationId:'delete-'+i,status:'pending',action:'delete_sale',payload:{saleId:sale.id,saleLink:{sessionId:sale.sessionId,invoice:sale.number},previousRecord:stale.records.find(row=>row.saleId===sale.id)}})));
+ await sender.api.queueReadyCheckoutReports();assert.equal(backend.events.length,50);
+ sender.context.navigator.onLine=true;await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.incomeReport.totals.sales,0);assert.equal(receiver.state.incomeReport.totals.income,0);
+ assert.equal(receiver.state.inventoryMovements.length,0);assert.equal(receiver.renders.filter(name=>name==='sales').length,1);
+ assert.equal(sender.storage.get('jobs').length,50,'Los avisos no eliminan el respaldo pendiente de Google.');
+ assert.equal(backend.calls.filter(name=>name==='publish_report_changes_batch').length,3);
+ assert.equal(receiver.api.mergeConfirmedIncomeReport({...stale,generatedAt:'2099-01-01'},filters).totals.sales,0);
+ const count=backend.events.length;await sender.api.queueReadyCheckoutReports();await settle();assert.equal(backend.events.length,count);
+ const paged={...stale,records:stale.records.slice(0,10)};
+ const merged=receiver.api.mergeConfirmedIncomeReport(paged,filters);assert.equal(merged.totals.sales,0);
+ assert.equal(receiver.api.mergeConfirmedIncomeReport(merged,filters).totals.sales,0);
+});
+test('editar cincuenta ventas sin red sustituye importes y unidades facturadas en BCA al reconectar',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const invoices=await stockedReceiver(backend,receiver),stale=structuredClone(receiver.state.incomeReport);
+ sender.storage.set('jobs',invoices.map((sale,i)=>({id:'edit-'+i,operationId:'edit-'+i,status:'pending',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:stale.records.find(row=>row.saleId===sale.id)}})));
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.incomeReport.totals.sales,50);assert.equal(receiver.state.incomeReport.totals.income,15000);
+ assert.equal(receiver.state.inventoryMovements.reduce((sum,row)=>sum+row.delta,0),-150);
+ assert.equal(receiver.renders.filter(name=>name==='sales').length,1);
+ const old=receiver.api.mergeConfirmedIncomeReport({...stale,generatedAt:'2099-01-01'},filters);assert.equal(old.totals.income,15000);
+ const paged=receiver.api.mergeConfirmedIncomeReport({...stale,records:stale.records.slice(0,10)},filters);
+ assert.equal(paged.totals.income,15000);assert.equal(receiver.api.mergeConfirmedIncomeReport(paged,filters).totals.income,15000);
+});
+test('una confirmacion tardia del alta o de una edicion anterior no revive la venta borrada',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const [sale]=await stockedReceiver(backend,receiver,1),before=receiver.state.incomeReport.records[0];
+ sender.storage.set('jobs',[{id:'edit-old',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:before}},
+ {id:'delete-new',action:'delete_sale',payload:{saleId:sale.id,saleLink:{sessionId:sale.sessionId,invoice:sale.number},previousRecord:before}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.incomeReport.totals.sales,0);
+ await sender.api.queueConfirmedReportChange('record_sale',{invoice:sale},{ok:true},'create-receipt');await settle();
+ await sender.api.queueConfirmedReportChange('edit_sale',{invoice:invoice(sale.id,3)},{ok:true},'edit-old');await settle();
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.incomeReport.totals.sales,0);assert.equal(receiver.state.inventoryMovements.length,0);
+ await sender.api.queueConfirmedReportChange('delete_sale',{saleId:sale.id},{ok:true},'delete-new');await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.api.reportMirror().pendingSaleMutations[sale.id],undefined);assert.equal(receiver.state.incomeReport.totals.sales,0);
+});
+
+test('dos ediciones pendientes conservan la base remota fuera de pagina y el acuse final no restaura cantidades anteriores',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const [sale]=await stockedReceiver(backend,receiver,1),before=receiver.state.incomeReport.records[0];
+ const stale=structuredClone(receiver.state.incomeReport);stale.records=[];
+ sender.storage.set('jobs',[{id:'edit-first',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:before}},
+ {id:'edit-last',action:'edit_sale',payload:{invoice:invoice(sale.id,4),previousRecord:{...before,total:300,subtotal:300,payments:[{method:'cash',amount:300}]}}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.api.mergeConfirmedIncomeReport(stale,filters).totals.income,400);
+ await sender.api.queueConfirmedReportChange('edit_sale',{invoice:invoice(sale.id,3)},{ok:true},'edit-first');await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.incomeReport.totals.income,400);assert.equal(receiver.state.inventoryMovements.reduce((sum,row)=>sum+row.delta,0),-4);
+ await sender.api.queueConfirmedReportChange('edit_sale',{invoice:invoice(sale.id,4)},{ok:true},'edit-last');await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.incomeReport.totals.income,400);assert.equal(receiver.state.inventoryMovements.reduce((sum,row)=>sum+row.delta,0),-4);
+ const authoritative=[billedMovement(sale),{movementId:'EDIT-real',type:'CORRECCION_VENTA',productId:'product',delta:-2}];
+ const real=receiver.api.mergeConfirmedMovements(authoritative,'',{authoritative:true,readStartedAt:Date.parse('2099-01-01')});
+ assert.equal(real.find(row=>row.type==='SALIDA_VENTA').delta,-2);
+ assert.equal(receiver.api.mergeConfirmedMovements(real).find(row=>row.type==='SALIDA_VENTA').delta,-2);
+});
+
+test('un lote mixto publica una sola foto de inventario con todos los productos incluso si el ultimo recibo falla',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const ops=[{operationId:'create-a',action:'record_sale',payload:{invoice:{...invoice('a'),items:[{menu_item_id:'a',quantity:1}]}}},
+ {operationId:'delete-c',action:'delete_sale',payload:{saleId:'c'}},
+ {operationId:'edit-b',action:'edit_sale',payload:{invoice:{...invoice('b'),items:[{menu_item_id:'b',quantity:1}]}}},
+ {operationId:'fail-d',action:'edit_sale',payload:{invoice:invoice('d')}}];
+ const snapshot=[{productId:'a',stock:7},{productId:'b',stock:8},{productId:'c',stock:9}];
+ sender.context.fetch=async()=>({ok:true,text:async()=>JSON.stringify({ok:true,results:ops.map((op,i)=>({operationId:op.operationId,result:i===3?{ok:false,retryable:true,items:snapshot}:{ok:true}}))})});
+ await sender.api.appsScriptRequest('sync_sales_batch',{operations:ops});await settle();
+ const withStock=backend.events.filter(event=>event.payload.items.length);
+ assert.equal(withStock.length,1);assert.deepEqual(withStock[0].payload.items,snapshot);
+ receiver.state.pendingProducts=new Set(['b']);receiver.state.inventoryMeta.b={productId:'b',stock:99};
+ await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.inventoryMeta.a.stock,7);assert.equal(receiver.state.inventoryMeta.b.stock,99);assert.equal(receiver.state.inventoryMeta.c.stock,9);
+});
+test('la edicion local actualiza el stock por diferencia antes de esperar la red',()=>{
+ const backend=server(),sender=device(backend,'offline');sender.state.items=[{id:'product'},{id:'other'}];
+ sender.state.inventoryMeta={product:{stock:10,version:7},other:{stock:20,version:8}};
+ vm.runInContext(section('applyEditedSaleStock','replaceEditedIncomeRecord')+';globalThis.editStock=applyEditedSaleStock;',sender.context);
+ sender.context.editStock({items:[{menuItemId:'product',quantity:2}]},{items:[{menu_item_id:'product',quantity:3}]});assert.equal(sender.state.inventoryMeta.product.stock,9);
+ sender.context.editStock({items:[{menuItemId:'product',quantity:3}]},{items:[{menu_item_id:'other',quantity:4}]});
+ assert.equal(sender.state.inventoryMeta.product.stock,12);assert.equal(sender.state.inventoryMeta.other.stock,16);assert.equal(sender.state.inventoryMeta.product.version,7);
+});
+
+test('un rechazo permanente retira la proyeccion rapida y recupera la venta canonica',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const [sale]=await stockedReceiver(backend,receiver,1),record=receiver.state.incomeReport.records[0];
+ sender.storage.set('jobs',[{id:'rejected',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:record}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.incomeReport.totals.income,300);
+ sender.context.fetch=async()=>({ok:true,text:async()=>JSON.stringify({ok:true,records:[record]})});
+ await sender.api.queueConfirmedReportChange('edit_sale',{invoice:invoice(sale.id,3)},{ok:false,retryable:false,error:'Sin existencias'},'rejected');
+ await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.incomeReport.totals.income,200);assert.equal(receiver.api.reportMirror().pendingSaleMutations[sale.id],undefined);
+ assert.equal(sender.storage.get('jobs').length,1);
+});
+
+test('la edicion conserva consumos previos y agrega solo la diferencia sin duplicarla en refrescos',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const [sale]=await stockedReceiver(backend,receiver,1),before=receiver.state.incomeReport.records[0];
+ receiver.state.inventoryMovements=[{...billedMovement(sale),movementId:'consume',type:'CONSUMO_MESA',delta:-2}];
+ receiver.api.reportMirror().movements={consume:receiver.state.inventoryMovements[0]};
+ sender.storage.set('jobs',[{id:'edit-consumption',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:before}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+ const once=receiver.api.mergeConfirmedMovements(receiver.state.inventoryMovements),twice=receiver.api.mergeConfirmedMovements(once);
+ assert.equal(twice.length,2);assert.equal(twice.reduce((sum,row)=>sum+row.delta,0),-3);
+ assert.equal(twice.find(row=>row.type==='CONSUMO_MESA').delta,-2);
+});
+
+test('la recepcion usa el aplicador real de inventario en ambos proyectos y conserva productos con cambios pendientes',async()=>{
+ const backend=server(),receiver=device(backend,'receiver');receiver.state.items=[{id:'a',name:'Agua'},{id:'b',name:'Pan'}];
+ receiver.state.inventoryMeta={a:{stock:1},b:{stock:99}};receiver.storage.set('jobs',[{id:'pending',status:'pending',action:'edit_sale',payload:{invoice:{items:[{menu_item_id:'b'}]}}}]);
+ Object.assign(receiver.context,{productAcronym:()=>'',persistInventoryStore(){},persistBootstrapCache(){},renderMenuManager(){}});
+ const offline=!source.includes('  const pendingInventoryIds =');
+ vm.runInContext(section(offline?'isPendingInventoryJob':'pendingInventoryIds',offline?'enqueueAppsScriptJob':'enqueueAppsScriptJob'),receiver.context);
+ backend.events.push({sequence:1,action:'edit_sale',payload:{items:[{productId:'a',stock:7},{productId:'b',stock:8}]}});
+ assert.equal(await receiver.api.syncConfirmedReports(),true);assert.equal(receiver.state.inventoryMeta.a.stock,7);assert.equal(receiver.state.inventoryMeta.b.stock,99);
+});
+
+test('editar y despues borrar retira el importe original fuera de pagina una sola vez',async()=>{
+ const backend=server(),sender=device(backend,'offline'),receiver=device(backend,'bca');
+ const [sale]=await stockedReceiver(backend,receiver,1),before=receiver.state.incomeReport.records[0];
+ const paged={...structuredClone(receiver.state.incomeReport),records:[]};
+ sender.storage.set('jobs',[{id:'edit-then-delete',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:before}},
+ {id:'delete-after-edit',action:'delete_sale',payload:{saleId:sale.id,previousRecord:{...before,total:300,subtotal:300,payments:[{method:'cash',amount:300}]}}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+ const merged=receiver.api.mergeConfirmedIncomeReport(paged,filters);assert.equal(merged.totals.income,0);assert.equal(merged.totals.sales,0);
+ assert.equal(receiver.api.mergeConfirmedIncomeReport(merged,filters).totals.income,0);
+});

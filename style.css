@@ -3468,6 +3468,7 @@ button:disabled {
   font-weight: 800;
 }
 
+.inventory-sync-status[hidden] { display: none !important; }
 .inventory-sync-status.is-synced { color: #0d7043; border-color: rgba(47, 209, 124, .3); background: #e2f8eb; }
 .inventory-sync-status.is-pending { color: #976000; border-color: rgba(245, 185, 75, .35); background: #fff7e3; }
 .inventory-sync-status.is-error { color: #ad3030; border-color: rgba(239, 77, 77, .3); background: #ffebeb; }

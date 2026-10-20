@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261019-consumo-v1">
+    <link rel="stylesheet" href="style.css?v=20261019-sale-mutations-v1">
     <link rel="stylesheet" href="menu-cards.css?v=20261019-dos-cartas-v3">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
@@ -324,7 +324,7 @@
             <p>Consulta existencias, costos, utilidad estimada y alertas de reposicion en un solo lugar.</p>
           </div>
           <div class="inventory-heading-actions">
-            <span class="inventory-sync-status is-local" id="inventorySyncStatus"><i data-lucide="hard-drive"></i> Respaldo local</span>
+            <span class="inventory-sync-status is-local" id="inventorySyncStatus" hidden><i data-lucide="hard-drive"></i> Respaldo local</span>
             <button class="inventory-purchases-button" id="openPurchases" type="button"><i data-lucide="shopping-cart"></i> Compras</button>
             <button class="primary" id="newInventoryProduct" type="button"><i data-lucide="package-plus"></i> Nuevo producto</button>
             <button class="ghost danger-text section-reset-button" type="button" data-reset-section="inventory"><i data-lucide="trash-2"></i> Eliminar todo</button>
@@ -939,6 +939,6 @@
     <script defer src="vendor/jspdf.umd.min.js"></script>
     <script defer src="sales-shift.js?v=20261019-pos-integrity-v1"></script>
     <script defer src="menu-cards.js?v=20261019-consumo-v1"></script>
-    <script defer src="app.js?v=20261019-sales-freshness-v1"></script>
+    <script defer src="app.js?v=20261019-sale-mutations-v1"></script>
   </body>
 </html>

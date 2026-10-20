@@ -1,7 +1,16 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.26.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.27.exe` con Inno Setup 6.
+
+La version 1.0.27 incluye ediciones y borrados pendientes en la misma via rapida
+por lotes que las ventas nuevas al reconectar. Conserva los acuses por operacion,
+protege las mutaciones recientes frente a recibos anteriores de Google y aplica
+los cambios de KPI y movimientos al recibir el conjunto. El inventario comparte
+una sola instantanea remota con todos los productos del lote; las ediciones
+ajustan el stock local por diferencia y se oculta el indicador de pendientes
+de inventario en Offline. Usa cache v59.
+No cambia Code.gs ni requiere SQL adicional al lote publicado en 1.0.26.
 
 La version 1.0.26 verifica el informe remoto antes de mostrar las cifras al
 abrir Ventas con conexion. Al volver a la aplicacion consulta otra vez y descarta

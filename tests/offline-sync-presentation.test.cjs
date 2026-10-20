@@ -129,3 +129,12 @@ vm.runInContext(`${source.slice(pinStart, pinEnd)}
 
   console.log("PASS conexión, pendientes nunca confirmados por tiempo, errores visibles y PIN");
 })().catch((error) => { console.error(error); process.exitCode = 1; });
+
+{
+ const inventoryBadge={hidden:false,innerHTML:'46 cambios pendientes'},start=source.indexOf('  const setInventorySyncStatus ='),end=source.indexOf('  const readAppsScriptOutbox =',start);
+ const context=vm.createContext({$:()=>inventoryBadge,icon:String,escapeHTML:String,refreshIcons(){}});
+ vm.runInContext(source.slice(start,end)+';globalThis.setStatus=setInventorySyncStatus;',context);
+ context.setStatus('46 cambios pendientes','pending','refresh-cw');assert.equal(inventoryBadge.hidden,true);assert.equal(inventoryBadge.innerHTML,'');
+ context.setStatus('Movimiento rechazado','error','cloud-off');assert.equal(inventoryBadge.hidden,false);assert.match(inventoryBadge.innerHTML,/Movimiento rechazado/);
+ assert.match(html,/id="inventorySyncStatus" hidden/);
+}

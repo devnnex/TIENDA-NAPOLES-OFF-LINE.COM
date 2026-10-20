@@ -13,6 +13,15 @@ function server(){
  return {events,calls,setFail(value){fail=value;},async rpc(name,payload){
   calls.push(name);
   if(fail)return {error:{message:'Sin conexión'}};
+  if(name==='publish_report_changes_batch'){
+   const results=[];
+   for(const change of payload.p_changes){
+    let old=events.find(row=>row.operationId===change.operationId);
+    if(!old){old={sequence:events.length+1,operationId:change.operationId,action:change.action,payload:structuredClone(change.payload)};events.push(old);}
+    results.push({operationId:change.operationId,sequence:old.sequence});
+   }
+   return {data:{ok:true,results}};
+  }
   if(name==='publish_report_change'){
    const old=events.find(row=>row.operationId===payload.p_operation_id);
    if(!old)events.push({sequence:events.length+1,operationId:payload.p_operation_id,action:payload.p_action,payload:structuredClone(payload.p_payload)});
@@ -43,6 +52,34 @@ function device(backend,id){
  return {context,state,storage,renders,api:context.api};
 }
 const invoice=(id,quantity=2)=>({id,sessionId:'session-'+id,number:'TN-'+id,createdAt:'2026-10-13T17:00:00Z',totals:{subtotal:quantity*100,total:quantity*100},items:[{id:'line-'+id,menu_item_id:'product',item_name:'Agua',quantity,unit_price:100,unit_cost:40}],payments:[{method:'cash',amount:quantity*100}]});
+
+test('una ráfaga pendiente viaja en lotes, conserva todo al perder una respuesta y pinta los KPI una vez al recibirla',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');
+ const changes=Array.from({length:50},(_,i)=>({operationId:'burst-'+i,action:'record_sale',payload:{invoice:invoice('burst-'+i)}}));
+ sender.storage.set('napoles_report_change_outbox_v1',changes);
+ let lose=true;sender.state.sb={rpc:async(name,payload)=>{const reply=await backend.rpc(name,payload);if(lose){lose=false;throw Error('respuesta perdida');}return reply;}};
+ assert.equal(await sender.api.flushConfirmedReportChanges(),false);
+ assert.equal(sender.storage.get('napoles_report_change_outbox_v1').length,50);
+ assert.equal(await sender.api.flushConfirmedReportChanges(),true);
+ assert.equal(backend.events.length,50);assert.equal(sender.storage.get('napoles_report_change_outbox_v1').length,0);
+ assert.equal(backend.calls.filter(name=>name==='publish_report_changes_batch').length,4);
+ assert.ok(!backend.calls.includes('publish_report_change'));
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.incomeReport.totals.sales,50);
+ assert.equal(receiver.renders.filter(name=>name==='sales').length,1);
+});
+
+test('una segunda página fallida conserva el cursor anterior y no aplica una recepción incompleta',async()=>{
+ const backend=server(),receiver=device(backend,'receiver');
+ backend.events.push(...Array.from({length:301},(_,i)=>({sequence:i+1,operationId:'page-'+i,action:'record_sale',payload:{invoice:invoice('page-'+i),items:[{productId:'p',stock:i}]}})));
+ let fail=true;receiver.state.sb={rpc:async(name,payload)=>fail&&payload.p_after>0?{error:{message:'sin red'}}:backend.rpc(name,payload)};
+ assert.equal(await receiver.api.syncConfirmedReports(),false);
+ assert.equal(receiver.api.reportMirror().cursor,0);assert.equal(receiver.state.invoiceHistory.length,0);
+ assert.equal(receiver.state.inventoryMeta.p,undefined);
+ fail=false;assert.equal(await receiver.api.syncConfirmedReports(),true);
+ assert.equal(receiver.api.reportMirror().cursor,301);assert.equal(receiver.state.incomeReport.totals.sales,301);
+ assert.equal(receiver.state.inventoryMeta.p.stock,300);
+ assert.equal(receiver.renders.filter(name=>name==='sales').length,1);
+});
 
 test('una venta llega de Offline a BCA y de BCA a Offline sin esperar el informe de Google',async()=>{
  for(const [senderId,receiverId] of [['offline','bca'],['bca','offline']]){
@@ -109,3 +146,18 @@ test('el informe posterior confirmado conserva correcciones de Google al concili
  const remote=structuredClone(receiver.state.incomeReport);remote.records[0].total=250;remote.totals.income=250;remote.generatedAt='2099-01-01T00:00:00Z';
  const merged=receiver.api.mergeConfirmedIncomeReport(remote,filters);assert.equal(merged.records[0].total,250);assert.equal(merged.totals.income,250);
 });
+
+ test('sin la nueva funcion de lotes conserva compatibilidad y vacia la cola confirmada',async()=>{
+ const backend=server(),sender=device(backend,'sender');
+ sender.storage.set('napoles_report_change_outbox_v1',Array.from({length:3},(_,i)=>({operationId:'compatible-'+i,action:'record_sale',payload:{invoice:invoice('compatible-'+i)}})));
+ let attempts=0;sender.state.sb={rpc:async(name,payload)=>{if(name==='publish_report_changes_batch'){attempts++;return {error:{code:'PGRST202',message:'Missing function'}};}return backend.rpc(name,payload);}};
+ assert.equal(await sender.api.flushConfirmedReportChanges(),true);assert.equal(attempts,1);
+ assert.equal(backend.events.length,3);assert.equal(sender.storage.get('napoles_report_change_outbox_v1').length,0);
+ });
+ test('no retira operaciones por acuses ausentes o ajenos al lote enviado',async()=>{
+ const backend=server(),sender=device(backend,'sender');
+ sender.storage.set('napoles_report_change_outbox_v1',Array.from({length:3},(_,i)=>({operationId:'partial-'+i,action:'record_sale',payload:{invoice:invoice('partial-'+i)}})));
+ let attempts=0;sender.state.sb={rpc:async()=>{attempts++;return attempts===1?{data:{ok:true,results:[{operationId:'partial-0'},{operationId:'unrequested'}]}}:{error:{message:'sin red'}};}};
+ assert.equal(await sender.api.flushConfirmedReportChanges(),false);
+ assert.deepEqual(sender.storage.get('napoles_report_change_outbox_v1').map(change=>change.operationId),['partial-1','partial-2']);
+ });

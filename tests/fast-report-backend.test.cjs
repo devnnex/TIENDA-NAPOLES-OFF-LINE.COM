@@ -27,6 +27,18 @@ test('la bitácora rápida exige empleado autorizado, protege importes, ordena e
   const sales=(await read('sales')).changes[0].payload;assert.equal(sales.invoice.id,'a');assert.equal(sales.items.length,0);assert.equal(sales.movements.length,0);
   assert.equal((await read('boss',first.sequence)).changes.length,0);
   const notices=(await db.query('select * from notices')).rows;assert.equal(notices.length,1);assert.deepEqual(notices[0].payload,{});assert.equal(notices[0].event,'reports-committed');
+  const batchSql=fs.readFileSync(path.join(__dirname,'../supabase/migrations/20261019233000_report_change_batches.sql'),'utf8');await db.exec(batchSql);await db.exec(batchSql);
+  const batch=async(token,changes)=>(await db.query('select publish_report_changes_batch($1,$2::jsonb) result',[token,JSON.stringify(changes)])).rows[0].result;
+  const changes=Array.from({length:20},(_,i)=>({operationId:'batch-'+i,action:'record_sale',payload:{invoice:{id:'sale-'+i}}}));
+  await assert.rejects(batch('waiter',changes),/No autorizado/);
+  const received=await batch('boss',changes);assert.equal(received.results.length,20);
+  assert.equal((await db.query('select * from notices')).rows.length,2,'Un aviso para las veinte operaciones de la misma transacción.');
+  assert.ok((await batch('boss',changes)).results.every(row=>row.duplicate));
+  assert.equal((await db.query('select * from notices')).rows.length,2);
+  const invalid=[{operationId:'must-rollback',action:'delete_sale',payload:{}},{operationId:'invalid',action:'arbitrary',payload:{}}];
+  await assert.rejects(batch('boss',invalid),/Cambio no válido/);
+  assert.equal((await db.query("select * from pos_report_changes where operation_id='must-rollback'")).rows.length,0,'Un fallo al final revierte el lote completo.');
+  assert.equal((await db.query('select * from pos_report_changes')).rows.length,21);
   await db.exec('set role anon');await assert.rejects(db.query('select * from pos_report_changes'),/permission denied/);await db.exec('reset role');
  }finally{await db.close();}
 });

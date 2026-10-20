@@ -1,7 +1,21 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.25.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.26.exe` con Inno Setup 6.
+
+La version 1.0.26 verifica el informe remoto antes de mostrar las cifras al
+abrir Ventas con conexion. Al volver a la aplicacion consulta otra vez y descarta
+respuestas anteriores a la reanudacion. Si los datos no cambian, conserva las
+tarjetas y detalles visibles. Sin conexion mantiene la ultima copia disponible.
+La cache de recursos pasa a v58.
+
+Las acciones aisladas mantienen el envio individual; los avisos confirmados
+acumulados se publican en lotes de hasta 20. La recepcion paginada aplica el
+conjunto completo una sola vez y conserva el cursor si alguna pagina falla.
+Para habilitar esa publicacion por lotes en ambos proyectos, ejecutar una vez
+la migracion supabase/migrations/20261019233000_report_change_batches.sql en
+Supabase. Hasta entonces conserva el envio individual compatible. Code.gs sigue
+en 2.14.0: si ya esta publicado, no requiere volver a actualizarlo.
 
 La versión 1.0.25 oculta los pendientes de respaldo del encabezado y de Ventas;
 Ventas conserva el número de facturas. Conserva las altas antes de sus ediciones

@@ -5479,3 +5479,11 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
   dialog { max-width: calc(100vw - 1rem); }
   .income-edit-line { grid-template-columns: minmax(0,1fr); }
 }
+
+/* El turno acepta el primer clic sin esperar la animacion de entrada. */
+.sales-shift-modal[open], .sales-shift-modal .sales-shift-card { animation: none; }
+
+/* Mantener la navegacion fluida al conservar listas extensas entre secciones. */
+#incomeRecords > .income-record { content-visibility: auto; contain-intrinsic-size: auto 190px; }
+#inventoryList > .inventory-row { content-visibility: auto; contain-intrinsic-size: auto 120px; }
+#inventoryMovementList > .movement-row { content-visibility: auto; contain-intrinsic-size: auto 88px; }

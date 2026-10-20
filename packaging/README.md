@@ -1,7 +1,16 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.27.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.28.exe` con Inno Setup 6.
+
+La version 1.0.28 cierra el turno al primer clic en la X o fuera del modal.
+Dibuja las listas de Ventas, Inventario y Movimientos en tramos pequenos para
+atender clics y escritura sin esperar las consultas, y pausa el dibujo oculto.
+Reutiliza formatos de moneda y fecha sin cambiar sus valores. El encabezado y
+la barra lateral del inicio muestran SOFTWARE junto al nombre, sin cambiar Marca.
+Corrige el doble descuento del propio lote de borrados y descarta inventarios
+con una version anterior a la ya recibida. La cache de recursos pasa a v60.
+No cambia Code.gs ni requiere SQL adicional.
 
 La version 1.0.27 incluye ediciones y borrados pendientes en la misma via rapida
 por lotes que las ventas nuevas al reconectar. Conserva los acuses por operacion,

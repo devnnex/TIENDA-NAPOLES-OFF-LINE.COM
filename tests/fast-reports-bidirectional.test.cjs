@@ -281,7 +281,7 @@ test('la edicion conserva consumos previos y agrega solo la diferencia sin dupli
 test('la recepcion usa el aplicador real de inventario en ambos proyectos y conserva productos con cambios pendientes',async()=>{
  const backend=server(),receiver=device(backend,'receiver');receiver.state.items=[{id:'a',name:'Agua'},{id:'b',name:'Pan'}];
  receiver.state.inventoryMeta={a:{stock:1},b:{stock:99}};receiver.storage.set('jobs',[{id:'pending',status:'pending',action:'edit_sale',payload:{invoice:{items:[{menu_item_id:'b'}]}}}]);
- Object.assign(receiver.context,{productAcronym:()=>'',persistInventoryStore(){},persistBootstrapCache(){},renderMenuManager(){}});
+ Object.assign(receiver.context,{inventoryFor:item=>receiver.state.inventoryMeta[item.id],inventoryStatus:()=> 'available',productAcronym:()=>'',persistInventoryStore(){},persistBootstrapCache(){},renderMenuManager(){}});
  const offline=!source.includes('  const pendingInventoryIds =');
  vm.runInContext(section(offline?'isPendingInventoryJob':'pendingInventoryIds',offline?'enqueueAppsScriptJob':'enqueueAppsScriptJob'),receiver.context);
  backend.events.push({sequence:1,action:'edit_sale',payload:{items:[{productId:'a',stock:7},{productId:'b',stock:8}]}});
@@ -297,4 +297,36 @@ test('editar y despues borrar retira el importe original fuera de pagina una sol
  await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
  const merged=receiver.api.mergeConfirmedIncomeReport(paged,filters);assert.equal(merged.totals.income,0);assert.equal(merged.totals.sales,0);
  assert.equal(receiver.api.mergeConfirmedIncomeReport(merged,filters).totals.income,0);
+});
+
+test('borrar localmente y recibir su propio lote deja dinero y existencias en cero ventas sin restar dos veces',async()=>{
+ const backend=server(),sender=device(backend,'offline');const invoices=await stockedReceiver(backend,sender,50),remoteBefore=structuredClone(sender.state.incomeReport);
+ Object.assign(sender.context,{isBoss:()=>true,canDeleteRecords:()=>true,toast(){},persistInventoryStore(){},inventoryFor:item=>sender.state.inventoryMeta[item.id],
+ enqueueAppsScriptJob:(action,payload,key)=>{const jobs=sender.storage.get('jobs')||[];jobs.push({id:key,operationId:key,status:'pending',action,payload});sender.storage.set('jobs',jobs);},
+ $:selector=>selector==='#deleteIncomeDialog'?{close(){}}:null});
+ sender.state.items=[{id:'product'}];sender.state.inventoryMeta.product={stock:0};sender.context.navigator.onLine=false;
+ vm.runInContext(section('deleteIncomeSale','applyEditedSaleStock')+section('mergeIncomeReport','setIncomeReportStatus')+';globalThis.actual={deleteIncomeSale,mergeIncomeReport};',sender.context);
+ for(const sale of invoices)await sender.context.actual.deleteIncomeSale({sale_id:{value:sale.id}});
+ assert.equal(sender.state.incomeReport.totals.income,0);assert.equal(sender.state.inventoryMeta.product.stock,100);
+ sender.context.navigator.onLine=true;await sender.api.queueReadyCheckoutReports();await settle();await sender.api.syncConfirmedReports();
+ assert.equal(sender.state.incomeReport.totals.income,0);assert.equal(sender.state.incomeReport.totals.sales,0);
+ assert.equal(sender.state.inventoryMovements.length,0);assert.equal(sender.state.inventoryMeta.product.stock,100);
+ assert.equal(sender.context.actual.mergeIncomeReport(remoteBefore,filters).totals.income,0,'El informe remoto anterior tampoco vuelve a descontar las ventas pendientes.');
+ const emptyRemote={records:[],recordRows:[],totals:{income:0,sales:0,cash:0},totalRecords:0,generatedAt:'2099-01-01'};
+ sender.state.incomeReport=sender.context.actual.mergeIncomeReport(emptyRemote,filters);
+ assert.equal(sender.state.incomeReport.totals.income,0);
+});
+
+test('rafagas de altas ediciones y borrados mantienen las unidades finales aunque despues llegue una foto anterior',async()=>{
+ const backend=server(),receiver=device(backend,'receiver');receiver.state.items=[{id:'a',name:'Agua',price:100}];receiver.state.inventoryMeta={a:{stock:1000,version:1}};
+ Object.assign(receiver.context,{inventoryFor:item=>receiver.state.inventoryMeta[item.id],inventoryStatus:()=> 'available',productAcronym:()=>'',persistInventoryStore(){},persistBootstrapCache(){},renderMenuManager(){}});
+ const offline=!source.includes('  const pendingInventoryIds =');
+ vm.runInContext(section(offline?'isPendingInventoryJob':'pendingInventoryIds','enqueueAppsScriptJob')+section('inventorySummary','renderInventoryLiveCalculation')+';globalThis.actualStock={applyRemoteInventoryItems,inventorySummary};',receiver.context);
+ for(const [stock,version] of [[960,21],[940,41],[1000,61]]){
+ backend.events.push({sequence:backend.events.length+1,action:'edit_sale',payload:{items:[{productId:'a',stock,version,costPrice:40}]}});
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.a.stock,stock);assert.equal(receiver.context.actualStock.inventorySummary().units,stock);
+ }
+ backend.events.push({sequence:backend.events.length+1,action:'record_sale',payload:{items:[{productId:'a',stock:960,version:21}]}});
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.a.stock,1000);
+ receiver.context.actualStock.applyRemoteInventoryItems([{productId:'a',stock:940,version:41}]);assert.equal(receiver.context.actualStock.inventorySummary().units,1000);
 });

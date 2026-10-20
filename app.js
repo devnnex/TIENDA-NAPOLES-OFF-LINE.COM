@@ -2924,12 +2924,13 @@ const App = (() => {
       if (action === "sync_sales_batch" && Array.isArray(result?.results)) {
         const inventorySnapshot = result.results.findLast(receipt => Array.isArray(receipt.result?.items))?.result.items;
         const lastConfirmed = result.results.findLast(receipt => receipt.result?.ok);
+        const inventorySettledOperations = result.results.filter(receipt => receipt.result?.ok).map(receipt => receipt.operationId);
         reportChangeBatchDepth += 1;
         try {
           for (const receipt of result.results) {
             const operation = payload.operations.find(entry => entry.operationId === receipt.operationId);
             if (operation) await acceptResult(operation.action, operation.payload,
-              inventorySnapshot ? { ...receipt.result, items: receipt === lastConfirmed ? inventorySnapshot : [], reportBatchInventory: receipt === lastConfirmed } : receipt.result,
+              inventorySnapshot ? { ...receipt.result, items: receipt === lastConfirmed ? inventorySnapshot : [], reportBatchInventory: receipt === lastConfirmed, reportInventorySettled: receipt === lastConfirmed ? inventorySettledOperations : [] } : receipt.result,
               operation.operationId);
           }
         } finally {
@@ -3018,6 +3019,7 @@ const App = (() => {
         if (!remoteIds.has(String(productId)) && !preserveProductIds.has(String(productId))
           && (!baseline || baseline.get(productId) === state.inventoryMeta[productId]?.updatedAt)) {
           delete state.inventoryMeta[productId];
+          if (state.reportMirror?.inventoryBase) delete state.reportMirror.inventoryBase[productId];
           changed = true;
         }
       });
@@ -3027,6 +3029,7 @@ const App = (() => {
       if (baseline && baseline.get(remote.productId) !== state.inventoryMeta[remote.productId]?.updatedAt) return;
       const item = itemById.get(String(remote.productId || ""));
       if (!item) return;
+      if (!remote.reportInventoryProjection && Object.values(state.reportMirror?.inventoryEffects || {}).some(effect => Object.prototype.hasOwnProperty.call(effect, String(remote.productId)))) return;
       if (Number(remote.version || 0) > 0 && Number(remote.version) < Number(state.inventoryMeta[item.id]?.version || 0)) return;
       const nextMeta = {
         code: String(remote.code || productAcronym(item.name)).toUpperCase(),
@@ -3037,6 +3040,10 @@ const App = (() => {
         updatedAt: remote.updatedAt || state.inventoryMeta[item.id]?.updatedAt || new Date().toISOString(),
         version: Number(remote.version || 0)
       };
+      if (!remote.reportInventoryProjection && state.reportMirror?.inventoryBase?.[item.id]) {
+        state.reportMirror.inventoryBase[item.id] = { ...remote };
+        void saveReportSyncValue(reportMirrorKey(), state.reportMirror);
+      }
       if (JSON.stringify(state.inventoryMeta[item.id] || {}) !== JSON.stringify(nextMeta)) {
         state.inventoryMeta[item.id] = nextMeta;
         changed = true;
@@ -3058,6 +3065,7 @@ const App = (() => {
   };
 
   const enqueueAppsScriptJob = (action, payload, dedupeKey = uid()) => {
+    if (["record_sale", "edit_sale", "delete_sale"].includes(action) && typeof saleInventoryDeltas === "function") payload = { ...payload, inventoryDeltas: saleInventoryDeltas(action, payload) };
     const jobs = readAppsScriptOutbox();
     const operationId = uid();
     const job = {
@@ -3367,7 +3375,7 @@ const App = (() => {
       return true;
     } catch (error) {
       state.syncFresh.inventory = false;
-      setInventorySyncStatus("Usando respaldo local", "error", "cloud-off");
+      setInventorySyncStatus("Usando respaldo local", "local", "cloud-off");
       return false;
     }
     })().finally(() => { inventoryReadPromise = null; });
@@ -6448,6 +6456,67 @@ const App = (() => {
     }
     return state.reportMirror;
   };
+  const saleInventoryDeltas = (action, payload) => {
+    if (payload.inventoryDeltas) return payload.inventoryDeltas;
+    const deltas = {};
+    const add = (lines, sign) => (lines || []).forEach(line => {
+      const id = String(line.menu_item_id || line.menuItemId || "");
+      if (id) deltas[id] = Number(deltas[id] || 0) + sign * Number(line.quantity || 0);
+    });
+    if (action !== "record_sale") add(payload.previousRecord?.items, 1);
+    if (action !== "delete_sale") add(payload.invoice?.items, -1);
+    if (action === "record_sale" && payload.invoice?.sessionId) {
+      (state.inventoryMovements || []).filter(row => String(row.sessionId) === String(payload.invoice.sessionId)
+        && ["CONSUMO_MESA", "DEVOLUCION_CONSUMO"].includes(row.type)).forEach(row => {
+        const id = String(row.productId || "");
+        if (id && Object.prototype.hasOwnProperty.call(deltas, id)) deltas[id] -= Number(row.delta || 0);
+      });
+    }
+    return deltas;
+  };
+  const reportInventoryItems = mirror => Object.values(mirror.inventoryBase || {}).map(item => ({ ...item,
+    stock: Math.max(0, Object.values(mirror.inventoryEffects || {}).some(effect => Object.prototype.hasOwnProperty.call(effect, item.productId))
+      ? Number(mirror.inventoryProjected?.[item.productId] ?? item.stock ?? 0) : Number(item.stock || 0)),
+    reportInventoryProjection: true }));
+  const reconcileReportInventory = (mirror, payload, action) => {
+    mirror.inventoryBase ||= {}; mirror.inventoryEffects ||= {}; mirror.inventorySettled ||= {}; mirror.inventoryProjected ||= {};
+    if (action === "clear_inventory") { mirror.inventoryBase = {}; mirror.inventoryEffects = {}; }
+    if (action === "delete_inventory" && payload.productId) {
+      delete mirror.inventoryBase[payload.productId];
+      Object.values(mirror.inventoryEffects).forEach(effect => { delete effect[payload.productId]; });
+    }
+    const rejected = payload.inventoryRejectedOperation || (payload.invoice?.reportRejected ? payload.mutationId : "");
+    if (rejected) {
+      Object.entries(mirror.inventoryEffects[rejected] || {}).forEach(([id, delta]) => { mirror.inventoryProjected[id] = Number(mirror.inventoryProjected[id] || 0) - Number(delta); });
+      delete mirror.inventoryEffects[rejected]; mirror.inventorySettled[rejected] = true;
+    }
+    const effect = payload.inventoryEffect;
+    if (effect && !mirror.inventorySettled[effect.operationId] && !mirror.inventoryEffects[effect.operationId]) {
+      const ownJobs = readAppsScriptOutbox().filter(job => ["record_sale", "edit_sale", "delete_sale"].includes(job.action));
+      for (const id of Object.keys(effect.deltas)) {
+        if (!Object.values(mirror.inventoryEffects).some(value => Object.prototype.hasOwnProperty.call(value, id))) {
+          const current = state.inventoryMeta?.[id];
+          if (!current) continue;
+          const ownDelta = ownJobs.reduce((sum, job) => sum + Number(saleInventoryDeltas(job.action, job.payload)[id] || 0), 0);
+          const previous = mirror.inventoryBase[id];
+          if (!previous || Number(current.version || 0) >= Number(previous.version || 0))
+            mirror.inventoryBase[id] = { ...current, productId: id, stock: Number(current.stock || 0) - ownDelta };
+          mirror.inventoryProjected[id] = Number(mirror.inventoryBase[id]?.stock || 0);
+        }
+      }
+      Object.entries(effect.deltas).forEach(([id, delta]) => { mirror.inventoryProjected[id] = Number(mirror.inventoryProjected[id] || 0) + Number(delta); });
+      mirror.inventoryEffects[effect.operationId] = effect.deltas;
+    }
+    // Partial receipts may describe stock that already includes another device.
+    // Keep the accepted burst steady until all its effects on that product settle.
+    for (const id of payload.inventorySettledOperations || []) {
+      delete mirror.inventoryEffects[id]; mirror.inventorySettled[id] = true;
+    }
+    for (const item of payload.items || []) {
+      if (!mirror.inventoryBase[item.productId] && !Object.values(mirror.inventoryEffects).some(effect => Object.prototype.hasOwnProperty.call(effect, String(item.productId)))) continue;
+      if (Number(item.version || 0) >= Number(mirror.inventoryBase[item.productId]?.version || 0)) mirror.inventoryBase[item.productId] = item;
+    }
+  };
   let reportChangeBatchDepth = 0;
   const queueConfirmedReportChange = async (action, payload, result, operationId = "") => {
     const supported = ["record_sale","edit_sale","delete_sale","clear_income","adjust_inventory","upsert_inventory","set_inventory_stock","delete_inventory","clear_inventory","update_inventory_movement_cost","clear_inventory_movements"];
@@ -6487,6 +6556,9 @@ const App = (() => {
     const change = { operationId: operationId || `${action}:${eventId || saleId || uid()}:${action === "record_sale" ? "saved" : uid()}`, action,
       payload: { occurredAt: new Date().toISOString(), ...(invoice ? { invoice } : {}), ...(saleId ? { saleId } : {}), ...(payload.saleLink ? { saleLink: payload.saleLink } : {}), ...(productId ? { productId } : {}),
         ...(["edit_sale", "delete_sale"].includes(action) ? { mutationId: payload.mutationId || operationId } : {}),
+        ...(invoice?.reportRejected ? { inventoryRejectedOperation: payload.mutationId } : {}),
+        ...(invoice?.googlePending ? { inventoryEffect: { operationId: payload.mutationId || operationId, deltas: saleInventoryDeltas(action, payload) } } : {}),
+        ...(Array.isArray(result.items) ? { inventorySettledOperations: result.reportInventorySettled || [operationId] } : {}),
         movements, items: (result.items || (result.item ? [result.item] : [])).filter(item => result.reportBatchInventory || action === "delete_sale" || ids.has(String(item.productId))) } };
     const queued = readLocalJson(reportChangeOutboxKey, []);
     if (!queued.some(entry => entry.operationId === change.operationId)) {
@@ -6577,6 +6649,7 @@ const App = (() => {
     for (const change of changes) {
       if (Number(change.sequence) <= Number(mirror.cursor)) continue;
       const payload = change.payload || {};
+      reconcileReportInventory(mirror, payload, change.action);
       const id = String(payload.saleId || payload.invoice?.id || payload.invoice?.sessionId || "");
       if (change.action === "clear_income") { mirror.sales = {}; mirror.deleted = {}; mirror.pendingSaleMutations = {}; mirror.deletedSaleRecords = {}; mirror.salesClearAt = change.confirmedAt || payload.occurredAt; }
       mirror.pendingSaleMutations ||= {};
@@ -6606,6 +6679,7 @@ const App = (() => {
       (payload.items || []).forEach(item => inventory.set(String(item.productId), item));
       mirror.cursor = Number(change.sequence);
     }
+    reportInventoryItems(mirror).forEach(item => inventory.set(String(item.productId), item));
     const items = [...inventory.values()];
     if (applyInventory && items.length) applyRemoteInventoryItems(items);
     return items;
@@ -6669,6 +6743,13 @@ const App = (() => {
         if (state.activeAdminSection === "inventory") renderInventory();
         if ($("#purchaseHistoryDialog")?.open) { renderPurchaseProductOptions(); renderPurchaseHistory(); }
       }
+      if (!changed) {
+        const items = reportInventoryItems(mirror);
+        if (items.length) {
+          if (typeof pendingInventoryIds === "function") applyRemoteInventoryItems(items);
+          else applyRemoteInventoryItems(items, { preserveProductIds: typeof pendingInventoryProductIds === "function" ? pendingInventoryProductIds() : new Set() });
+        }
+      }
       return changed;
     } catch (_) { return false; } finally {
       confirmedReportReading = false;
@@ -6719,6 +6800,9 @@ const App = (() => {
       if (!invoice.reportMutation || invoice.reportMovementSettled) continue;
       if (!invoice.googlePending && authoritative && readStartedAt >= Date.parse(invoice.reportConfirmedAt || "")) {
         invoice.reportMovementSettled = true; retired = true; continue;
+      }
+      for (const [id, row] of map) {
+        if (row.type === "CORRECCION_VENTA" && movementBelongsToSale(row, invoice)) map.delete(id);
       }
       const quantities = new Map();
       (invoice.reportPrevious?.items || []).forEach(line => {

@@ -330,3 +330,115 @@ test('rafagas de altas ediciones y borrados mantienen las unidades finales aunqu
  await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.a.stock,1000);
  receiver.context.actualStock.applyRemoteInventoryItems([{productId:'a',stock:940,version:41}]);assert.equal(receiver.context.actualStock.inventorySummary().units,1000);
 });
+
+
+function installActualInventory(target, stock=1000) {
+ target.state.items=[{id:'product',name:'Agua',price:100}];target.state.inventoryMeta={product:{stock,version:1,costPrice:40,updatedAt:'base'}};
+ Object.assign(target.context,{inventoryFor:item=>target.state.inventoryMeta[item.id],inventoryStatus:()=> 'available',productAcronym:()=>'',persistInventoryStore(){},persistBootstrapCache(){},renderMenuManager(){}});
+ const offline=!source.includes('  const pendingInventoryIds =');
+ vm.runInContext(section(offline?'isPendingInventoryJob':'pendingInventoryIds','enqueueAppsScriptJob')+';globalThis.actualInventory=applyRemoteInventoryItems;',target.context);
+}
+test('altas ediciones y borrados transmiten unidades en la misma rafaga y los tres acuses parciales no vuelven a moverlas',async()=>{
+ for(const action of ['record_sale','edit_sale','delete_sale']){
+  const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');
+  const sales=Array.from({length:50},(_,i)=>invoice('units-'+i));
+  const initial=action==='record_sale'?1000:900,final=action==='record_sale'?900:action==='edit_sale'?850:1000;
+  installActualInventory(sender,final);installActualInventory(receiver,initial);
+  const jobs=sales.map((sale,i)=>({id:'units-op-'+i,operationId:'units-op-'+i,status:'pending',action,
+   payload:{...(action==='delete_sale'?{saleId:sale.id}:{invoice:{...sale,checkoutAccepted:true,...(action==='edit_sale'?{items:sale.items.map(line=>({...line,quantity:3}))}:{})}}),
+    previousRecord:{saleId:sale.id,items:[{menuItemId:'product',quantity:2}]}}}));
+  sender.storage.set('jobs',jobs);sender.context.navigator.onLine=false;
+  await sender.api.queueReadyCheckoutReports();assert.equal(backend.events.length,0);
+  sender.context.navigator.onLine=true;await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+  assert.equal(receiver.state.inventoryMeta.product.stock,final,'La primera rafaga ya lleva las existencias finales: '+action);
+  await sender.api.syncConfirmedReports();assert.equal(sender.state.inventoryMeta.product.stock,final,'El emisor no se aplica su propio descuento dos veces.');
+  for(let start=0;start<50;start+=20){
+   const batch=jobs.slice(start,start+20),done=start+batch.length;
+   const stock=initial+(final-initial)*done/50;
+   sender.context.fetch=async()=>({ok:true,text:async()=>JSON.stringify({ok:true,results:batch.map((job,index)=>({operationId:job.id,result:{ok:true,batchReceipt:true,...(index===batch.length-1?{items:[{productId:'product',stock,version:done+1,costPrice:40}]}:{})}}))})});
+   await sender.api.appsScriptRequest('sync_sales_batch',{operations:batch});await settle();
+   sender.storage.set('jobs',jobs.slice(done));
+   if(start===20){receiver.context.navigator.onLine=false;assert.equal(await receiver.api.syncConfirmedReports(),false);receiver.context.navigator.onLine=true;}
+   await receiver.api.syncConfirmedReports();await sender.api.syncConfirmedReports();
+   assert.equal(receiver.state.inventoryMeta.product.stock,final,'Cada confirmacion parcial conserva el saldo final: '+action+' '+done);
+   assert.equal(sender.state.inventoryMeta.product.stock,final);
+   receiver.context.actualInventory([{productId:'product',stock,version:done+1}]);
+   assert.equal(receiver.state.inventoryMeta.product.stock,final,'Una lectura intermedia tampoco repite el lote.');
+  }
+  assert.equal(Object.keys(receiver.api.reportMirror().inventoryEffects).length,0);
+  const saved=structuredClone(receiver.api.reportMirror());receiver.state.inventoryMeta.product.stock=initial;receiver.state.reportMirror=saved;
+  await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,final,'Recupera el saldo persistido aunque se cerrara antes de pintar.');
+ }
+});
+test('el inventario acumula equipos distintos y un acuse perdido o repetido no duplica unidades',async()=>{
+ const backend=server(),a=device(backend,'a'),b=device(backend,'b'),receiver=device(backend,'receiver');installActualInventory(receiver,100);
+ for(const [sender,id,quantity] of [[a,'device-a',2],[b,'device-b',3]]){
+  sender.storage.set('jobs',[{id,operationId:id,status:'pending',action:'record_sale',payload:{invoice:{...invoice(id,quantity),checkoutAccepted:true}}}]);
+  await sender.api.queueReadyCheckoutReports();await settle();
+ }
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,95);
+ await a.api.queueConfirmedReportChange('record_sale',{invoice:invoice('device-a',2)},{ok:true,items:[{productId:'product',stock:98,version:2}]},'device-a');await settle();
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,95);
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,95);
+ await b.api.queueConfirmedReportChange('record_sale',{invoice:invoice('device-b',3)},{ok:true,items:[{productId:'product',stock:95,version:3}]},'device-b');await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.inventoryMeta.product.stock,95);
+});
+test('una lectura de movimientos tomada entre dos ediciones no suma correcciones remotas encima de la proyeccion final',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');
+ const [sale]=await stockedReceiver(backend,receiver,1),before=receiver.state.incomeReport.records[0];
+ sender.storage.set('jobs',[{id:'edit-one',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:before}},
+ {id:'edit-two',action:'edit_sale',payload:{invoice:invoice(sale.id,4),previousRecord:{...before,items:[{menuItemId:'product',quantity:3}]}}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+ const partial=[billedMovement(sale),{movementId:'EDIT-intermediate-product',type:'CORRECCION_VENTA',productId:'product',sessionId:sale.sessionId,delta:-1}];
+ const merged=receiver.api.mergeConfirmedMovements(partial,'',{authoritative:true,readStartedAt:Date.now()});
+ assert.equal(merged.reduce((sum,row)=>sum+row.delta,0),-4);
+ assert.equal(receiver.api.mergeConfirmedMovements(merged).reduce((sum,row)=>sum+row.delta,0),-4);
+});
+
+test('alta edicion y borrado de la misma venta quedan quietos durante los acuses y los reintentos',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');installActualInventory(receiver,100);
+ const sale=invoice('same-sale'),record={saleId:sale.id,items:[{menuItemId:'product',quantity:2}]};
+ const jobs=[{id:'same-create',action:'record_sale',payload:{invoice:{...sale,checkoutAccepted:true}}},
+ {id:'same-edit',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:record}},
+ {id:'same-delete',action:'delete_sale',payload:{saleId:sale.id,previousRecord:{...record,items:[{menuItemId:'product',quantity:3}]}}}];
+ sender.storage.set('jobs',jobs);await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.inventoryMeta.product.stock,100);assert.equal(receiver.state.incomeReport.totals.sales,0);
+ for(const [index,stock] of [98,97,100].entries()){
+  const job=jobs[index];await sender.api.queueConfirmedReportChange(job.action,job.payload,{ok:true,items:[{productId:'product',stock,version:index+2}]},job.id);
+  await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,100);
+  assert.equal(receiver.state.inventoryMovements.length,0);await sender.api.queueReadyCheckoutReports();await settle();
+  await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,100);
+ }
+});
+test('el rechazo definitivo retira tambien las unidades proyectadas, sin dejarlas pendientes para siempre',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');
+ const [sale]=await stockedReceiver(backend,receiver,1),record=receiver.state.incomeReport.records[0];installActualInventory(receiver,98);
+ sender.storage.set('jobs',[{id:'reject-stock',action:'edit_sale',payload:{invoice:invoice(sale.id,3),previousRecord:record}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,97);
+ sender.context.fetch=async()=>({ok:true,text:async()=>JSON.stringify({ok:true,records:[record]})});
+ await sender.api.queueConfirmedReportChange('edit_sale',{invoice:invoice(sale.id,3)},{ok:false,retryable:false},'reject-stock');
+ await settle();delete backend.events.at(-1).payload.invoice; // Un lector de inventario sin permiso de ventas tampoco recibe la factura.
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,98);
+ assert.equal(Object.keys(receiver.api.reportMirror().inventoryEffects).length,0);
+});
+test('el cierre de una mesa cuyo consumo ya se desconto no vuelve a descontar ese consumo',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');installActualInventory(receiver,98);
+ const sale={...invoice('consumed'),checkoutAccepted:true};
+ sender.state.inventoryMovements=[{movementId:'consumed-before',sessionId:sale.sessionId,productId:'product',type:'CONSUMO_MESA',delta:-2}];
+ sender.storage.set('jobs',[{id:'close-consumed',action:'record_sale',payload:{invoice:sale}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,98);
+});
+
+test('los acuses de dos equipos recibidos en orden inverso no repiten ni compensan unidades en pantalla',async()=>{
+ const backend=server(),a=device(backend,'a'),b=device(backend,'b'),receiver=device(backend,'receiver');installActualInventory(receiver,100);
+ for(const [sender,id,quantity] of [[a,'reverse-a',2],[b,'reverse-b',3]]){
+  sender.storage.set('jobs',[{id,operationId:id,action:'record_sale',payload:{invoice:{...invoice(id,quantity),checkoutAccepted:true}}}]);
+  await sender.api.queueReadyCheckoutReports();await settle();
+ }
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,95);
+ // B se guardo primero, pero se perdio su respuesta. El acuse de A llega antes.
+ await a.api.queueConfirmedReportChange('record_sale',{invoice:invoice('reverse-a',2)},{ok:true,items:[{productId:'product',stock:95,version:3}]},'reverse-a');await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.inventoryMeta.product.stock,95,'No suma B encima de un saldo que ya incluye B.');
+ await b.api.queueConfirmedReportChange('record_sale',{invoice:invoice('reverse-b',3)},{ok:true,items:[{productId:'product',stock:97,version:2}]},'reverse-b');await settle();await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.inventoryMeta.product.stock,95,'El acuse atrasado tampoco restaura el saldo anterior.');
+});

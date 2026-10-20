@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261019-ui-stock-v1">
+    <link rel="stylesheet" href="style.css?v=20261019-inventory-burst-v1">
     <link rel="stylesheet" href="menu-cards.css?v=20261019-dos-cartas-v3">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
@@ -84,7 +84,7 @@
           <p class="js-business-subtitle">Gestiona solicitudes, mesas, menu y cuentas.</p>
           <span class="live-status" id="realtimeStatus"><i data-lucide="wifi"></i> Conectando en vivo</span>
           <span class="live-status sync-status is-offline" id="globalSyncStatus" role="status" aria-live="polite" hidden></span>
-          <button class="ghost" id="retryPendingSync" type="button" hidden>Reintentar respaldo</button>
+          <span class="live-status live" id="softwareStatus" role="status"><i data-lucide="circle-check"></i> Usando el software</span>
         </div>
         <div class="admin-header-actions">
           <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
@@ -939,6 +939,6 @@
     <script defer src="vendor/jspdf.umd.min.js"></script>
     <script defer src="sales-shift.js?v=20261019-pos-integrity-v1"></script>
     <script defer src="menu-cards.js?v=20261019-consumo-v1"></script>
-    <script defer src="app.js?v=20261019-ui-stock-v1"></script>
+    <script defer src="app.js?v=20261019-inventory-burst-v1"></script>
   </body>
 </html>

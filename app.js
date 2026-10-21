@@ -3387,7 +3387,7 @@ const App = (() => {
     }
     try {
       const baseline = new Map(Object.entries(state.inventoryMeta).map(([id, meta]) => [id, meta?.updatedAt]));
-      const result = await appsScriptRequest("get_inventory");
+      const result = await (typeof readCoherentInventorySnapshot === "function" ? readCoherentInventorySnapshot() : appsScriptRequest("get_inventory"));
       if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el inventario.");
       if (!Array.isArray(result.items)) throw new Error("El inventario remoto devolvió una respuesta inválida.");
       applyRemoteInventoryItems(result.items, { replace: true, preserveProductIds: pendingInventoryProductIds(), baseline });
@@ -6507,6 +6507,86 @@ const App = (() => {
     }
     return deltas;
   };
+  let inventorySnapshotProofPromise = null;
+  const readCoherentInventorySnapshot = () => {
+    if (inventorySnapshotProofPromise) return inventorySnapshotProofPromise;
+    inventorySnapshotProofPromise = (async () => {
+      const token = state.authToken, mirror = reportMirror();
+      const active = Object.keys(mirror.inventoryEffects || {});
+      if (!active.length) return appsScriptRequest("get_inventory");
+      const fingerprint = () => JSON.stringify([mirror.inventoryEffects, mirror.inventorySettled, mirror.inventoryBase]);
+      const before = fingerprint();
+      const links = { ...(mirror.inventoryOperations || {}) };
+      if (active.some(id => !links[id])) {
+        let cursor = 0;
+        do {
+          const { data, error } = await state.sb.rpc("get_report_changes", { auth_token: token, p_after: cursor });
+          if (error || !data?.ok || !Array.isArray(data.changes)) throw transientAppsScriptError("Falta verificar el inventario guardado.");
+          for (const change of data.changes) {
+            const payload = change.payload || {}, id = payload.inventoryEffect?.operationId;
+            if (id && active.includes(id)) links[id] = inventoryOperationLink(change.action, payload);
+          }
+          if (!data.hasMore) break;
+          const next = Number(data.changes.at(-1)?.sequence);
+          if (next <= cursor) throw transientAppsScriptError("El inventario guardado no pudo verificarse completo.");
+          cursor = next;
+        } while (true);
+        if (active.some(id => !links[id]?.saleId)) throw transientAppsScriptError("Falta la referencia de un ajuste pendiente.");
+      }
+      let proof = mirror.inventoryCanonicalProof, snapshot, after;
+      if (proof && active.every(id => Object.prototype.hasOwnProperty.call(proof.applied, id))) {
+        snapshot = await appsScriptRequest("get_inventory");
+        after = await appsScriptRequest("status");
+        if (!after?.ok || after.historyRevision !== proof.revision) proof = null;
+      } else proof = null;
+      if (!proof) {
+        const filters = { dateFrom: "2000-01-01", dateTo: "2099-12-31", limit: 500 };
+        const report = await appsScriptRequest("get_income_report", { filters });
+        if (!report?.ok || report.stale || !Array.isArray(report.recordRows) || !Array.isArray(report.records)) throw transientAppsScriptError("Falta confirmar que ajustes de inventario ya se aplicaron.");
+        const ids = new Set(report.recordRows.map(row => String(row.saleId)));
+        const records = new Map(report.records.map(row => [String(row.saleId), row]));
+        const missing = report.recordRows.filter(row => active.some(id => links[id].action === "edit_sale" && links[id].saleId === String(row.saleId)) && !records.has(String(row.saleId)));
+        for (let offset = 0; offset < missing.length; offset += 300) {
+          const page = await appsScriptRequest("get_income_report", { filters: { ...filters, revision: report.revision, pageRows: missing.slice(offset, offset + 300) } });
+          if (!page?.ok || page.stale || !Array.isArray(page.records)) throw transientAppsScriptError("La verificacion del inventario cambio durante la lectura.");
+          page.records.forEach(row => records.set(String(row.saleId), row));
+        }
+        const applied = {};
+        for (const id of active) {
+          const link = links[id], exists = ids.has(link.saleId);
+          applied[id] = link.action === "record_sale" ? exists : link.action === "delete_sale" ? !exists
+            : !exists || JSON.stringify(inventoryQuantities(records.get(link.saleId)?.items)) === JSON.stringify(link.quantities);
+        }
+        proof = { revision: report.revision, applied };
+        snapshot = await appsScriptRequest("get_inventory");
+        after = await appsScriptRequest("status");
+      }
+      // Read stock after checking the operations, then verify that no sale
+      // committed between those reads. A failed check leaves the cache intact.
+      if (!snapshot?.ok || !Array.isArray(snapshot.items) || !after?.ok || after.historyRevision !== proof.revision
+        || state.authToken !== token || fingerprint() !== before) throw transientAppsScriptError("El inventario se esta actualizando; se verificara otra vez.");
+      const effects = { ...mirror.inventoryEffects }, settled = { ...mirror.inventorySettled };
+      for (const id of active) if (proof.applied[id]) { delete effects[id]; settled[id] = true; }
+      const base = Object.fromEntries(snapshot.items.map(item => [String(item.productId), item]));
+      const projected = Object.fromEntries(snapshot.items.map(item => [String(item.productId), Number(item.stock || 0)
+        + Object.values(effects).reduce((sum, effect) => sum + Number(effect[item.productId] || 0), 0)]));
+      const fields = { inventoryBase: base, inventoryProjected: projected, inventoryEffects: effects,
+        inventorySettled: settled, inventoryOperations: links, inventoryCanonicalProof: proof };
+      if (!await saveReportSyncValue(reportMirrorKey(), { ...mirror, ...fields })) throw transientAppsScriptError("Falta guardar el inventario conciliado.");
+      if (state.authToken !== token || fingerprint() !== before) throw transientAppsScriptError("Hay nuevos ajustes de inventario por verificar.");
+      Object.assign(mirror, fields);
+      return { ...snapshot, items: reportInventoryItems(mirror) };
+    })().finally(() => { inventorySnapshotProofPromise = null; });
+    return inventorySnapshotProofPromise;
+  };
+  const inventoryQuantities = items => Object.entries((items || []).reduce((totals, line) => {
+    const id = String(line.menu_item_id || line.menuItemId || "");
+    if (id) totals[id] = Number(totals[id] || 0) + Number(line.quantity || 0);
+    return totals;
+  }, {})).sort(([left], [right]) => left.localeCompare(right));
+  const inventoryOperationLink = (action, payload) => ({ action,
+    saleId: String(payload.saleId || payload.invoice?.id || payload.invoice?.sessionId || ""),
+    ...(action === "edit_sale" ? { quantities: inventoryQuantities(payload.invoice?.items) } : {}) });
   const reportInventoryItems = mirror => Object.values(mirror.inventoryBase || {}).map(item => ({ ...item,
     stock: Math.max(0, Object.values(mirror.inventoryEffects || {}).some(effect => Object.prototype.hasOwnProperty.call(effect, item.productId))
       ? Number(mirror.inventoryProjected?.[item.productId] ?? item.stock ?? 0) : Number(item.stock || 0)),
@@ -6531,6 +6611,7 @@ const App = (() => {
       mirror.inventorySettled[stockChange.operationId] = true;
     }
     const effect = payload.inventoryEffect;
+    if (effect) { mirror.inventoryOperations ||= {}; mirror.inventoryOperations[effect.operationId] = inventoryOperationLink(action, payload); }
     if (effect && !mirror.inventorySettled[effect.operationId] && !mirror.inventoryEffects[effect.operationId]) {
       const inventoryJobs = readAppsScriptOutbox();
       const ownJobs = inventoryJobs.filter(job => ["record_sale", "edit_sale", "delete_sale"].includes(job.action));

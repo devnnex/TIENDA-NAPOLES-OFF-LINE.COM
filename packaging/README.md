@@ -1,7 +1,13 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.34.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.35.exe` con Inno Setup 6.
+
+La version 1.0.35 vuelve a verificar las operaciones de inventario cuando
+cambia el stock remoto, incluso si se perdio el aviso de revision del respaldo.
+Mantiene la recuperacion de las copias antiguas y comprueba tambien cambios
+posteriores, operaciones nuevas y reconexiones. Usa cache v67.
+El cambio se limita al inventario; no requiere SQL ni actualizar Code.gs.
 
 La version 1.0.34 recupera los calculos antiguos de existencias que podian
 ser distintos entre equipos con las mismas revisiones. Verifica que operaciones

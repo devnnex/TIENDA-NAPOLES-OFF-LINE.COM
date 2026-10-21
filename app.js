@@ -6537,7 +6537,9 @@ const App = (() => {
       if (proof && active.every(id => Object.prototype.hasOwnProperty.call(proof.applied, id))) {
         snapshot = await appsScriptRequest("get_inventory");
         after = await appsScriptRequest("status");
-        if (!after?.ok || after.historyRevision !== proof.revision) proof = null;
+        const affected = new Set(active.flatMap(id => Object.keys(mirror.inventoryEffects[id])));
+        if (!after?.ok || after.historyRevision !== proof.revision || snapshot.items?.some(item => affected.has(String(item.productId))
+          && proof.inventoryVersions?.[item.productId] !== JSON.stringify([item.version, item.stock]))) proof = null;
       } else proof = null;
       if (!proof) {
         const filters = { dateFrom: "2000-01-01", dateTo: "2099-12-31", limit: 500 };
@@ -6565,6 +6567,7 @@ const App = (() => {
       // committed between those reads. A failed check leaves the cache intact.
       if (!snapshot?.ok || !Array.isArray(snapshot.items) || !after?.ok || after.historyRevision !== proof.revision
         || state.authToken !== token || fingerprint() !== before) throw transientAppsScriptError("El inventario se esta actualizando; se verificara otra vez.");
+      proof = { ...proof, inventoryVersions: Object.fromEntries(snapshot.items.map(item => [String(item.productId), JSON.stringify([item.version, item.stock])])) };
       const effects = { ...mirror.inventoryEffects }, settled = { ...mirror.inventorySettled };
       for (const id of active) if (proof.applied[id]) { delete effects[id]; settled[id] = true; }
       const base = Object.fromEntries(snapshot.items.map(item => [String(item.productId), item]));

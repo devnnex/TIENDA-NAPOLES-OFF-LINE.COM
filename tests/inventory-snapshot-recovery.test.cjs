@@ -84,3 +84,10 @@ test('sigue conciliando entradas retiros y operaciones nuevas despues de recuper
  await same(93);
  for(const app of apps)app.env.snapshot={ok:true,items:[item(103,7)]};await same(103);
 });
+
+test('si se perdio el aviso de revision vuelve a verificar al cambiar las existencias remotas',async()=>{
+ const app=fixture();assert.equal((await app.api.readCoherentInventorySnapshot()).items[0].stock,95);
+ app.env.snapshot={ok:true,items:[item(95,3)]};app.env.report.recordRows.push({saleId:'pending-sale',row:3});
+ assert.equal((await app.api.readCoherentInventorySnapshot()).items[0].stock,95);
+ assert.equal(Object.keys(app.mirror.inventoryEffects).length,0);
+});

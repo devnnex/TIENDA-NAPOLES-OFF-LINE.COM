@@ -479,3 +479,44 @@ test('el acceso compartido al inventario conserva la version al hacer una reposi
  owner.state.inventoryMeta.product={...before,stock:24,updatedAt:'local-entry'};
  owner.context.actualInventory([{productId:'product',stock:0,version:6}]);assert.equal(owner.state.inventoryMeta.product.stock,24);
 });
+
+test('el lote manual confirmado comparte stock y todos los campos de inventario sin esperar a Google otra vez',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');installActualInventory(receiver,10);
+ const item={productId:'product',name:'Club Colombia',category:'Cervezas',stock:24,version:2,costPrice:2500,salePrice:5000,minStock:6,unit:'botella',code:'CC',isAvailable:false,updatedAt:'remote-change'};
+ await sender.api.queueConfirmedReportChange('sync_inventory',{items:[item]},{ok:true,items:[item]},'manual-batch');await settle();
+ await receiver.api.syncConfirmedReports();
+ assert.equal(receiver.state.inventoryMeta.product.stock,24);
+ assert.equal(receiver.state.inventoryMeta.product.costPrice,2500);
+ assert.equal(receiver.state.inventoryMeta.product.minStock,6);
+ assert.equal(receiver.state.items[0].name,'Club Colombia');
+ assert.equal(receiver.state.items[0].menu_categories.name,'Cervezas');
+ assert.equal(receiver.state.items[0].price,5000);assert.equal(receiver.state.items[0].is_available,false);
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,24);
+});
+test('una rafaga de cincuenta ajustes manuales se recibe completa y no vuelve al saldo anterior',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');installActualInventory(receiver,100);
+ backend.setFail(true);
+ for(let i=0;i<50;i++)await sender.api.queueConfirmedReportChange('adjust_inventory',{adjustment:{eventId:'entry-'+i,productId:'product',delta:i<25?1:-1}},{ok:true,item:{productId:'product',name:'Agua',stock:i<25?101+i:149-i,version:i+2,costPrice:40,salePrice:100}},'manual-'+i);
+ await settle();backend.setFail(false);await sender.api.flushConfirmedReportChanges();await settle();
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,100);
+ assert.equal(backend.events.length,50);const before=receiver.renders.length;
+ await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,100);assert.equal(receiver.renders.length,before);
+});
+test('agrupar cambios de stock antes de enviarlos conserva todo el ajuste y respeta la escritura en vuelo',async()=>{
+ const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');installActualInventory(receiver,2);
+ const sale={...invoice('before-manual'),checkoutAccepted:true};sender.storage.set('jobs',[{id:'sale',action:'record_sale',payload:{invoice:sale}}]);
+ await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,0);
+ sender.storage.set('jobs',[]);
+ Object.assign(sender.context,{recordSyncEvent(){},isAppsScriptConfigured:()=>false,setInventorySyncStatus(){},updateGlobalSyncStatus(){},flushAppsScriptOutbox(){}});
+ vm.runInContext(section('enqueueAppsScriptJob','appsScriptRetryDelay')+';globalThis.enqueue=enqueueAppsScriptJob;',sender.context);
+ for(const action of ['set_inventory_stock','upsert_inventory']){
+  sender.storage.set('jobs',[]);
+  const payload=stock=>action==='set_inventory_stock'?{productId:'product',stock,inventoryDelta:10}:{item:{productId:'product',stock,inventoryDelta:10}};
+  await sender.context.enqueue(action,payload(10),'same');await sender.context.enqueue(action,payload(20),'same');
+  const jobs=sender.storage.get('jobs');assert.equal(jobs.length,1);
+  const delta=action==='set_inventory_stock'?jobs[0].payload.inventoryDelta:jobs[0].payload.item.inventoryDelta;
+  assert.equal(delta,20,'El ultimo valor absoluto incluye ambos ajustes');
+  jobs[0].status='syncing';sender.storage.set('jobs',jobs);
+  await sender.context.enqueue(action,payload(30),'same');assert.equal(sender.storage.get('jobs').length,2,'Una escritura en vuelo conserva su identidad y su ajuste');
+ }
+});

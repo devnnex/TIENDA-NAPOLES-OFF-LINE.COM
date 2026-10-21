@@ -3048,6 +3048,16 @@ const App = (() => {
         state.inventoryMeta[item.id] = nextMeta;
         changed = true;
       }
+      if (typeof remote.name === "string" && remote.name.trim() && item.name !== remote.name) {
+        item.name = remote.name;
+        changed = true;
+      }
+      if (typeof remote.category === "string" && String(item.menu_categories?.name || "") !== remote.category) {
+        const category = state.categories?.find(entry => entry.name === remote.category);
+        if (category) item.category_id = category.id;
+        item.menu_categories = remote.category ? { ...(item.menu_categories || {}), name: remote.category } : null;
+        changed = true;
+      }
       if (Number.isFinite(Number(remote.salePrice)) && item.price !== Math.max(0, Number(remote.salePrice))) {
         item.price = Math.max(0, Number(remote.salePrice));
         changed = true;
@@ -3083,9 +3093,21 @@ const App = (() => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
-    const existingIndex = jobs.findIndex((entry) => entry.dedupeKey === dedupeKey);
-    if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock", "update_inventory_movement_cost"].includes(action)) jobs[existingIndex] = job;
-    else if (existingIndex < 0) jobs.push(job);
+    const stockWrite = ["upsert_inventory", "set_inventory_stock"].includes(action);
+    const existingIndex = stockWrite
+      ? jobs.findLastIndex(entry => entry.dedupeKey === dedupeKey && entry.status !== "syncing" && !Number(entry.attempts || 0))
+      : jobs.findIndex(entry => entry.dedupeKey === dedupeKey);
+    if (existingIndex >= 0 && ["upsert_inventory", "set_inventory_stock", "update_inventory_movement_cost"].includes(action)) {
+      if (stockWrite) {
+        const previous = action === "upsert_inventory" ? jobs[existingIndex].payload.item : jobs[existingIndex].payload;
+        const next = action === "upsert_inventory" ? job.payload.item : job.payload;
+        if (previous?.inventoryDelta !== undefined || next?.inventoryDelta !== undefined) {
+          const combined = { ...next, inventoryDelta: Number(previous?.inventoryDelta || 0) + Number(next?.inventoryDelta || 0) };
+          job.payload = action === "upsert_inventory" ? { ...job.payload, item: combined } : combined;
+        }
+      }
+      jobs[existingIndex] = job;
+    } else if (existingIndex < 0) jobs.push(job);
     const persisted = writeAppsScriptOutbox(jobs);
     recordSyncEvent("queued", job);
     if (isAppsScriptConfigured()) void flushAppsScriptOutbox();
@@ -5715,7 +5737,7 @@ const App = (() => {
   };
   const recordAbono = async (form) => {
     if (form.dataset.saving === "1") return;
-    const session = state.sessions.find((row) => row.id === form.session_id.value);
+    let session = state.sessions.find((row) => row.id === form.session_id.value);
     const amount = currencyInputNumber(form.amount);
     if (!session || amount <= 0 || amount > sessionBalance(session)) { toast("El abono debe ser mayor a cero y no superar el saldo pendiente.", "error"); return; }
     const id = form.dataset.paymentId || uid(); form.dataset.paymentId = id;
@@ -5724,9 +5746,14 @@ const App = (() => {
       const { data, error } = await state.sb.rpc("record_session_payment", { auth_token: state.authToken, payment_id: id,
         p_session_id: session.id, p_amount: amount, p_method: form.payment_method.value, p_reference: form.reference.value.trim(), p_created_at: new Date().toISOString() });
       if (error || !data?.payment) { toast(error?.message || "El abono no pudo guardarse. La cuenta conserva su saldo.", "error", "abono-failed"); return; }
-      session.session_payments = [...sessionPayments(session).filter((row) => row.id !== id), data.payment];
-      if (typeof persistOfflineAdminSnapshot === "function") persistOfflineAdminSnapshot();
-      if (typeof flushDurableWrites === "function") await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
+      // The account list may have refreshed while the payment was in flight.
+      session = state.sessions.find(row => row.id === session.id) || session;
+      session.session_payments = [...sessionPayments(session).filter(row => row.id !== id), data.payment];
+      if (typeof persistOfflineAdminSnapshot === "function") {
+        persistOfflineAdminSnapshot();
+        if (typeof flushDurableWrites === "function" && typeof OFFLINE_ADMIN_SNAPSHOT_KEY !== "undefined")
+          await flushDurableWrites([OFFLINE_ADMIN_SNAPSHOT_KEY]);
+      }
       if (form.payment_method.value === "cash" && !data.duplicate) void openCashDrawer({ localOnly: true });
       delete form.dataset.paymentId; $("#abonoDialog")?.close();
       state.accountsRenderSignature = ""; state.adminSnapshotSignature = "";
@@ -6526,13 +6553,18 @@ const App = (() => {
       delete mirror.inventoryEffects[id]; mirror.inventorySettled[id] = true;
     }
     for (const item of payload.items || []) {
-      if (!mirror.inventoryBase[item.productId] && !Object.values(mirror.inventoryEffects).some(effect => Object.prototype.hasOwnProperty.call(effect, String(item.productId)))) continue;
+      const manualChange = ["adjust_inventory", "upsert_inventory", "set_inventory_stock"].includes(action);
+      if (!manualChange && !mirror.inventoryBase[item.productId] && !Object.values(mirror.inventoryEffects).some(effect => Object.prototype.hasOwnProperty.call(effect, String(item.productId)))) continue;
       if (Number(item.version || 0) >= Number(mirror.inventoryBase[item.productId]?.version || 0)) mirror.inventoryBase[item.productId] = item;
     }
   };
   let reportChangeBatchDepth = 0;
   const queueConfirmedReportChange = async (action, payload, result, operationId = "") => {
     const supported = ["record_sale","edit_sale","delete_sale","clear_income","adjust_inventory","upsert_inventory","set_inventory_stock","delete_inventory","clear_inventory","update_inventory_movement_cost","clear_inventory_movements"];
+    if (action === "sync_inventory") {
+      // Share the confirmed bulk snapshot through the existing inventory notice.
+      action = "upsert_inventory";
+    }
     if (!supported.includes(action)) return;
     if (!result?.ok) {
       const previewId = "mutation:" + operationId;
@@ -6563,6 +6595,7 @@ const App = (() => {
     const ids = new Set((invoice?.items || []).map(line => String(line.menu_item_id || "")).filter(Boolean));
     const productId = String(payload.adjustment?.productId || payload.item?.productId || payload.productId || "");
     if (productId) ids.add(productId);
+    (payload.items || []).forEach(item => { if (item.productId) ids.add(String(item.productId)); });
     const eventId = String(payload.adjustment?.eventId || payload.item?.movementEventId || payload.movementId || "");
     const movements = (state.inventoryMovements || []).filter(row => eventId ? String(row.movementId) === eventId
       : action === "record_sale" && (String(row.movementId).startsWith(`SALE-${saleId}-`) || (invoice?.sessionId && String(row.sessionId) === String(invoice.sessionId))));

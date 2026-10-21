@@ -520,3 +520,44 @@ test('agrupar cambios de stock antes de enviarlos conserva todo el ajuste y resp
   await sender.context.enqueue(action,payload(30),'same');assert.equal(sender.storage.get('jobs').length,2,'Una escritura en vuelo conserva su identidad y su ajuste');
  }
 });
+
+const exactStockItem=(stock,version)=>({productId:'product',name:'Agua',category:'Bebidas',code:'AG',stock,version,costPrice:40,salePrice:100,minStock:5,unit:'unidad',isAvailable:true,updatedAt:'confirmed-'+version});
+function assertExactInventoryKpis(target,units){
+ vm.runInContext(section('inventorySummary','renderInventoryLiveCalculation')+';globalThis.exactSummary=inventorySummary;',target.context);
+ const summary=target.context.exactSummary();assert.equal(summary.units,units);assert.equal(summary.costValue,units*40);assert.equal(summary.saleValue,units*100);
+}
+test('un ajuste local pendiente no se vuelve a sumar al confirmar despues del primer aviso de venta',async()=>{
+ for(const action of ['adjust_inventory','set_inventory_stock','upsert_inventory']){
+  const backend=server(),owner=device(backend,'owner'),peer=device(backend,'peer');installActualInventory(owner,18);installActualInventory(peer,10);
+  const item={productId:'product',stock:20,inventoryDelta:10};
+  const payload=action==='adjust_inventory'?{adjustment:{productId:'product',eventId:'entry',delta:10}}:action==='set_inventory_stock'?item:{item};
+  const sale={...invoice('after-entry'),checkoutAccepted:true};
+  owner.storage.set('jobs',[{id:'entry',action,status:'pending',payload},{id:'sale',action:'record_sale',status:'pending',payload:{invoice:sale}}]);
+  await owner.api.queueReadyCheckoutReports();await settle();await peer.api.syncConfirmedReports();assert.equal(peer.state.inventoryMeta.product.stock,8);
+  await owner.api.queueConfirmedReportChange(action,payload,{ok:true,item:exactStockItem(20,2)},'entry');await settle();await peer.api.syncConfirmedReports();
+  assert.equal(owner.api.reportMirror().inventoryProjected.product,18,'El espejo propio no incluye dos veces las diez unidades locales: '+action);
+  assert.equal(peer.state.inventoryMeta.product.stock,18);
+  // A closing process may have removed the confirmed jobs before receiving the
+  // sales receipt; replay the durable inventory without relying on those guards.
+  owner.storage.set('jobs',[]);await owner.api.syncConfirmedReports();assert.equal(owner.state.inventoryMeta.product.stock,18);
+  owner.context.navigator.onLine=false;await owner.api.syncConfirmedReports();assert.equal(owner.state.inventoryMeta.product.stock,18);
+  owner.context.navigator.onLine=true;await owner.api.syncConfirmedReports();assert.equal(owner.state.inventoryMeta.product.stock,18);
+  await owner.api.queueConfirmedReportChange(action,payload,{ok:true,item:exactStockItem(20,2)},'entry');await settle();
+  await owner.api.queueConfirmedReportChange('record_sale',{invoice:sale},{ok:true,items:[exactStockItem(18,3)]},'sale');await settle();
+  await owner.api.syncConfirmedReports();await peer.api.syncConfirmedReports();assert.equal(owner.state.inventoryMeta.product.stock,peer.state.inventoryMeta.product.stock);assert.equal(owner.state.inventoryMeta.product.stock,18);
+  assertExactInventoryKpis(owner,18);assertExactInventoryKpis(peer,18);
+ }
+});
+test('un retiro pendiente y varios ajustes locales quedan iguales en los dos inventarios al reconectar',async()=>{
+ const backend=server(),owner=device(backend,'owner'),peer=device(backend,'peer');installActualInventory(owner,66);installActualInventory(peer,100);
+ const changes=[12,-20,-24];const jobs=changes.map((delta,i)=>({id:'adjust-'+i,status:'pending',action:'adjust_inventory',payload:{adjustment:{productId:'product',eventId:'adjust-'+i,delta}}}));
+ const sale={...invoice('adjusted'),checkoutAccepted:true};jobs.push({id:'adjust-sale',status:'pending',action:'record_sale',payload:{invoice:sale}});
+ owner.storage.set('jobs',jobs);owner.context.navigator.onLine=false;await owner.api.queueReadyCheckoutReports();assert.equal(backend.events.length,0);
+ owner.context.navigator.onLine=true;await owner.api.queueReadyCheckoutReports();await settle();await peer.api.syncConfirmedReports();
+ let stock=100;for(let i=0;i<changes.length;i++){stock+=changes[i];await owner.api.queueConfirmedReportChange('adjust_inventory',jobs[i].payload,{ok:true,item:exactStockItem(stock,i+2)},jobs[i].id);}
+ await settle();await peer.api.syncConfirmedReports();owner.storage.set('jobs',[]);await owner.api.syncConfirmedReports();
+ assert.equal(owner.state.inventoryMeta.product.stock,66);assert.equal(peer.state.inventoryMeta.product.stock,66);
+ await owner.api.queueConfirmedReportChange('record_sale',{invoice:sale},{ok:true,items:[exactStockItem(66,5)]},'adjust-sale');await settle();await peer.api.syncConfirmedReports();await owner.api.syncConfirmedReports();
+ assert.equal(owner.state.inventoryMeta.product.stock,66);assert.equal(peer.state.inventoryMeta.product.stock,66);
+ assertExactInventoryKpis(owner,66);assertExactInventoryKpis(peer,66);
+});

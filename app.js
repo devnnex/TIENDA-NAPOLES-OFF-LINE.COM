@@ -6532,15 +6532,24 @@ const App = (() => {
     }
     const effect = payload.inventoryEffect;
     if (effect && !mirror.inventorySettled[effect.operationId] && !mirror.inventoryEffects[effect.operationId]) {
-      const ownJobs = readAppsScriptOutbox().filter(job => ["record_sale", "edit_sale", "delete_sale"].includes(job.action));
+      const inventoryJobs = readAppsScriptOutbox();
+      const ownJobs = inventoryJobs.filter(job => ["record_sale", "edit_sale", "delete_sale"].includes(job.action));
       for (const id of Object.keys(effect.deltas)) {
         if (!Object.values(mirror.inventoryEffects).some(value => Object.prototype.hasOwnProperty.call(value, id))) {
           const current = state.inventoryMeta?.[id];
           if (!current) continue;
           const ownDelta = ownJobs.reduce((sum, job) => sum + Number(saleInventoryDeltas(job.action, job.payload)[id] || 0), 0);
+          // Local stock already includes these edits. Their later receipts add
+          // them once, so exclude them from the confirmed starting balance.
+          const pendingAdjustment = inventoryJobs.reduce((sum, job) => {
+            if (["failed", "conflict"].includes(job.status) || mirror.inventorySettled[job.operationId || job.id]) return sum;
+            const item = job.action === "adjust_inventory" ? job.payload?.adjustment
+              : job.action === "upsert_inventory" ? job.payload?.item : job.action === "set_inventory_stock" ? job.payload : null;
+            return sum + (String(item?.productId || "") === id ? Number(job.action === "adjust_inventory" ? item.delta : item.inventoryDelta || 0) : 0);
+          }, 0);
           const previous = mirror.inventoryBase[id];
           if (!previous || Number(current.version || 0) >= Number(previous.version || 0))
-            mirror.inventoryBase[id] = { ...current, productId: id, stock: Number(current.stock || 0) - ownDelta };
+            mirror.inventoryBase[id] = { ...current, productId: id, stock: Number(current.stock || 0) - ownDelta - pendingAdjustment };
           mirror.inventoryProjected[id] = Number(mirror.inventoryBase[id]?.stock || 0);
         }
       }

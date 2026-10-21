@@ -3062,6 +3062,7 @@ const App = (() => {
     persistBootstrapCache();
     if (state.activeAdminSection === "inventory") renderInventory();
     if (state.activeAdminSection === "menu") renderMenuManager();
+    if ($("#consumptionDialog")?.open) renderConsumptionProductOptions($("#consumptionProductSearch")?.value || "");
   };
 
   const enqueueAppsScriptJob = (action, payload, dedupeKey = uid()) => {
@@ -3516,6 +3517,11 @@ const App = (() => {
     enqueueAppsScriptJob("upsert_inventory", {
       item: { ...inventoryPayload(item), ...movement }
     }, `inventory:${item.id}`);
+  };
+
+  const refreshConsumptionInventory = () => {
+    if (!navigator.onLine || !state.currentUser || !isAppsScriptConfigured()) return Promise.resolve(false);
+    return refreshInventoryFromPeer().catch(() => false);
   };
 
   const applyConsumptionInventoryDelta = (item, delta, context = {}) => {
@@ -6490,6 +6496,13 @@ const App = (() => {
       Object.entries(mirror.inventoryEffects[rejected] || {}).forEach(([id, delta]) => { mirror.inventoryProjected[id] = Number(mirror.inventoryProjected[id] || 0) - Number(delta); });
       delete mirror.inventoryEffects[rejected]; mirror.inventorySettled[rejected] = true;
     }
+    const stockChange = payload.inventoryStockChange;
+    if (stockChange && !mirror.inventorySettled[stockChange.operationId]) {
+      const id = String(stockChange.productId);
+      if (Object.values(mirror.inventoryEffects).some(effect => Object.prototype.hasOwnProperty.call(effect, id)))
+        mirror.inventoryProjected[id] = Number(mirror.inventoryProjected[id] ?? mirror.inventoryBase[id]?.stock ?? 0) + Number(stockChange.delta || 0);
+      mirror.inventorySettled[stockChange.operationId] = true;
+    }
     const effect = payload.inventoryEffect;
     if (effect && !mirror.inventorySettled[effect.operationId] && !mirror.inventoryEffects[effect.operationId]) {
       const ownJobs = readAppsScriptOutbox().filter(job => ["record_sale", "edit_sale", "delete_sale"].includes(job.action));
@@ -6553,9 +6566,23 @@ const App = (() => {
     const eventId = String(payload.adjustment?.eventId || payload.item?.movementEventId || payload.movementId || "");
     const movements = (state.inventoryMovements || []).filter(row => eventId ? String(row.movementId) === eventId
       : action === "record_sale" && (String(row.movementId).startsWith(`SALE-${saleId}-`) || (invoice?.sessionId && String(row.sessionId) === String(invoice.sessionId))));
+    const stockDelta = action === "adjust_inventory" ? payload.adjustment?.delta
+      : action === "set_inventory_stock" ? payload.inventoryDelta
+      : action === "upsert_inventory" ? payload.item?.inventoryDelta : undefined;
+    const inventoryStockChange = stockDelta !== undefined && productId && operationId
+      ? { operationId, productId, delta: Number(stockDelta || 0) } : null;
+    const stockItems = result.items || (result.item ? [result.item] : []);
+    // Reconcile the durable receipt locally before removing its outbox job,
+    // even if publishing the notification to the other devices is interrupted.
+    if (inventoryStockChange) {
+      const mirror = reportMirror();
+      reconcileReportInventory(mirror, { inventoryStockChange, items: stockItems }, action);
+      if (!await saveReportSyncValue(reportMirrorKey(), mirror)) throw transientAppsScriptError("Falta proteger la reposicion confirmada.");
+    }
     const change = { operationId: operationId || `${action}:${eventId || saleId || uid()}:${action === "record_sale" ? "saved" : uid()}`, action,
       payload: { occurredAt: new Date().toISOString(), ...(invoice ? { invoice } : {}), ...(saleId ? { saleId } : {}), ...(payload.saleLink ? { saleLink: payload.saleLink } : {}), ...(productId ? { productId } : {}),
         ...(["edit_sale", "delete_sale"].includes(action) ? { mutationId: payload.mutationId || operationId } : {}),
+        ...(inventoryStockChange ? { inventoryStockChange } : {}),
         ...(invoice?.reportRejected ? { inventoryRejectedOperation: payload.mutationId } : {}),
         ...(invoice?.googlePending ? { inventoryEffect: { operationId: payload.mutationId || operationId, deltas: saleInventoryDeltas(action, payload) } } : {}),
         ...(Array.isArray(result.items) ? { inventorySettledOperations: result.reportInventorySettled || [operationId] } : {}),
@@ -7833,6 +7860,7 @@ const App = (() => {
     persistBootstrapCache();
     queueInventoryUpsert(hydrated, movementEventId ? {
       movementEventId,
+      inventoryDelta: stockDelta,
       movementType: id ? (stockDelta > 0 ? "ENTRADA_EDICION" : "SALIDA_EDICION") : "NUEVO_PRODUCTO",
       movementReference: id ? "Edicion de producto" : "Registro inicial"
     } : {});
@@ -7909,6 +7937,7 @@ const App = (() => {
     persistInventoryStore();
     enqueueAppsScriptJob("set_inventory_stock", {
       productId: item.id,
+      inventoryDelta: delta,
       stock: nextStock,
       updatedAt: state.inventoryMeta[id].updatedAt,
       version: current.version
@@ -10261,6 +10290,7 @@ const App = (() => {
     $("#cashReceivedFields").hidden = false;
     updatePaymentTipChoice();
     dialog.showModal();
+    void refreshConsumptionInventory();
     refreshIcons();
   };
 
@@ -10664,7 +10694,12 @@ const App = (() => {
     const buttons = $$('button[type="submit"]', form);
     buttons.forEach((button) => { button.disabled = true; });
     state.paymentProcessing = true;
-    const inventoryPlan = paidInventoryPlan(session);
+    let inventoryPlan = paidInventoryPlan(session);
+    if (inventoryPlan.some(entry => inventoryFor(entry.item).stock < entry.quantity)
+      && typeof refreshConsumptionInventory === "function" && navigator.onLine) {
+      await refreshConsumptionInventory();
+      inventoryPlan = paidInventoryPlan(session);
+    }
     if (!validatePaidInventory(inventoryPlan)) {
       receiptWindow?.close();
       buttons.forEach((button) => { button.disabled = false; });
@@ -11256,6 +11291,7 @@ const App = (() => {
     renderLastConsumptionTime(session);
     closeConsumptionProductOptions();
     dialog.showModal();
+    void refreshConsumptionInventory();
     window.setTimeout(() => {
       productSearch?.focus({ preventScroll: true });
     }, 0);
@@ -11322,6 +11358,7 @@ const App = (() => {
     if (keepPreview) renderTableConsumptionPreview(session);
     if ($("#tableSessionActions")) $("#tableSessionActions").hidden = true;
     if (!dialog.open) dialog.showModal();
+    void refreshConsumptionInventory();
     form.quantity.focus({ preventScroll: true });
     form.quantity.select();
     refreshIcons();

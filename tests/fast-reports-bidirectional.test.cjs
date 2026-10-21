@@ -442,3 +442,40 @@ test('los acuses de dos equipos recibidos en orden inverso no repiten ni compens
  await b.api.queueConfirmedReportChange('record_sale',{invoice:invoice('reverse-b',3)},{ok:true,items:[{productId:'product',stock:97,version:2}]},'reverse-b');await settle();await receiver.api.syncConfirmedReports();
  assert.equal(receiver.state.inventoryMeta.product.stock,95,'El acuse atrasado tampoco restaura el saldo anterior.');
 });
+
+test('reponer Club Colombia no vuelve a agotarlo al recibir avisos de ventas pendientes o acuses anteriores',async()=>{
+ for(const action of ['adjust_inventory','set_inventory_stock','upsert_inventory']){
+  const backend=server(),sender=device(backend,'sender'),receiver=device(backend,'receiver');installActualInventory(receiver,2);
+  const sale={...invoice('club'),checkoutAccepted:true};sender.storage.set('jobs',[{id:'club-sale',action:'record_sale',payload:{invoice:sale}}]);
+  await sender.api.queueReadyCheckoutReports();await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,0);
+  const item={productId:'product',stock:24,version:3,unit:'unidad'};
+  const payload=action==='adjust_inventory'?{adjustment:{eventId:'club-entry',productId:'product',delta:24}}:action==='set_inventory_stock'?{productId:'product',stock:24,inventoryDelta:24}:{item:{...item,inventoryDelta:24,movementEventId:'club-entry'}};
+  await sender.api.queueConfirmedReportChange(action,payload,{ok:true,item},'restock-club');await settle();await receiver.api.syncConfirmedReports();
+  assert.equal(receiver.state.inventoryMeta.product.stock,24,'La entrada confirmada debe sumarse tambien al inventario proyectado: '+action);
+  await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,24,'El sondeo sin novedades tampoco restaura el cero.');
+  await sender.api.queueConfirmedReportChange('record_sale',{invoice:sale},{ok:true,items:[{productId:'product',stock:0,version:2}]},'club-sale');
+  await settle();await receiver.api.syncConfirmedReports();assert.equal(receiver.state.inventoryMeta.product.stock,24,'El acuse anterior a la entrada no la deshace.');
+ }
+});
+
+test('la reposicion propia permanece aunque se corte la publicacion del aviso despues de guardarla en el backend',async()=>{
+ const backend=server(),owner=device(backend,'owner');installActualInventory(owner,2);
+ const sale={...invoice('own-club'),checkoutAccepted:true};owner.storage.set('jobs',[{id:'own-club-sale',action:'record_sale',payload:{invoice:sale}}]);
+ owner.state.inventoryMeta.product.stock=0;await owner.api.queueReadyCheckoutReports();await settle();await owner.api.syncConfirmedReports();
+ owner.state.inventoryMeta.product.stock=24;owner.storage.set('jobs',[{id:'own-entry',action:'adjust_inventory',payload:{adjustment:{eventId:'own-entry',productId:'product',delta:24}}}]);
+ backend.setFail(true);
+ await owner.api.queueConfirmedReportChange('adjust_inventory',{adjustment:{eventId:'own-entry',productId:'product',delta:24}},{ok:true,item:{productId:'product',stock:24,version:3}},'own-entry');await settle();
+ owner.storage.set('jobs',[]);backend.setFail(false);
+ await owner.api.syncConfirmedReports();assert.equal(owner.state.inventoryMeta.product.stock,24,'El sondeo anterior al aviso no restaura cero tras retirar el job confirmado.');
+ await owner.api.flushConfirmedReportChanges();await settle();await owner.api.syncConfirmedReports();assert.equal(owner.state.inventoryMeta.product.stock,24);
+ await owner.api.queueConfirmedReportChange('adjust_inventory',{adjustment:{eventId:'own-entry',productId:'product',delta:24}},{ok:true,item:{productId:'product',stock:24,version:3}},'own-entry');
+ await settle();await owner.api.syncConfirmedReports();assert.equal(owner.state.inventoryMeta.product.stock,24,'Una respuesta repetida no repone dos veces.');
+});
+test('el acceso compartido al inventario conserva la version al hacer una reposicion local',()=>{
+ const backend=server(),owner=device(backend,'owner');installActualInventory(owner,0);
+ owner.state.inventoryMeta.product={stock:0,version:7};
+ vm.runInContext(section('inventoryFor','inventoryStatus')+';globalThis.readInventory=inventoryFor;',owner.context);
+ const before=owner.context.readInventory(owner.state.items[0]);assert.equal(before.version,7);
+ owner.state.inventoryMeta.product={...before,stock:24,updatedAt:'local-entry'};
+ owner.context.actualInventory([{productId:'product',stock:0,version:6}]);assert.equal(owner.state.inventoryMeta.product.stock,24);
+});

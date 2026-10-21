@@ -45,6 +45,7 @@ const cases = [
   const inventoryState = { items: [product], inventoryMeta: {}, activeAdminSection: "inventory" };
   const applyContext = vm.createContext({
     state: inventoryState, Map, Set,
+    $: () => null,
     productAcronym: () => "AG",
     persistInventoryStore: () => work.push("save"),
     persistBootstrapCache: () => work.push("cache"),

@@ -3133,6 +3133,7 @@ const App = (() => {
     state.appsScriptOutboxBusy = true;
     let activeJob = null;
     let batchSupported = true;
+    let confirmedInventoryWrite = false;
     try {
       let jobs = readAppsScriptOutbox();
       while (true) {
@@ -3145,6 +3146,17 @@ const App = (() => {
             return false;
           }
           break;
+        }
+        // Older Offline versions queued an absolute balance without sending it.
+        // Upgrade only untouched jobs; never change an operation already tried.
+        if (job.action === "set_inventory_stock" && !Number(job.attempts || 0) && !job.lastAttemptAt
+          && job.dedupeKey === `inventory-stock:${job.payload?.productId}`
+          && Number.isFinite(Number(job.payload?.inventoryDelta))) {
+          const previous = job.payload, delta = Number(previous.inventoryDelta);
+          job.action = delta ? "adjust_inventory" : "get_inventory";
+          job.payload = delta ? { adjustment: { eventId: `units:${previous.productId}:${job.operationId || job.id}`,
+            productId: previous.productId, delta, movementType: delta > 0 ? "ENTRADA_UNIDADES" : "SALIDA_UNIDADES",
+            reference: "Botón + Unidades", occurredAt: previous.updatedAt || job.createdAt } } : {};
         }
         activeJob = job;
         const startedAt = performance.now();
@@ -3275,6 +3287,7 @@ const App = (() => {
           return false;
         }
         applyFreshRemoteInventory();
+        if (["adjust_inventory", "upsert_inventory", "sync_inventory", "set_inventory_stock", "delete_inventory", "clear_inventory"].includes(job.action)) confirmedInventoryWrite = true;
         jobs = pendingAfterCurrent;
         await writeAppsScriptOutbox(jobs, [job.id]);
         recordSyncEvent("confirmed", { ...job, status: "synced", durationMs: performance.now() - startedAt });
@@ -3319,6 +3332,12 @@ const App = (() => {
       return false;
     } finally {
       state.appsScriptOutboxBusy = false;
+      // Once this queue drains (or is interrupted), read the backend again.
+      // Coalesce the stock read and refresh movements even outside that section.
+      if (confirmedInventoryWrite && typeof navigator !== "undefined" && navigator.onLine) {
+        if (typeof refreshInventoryFromPeer === "function") void refreshInventoryFromPeer();
+        if (typeof loadInventoryMovements === "function") void loadInventoryMovements({ force: true });
+      }
       void updateGlobalSyncStatus();
     }
   };
@@ -6690,8 +6709,41 @@ const App = (() => {
     if (productId) ids.add(productId);
     (payload.items || []).forEach(item => { if (item.productId) ids.add(String(item.productId)); });
     const eventId = String(payload.adjustment?.eventId || payload.item?.movementEventId || payload.movementId || "");
-    const movements = (state.inventoryMovements || []).filter(row => eventId ? String(row.movementId) === eventId
+    let movements = (state.inventoryMovements || []).filter(row => eventId ? String(row.movementId) === eventId
       : action === "record_sale" && (String(row.movementId).startsWith(`SALE-${saleId}-`) || (invoice?.sessionId && String(row.sessionId) === String(invoice.sessionId))));
+    if (action === "adjust_inventory" && eventId.startsWith("units:") && result.item) {
+      // A local preview may start from a stale balance. Share the balance that
+      // Google actually used, with the same event ID on both devices.
+      let movement;
+      if (result.duplicate) {
+        let cursor = null, revision;
+        const permissions = state.currentUser?.permissions;
+        const canReadMovements = state.currentUser?.role === "boss" || !Array.isArray(permissions) || permissions.includes("movements");
+        while (canReadMovements) {
+          const page = await appsScriptRequest("get_inventory_movements", { limit: 800, ...(cursor ? { cursor, revision } : {}) });
+          if (!page?.ok || page.stale || !Array.isArray(page.movements)) throw transientAppsScriptError("Falta confirmar el movimiento remoto del inventario.");
+          movement = page.movements.find(row => String(row.movementId) === eventId);
+          revision = page.revision;
+          cursor = page.hasMore ? page.nextCursor : null;
+          if (movement || !cursor) break;
+        }
+      } else {
+        const adjustment = payload.adjustment;
+        movement = { ...(movements[0] || {}), movementId: eventId, productId,
+          code: result.item.code || adjustment.code || "", product: result.item.name || adjustment.name || "Producto",
+          type: adjustment.movementType || (Number(adjustment.delta) > 0 ? "ENTRADA_UNIDADES" : "SALIDA_UNIDADES"),
+          delta: Number(adjustment.delta), before: Number(result.item.stock) - Number(adjustment.delta), after: Number(result.item.stock),
+          unitCost: Number(result.item.costPrice || 0), reference: adjustment.reference || "", sessionId: adjustment.sessionId || "",
+          date: adjustment.occurredAt || result.item.updatedAt, user: state.currentUser?.full_name || state.currentUser?.username || "Equipo" };
+      }
+      movements = movement ? [movement] : [];
+      if (movement) {
+        const rows = new Map((state.inventoryMovements || []).map(row => [String(row.movementId), row]));
+        rows.set(eventId, movement);
+        state.inventoryMovements = [...rows.values()];
+        persistInventoryMovements();
+      }
+    }
     const stockDelta = action === "adjust_inventory" ? payload.adjustment?.delta
       : action === "set_inventory_stock" ? payload.inventoryDelta
       : action === "upsert_inventory" ? payload.item?.inventoryDelta : undefined;
@@ -8022,7 +8074,7 @@ const App = (() => {
     const subtract = form.operation.value === "subtract";
     const next = subtract ? current - quantity : current + quantity;
     target.classList.toggle("is-invalid", next < 0);
-    target.innerHTML = `<span>Quedará en</span><strong>${Math.max(0, next).toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${escapeHTML(inventoryFor(item).unit)}${next === 1 ? "" : "s"}</strong>${next < 0 ? "<small>No puedes retirar más de lo disponible.</small>" : "<small>Este ajuste no se agrega a Movimientos.</small>"}`;
+    target.innerHTML = `<span>Quedará en</span><strong>${Math.max(0, next).toLocaleString("es-CO", { maximumFractionDigits: 2 })} ${escapeHTML(inventoryFor(item).unit)}${next === 1 ? "" : "s"}</strong>${next < 0 ? "<small>No puedes retirar más de lo disponible.</small>" : "<small>El ajuste quedará identificado en Movimientos.</small>"}`;
   };
 
   const openInventoryAdjustment = (id) => {
@@ -8060,14 +8112,32 @@ const App = (() => {
       stock: nextStock,
       updatedAt: new Date().toISOString()
     };
+    const eventId = `units:${item.id}:${uid()}`;
+    const movementType = delta > 0 ? "ENTRADA_UNIDADES" : "SALIDA_UNIDADES";
+    const movementReference = "Botón + Unidades";
+    recordLocalInventoryMovement({
+      eventId,
+      item,
+      delta,
+      before: current.stock,
+      after: nextStock,
+      type: movementType,
+      reference: movementReference,
+      occurredAt: state.inventoryMeta[id].updatedAt
+    });
     persistInventoryStore();
-    enqueueAppsScriptJob("set_inventory_stock", {
-      productId: item.id,
-      inventoryDelta: delta,
-      stock: nextStock,
-      updatedAt: state.inventoryMeta[id].updatedAt,
-      version: current.version
-    }, `inventory-stock:${item.id}`);
+    enqueueAppsScriptJob("adjust_inventory", {
+      adjustment: {
+        eventId,
+        productId: item.id,
+        code: current.code,
+        name: item.name || "Producto",
+        delta,
+        reference: movementReference,
+        movementType,
+        occurredAt: state.inventoryMeta[id].updatedAt
+      }
+    }, `inventory-adjust:${eventId}`);
     $("#inventoryAdjustDialog")?.close();
     renderInventory();
     toast(`Existencia de ${item.name} actualizada a ${nextStock.toLocaleString("es-CO", { maximumFractionDigits: 2 })}.`, "ok", `stock-adjusted:${id}:${nextStock}`);

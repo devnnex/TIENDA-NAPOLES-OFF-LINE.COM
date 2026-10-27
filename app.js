@@ -1070,7 +1070,6 @@ const App = (() => {
   const showAdminSection = (section = "dashboard") => {
     if (section === "tips" && !tipsEnabled()) section = canAccessAdminSection("accounts") ? "accounts" : "service";
     if (!canAccessAdminSection(section)) section = allowedAdminSections()[0] || "service";
-    const enteringIncome = section === "income" && state.activeAdminSection !== "income";
     state.activeAdminSection = section;
     $$("[data-admin-section]").forEach((el) => {
       el.classList.toggle("section-active", el.dataset.adminSection === section);
@@ -1098,19 +1097,15 @@ const App = (() => {
       if (!state.syncFresh.movements || Date.now() - Number(state.movementFetchedAt || 0) >= 5000) void loadInventoryMovements();
     }
     if (section === "income") {
-      if (enteringIncome) {
-        const previousRange = state.incomeReport?.filters;
-        const preset = state.incomeRangePreset === "shift" && (state.salesShiftHistory || []).some((shift) => shift.id === state.selectedSalesShiftId) ? "shift" : "today";
-        const activeRange = incomeRangeDates(preset);
-        setIncomeRange(preset, false);
-        if (!previousRange || ["dateFrom", "dateTo", "startAt", "endAt"].some((key) =>
-          String(previousRange[key] || "") !== String(activeRange[key] || ""))) state.incomeReport = null;
-      }
       renderSalesShift();
       initializeIncomeFilters();
-      if (state.incomeRangePreset !== "shift" || state.incomeRenderedReport !== state.incomeReport) renderIncomeReport();
-      if (!state.incomeReport) void loadIncomeReport();
-      else if (state.incomeRangePreset !== "shift") void refreshBackgroundReports();
+      const currentFilters = incomeFiltersFromForm();
+      const samePeriod = state.incomeReport && JSON.stringify(state.incomeReport.filters) === JSON.stringify(currentFilters);
+      if (!samePeriod) void loadIncomeReport();
+      else {
+        renderIncomeReport();
+        void refreshBackgroundReports();
+      }
     }
     if (section === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
     if (section === "users") renderUsers();
@@ -3474,13 +3469,6 @@ const App = (() => {
   const synchronizeAfterReconnect = (reason = "reconnect") => {
     if (reconnectSyncPromise) return reconnectSyncPromise;
     reconnectSyncPromise = (async () => {
-      if (reason !== "startup" && state.page === "admin" && navigator.onLine && canAccessAdminSection("income")) {
-        state.incomeRequestId = Number(state.incomeRequestId || 0) + 1;
-        state.incomeLoading = false;
-        state.incomeAwaitingRemote = true;
-        state.incomeRenderedShiftSignature = "";
-        if (state.activeAdminSection === "income") renderIncomeReport();
-      }
       if (state.page === "admin" && state.offlineLoginPending && !await refreshOfflineLogin()) return false;
       void flushPeerRefreshes();
       const startedAt = performance.now();
@@ -3496,7 +3484,7 @@ const App = (() => {
         refreshAdminNow(),
         syncInventoryWithAppsScript(),
         isManager() ? loadInventoryMovements() : Promise.resolve(false),
-        canAccessAdminSection('income') ? loadIncomeReport({ background:true,force:true }) : Promise.resolve(false),
+        canAccessAdminSection('income') ? loadIncomeReport({ background:true,force: !["resume", "foreground"].includes(reason) }) : Promise.resolve(false),
         isBoss() ? loadUsers() : Promise.resolve(false)
       ]) : Promise.resolve([]);
       const initialCounts = await getOfflineSyncStatus();
@@ -3513,7 +3501,7 @@ const App = (() => {
             syncInventoryWithAppsScript(),
             isManager() ? loadInventoryMovements() : Promise.resolve(false),
             canAccessAdminSection("income")
-              ? loadIncomeReport({ background: true, force: true })
+              ? loadIncomeReport({ background: true, force: !["resume", "foreground"].includes(reason) })
               : Promise.resolve(false)
           ]);
           await refreshBackgroundReports({ force: true });
@@ -7003,6 +6991,7 @@ const App = (() => {
     });
     for (const invoice of Object.values(mirror.sales)) {
       if (!invoice.reportMutation || invoice.reportMovementSettled) continue;
+      if (mirror.movementsClearAt && !(Date.parse(invoice.reportConfirmedAt || invoice.createdAt || "") > Date.parse(mirror.movementsClearAt))) continue;
       if (!invoice.googlePending && authoritative && readStartedAt >= Date.parse(invoice.reportConfirmedAt || "")) {
         invoice.reportMovementSettled = true; retired = true; continue;
       }
@@ -8204,7 +8193,7 @@ const App = (() => {
   };
   const refreshSalesShiftRange = () => {
     renderSalesShift();
-    if (!["today", "shift"].includes(state.incomeRangePreset)) return;
+    if (state.incomeRangePreset === "custom") return;
     const range = incomeRangeDates(state.incomeRangePreset);
     const signature = JSON.stringify(range);
     if (state.salesShiftRangeSignature === signature) return;
@@ -8307,7 +8296,7 @@ const App = (() => {
     action.querySelector('[value="replace"]').disabled = !state.salesShift || historical;
     action.querySelector('[value="add"]').disabled = !state.salesShift || historical;
     action.querySelector('[value="edit"]').disabled = !state.salesShiftFormSnapshot;
-    action.value = shiftId ? "edit" : current ? "replace" : "new";
+    action.value = shiftId || current ? "edit" : "new";
     updateSalesShiftForm();
     bindCurrencyInputs(form);
     dialog.showModal();
@@ -8389,8 +8378,8 @@ const App = (() => {
   };
 
   const incomeRangeDates = (preset = "today") => preset === "shift"
-    ? SalesShift.shiftRange((state.salesShiftHistory || []).find((item) => item.id === state.selectedSalesShiftId)) || SalesShift.range("today", state.salesShift)
-    : SalesShift.range(preset, state.salesShift);
+    ? SalesShift.shiftRange((state.salesShiftHistory || []).find((item) => item.id === state.selectedSalesShiftId)) || SalesShift.range("today", null, new Date())
+    : SalesShift.range(preset, preset === "today" ? null : state.salesShift, new Date());
 
   const markIncomeRangePreset = () => {
     $$('[data-income-range]').forEach((button) => {
@@ -8421,10 +8410,10 @@ const App = (() => {
     from.value = range.dateFrom;
     to.value = range.dateTo;
     state.incomeAppliedRange = range;
-    if (preset === "today" || preset === "shift") {
-      state.salesShiftRangeSignature = JSON.stringify(range);
-      window.clearTimeout(state.salesShiftBoundaryTimer);
-      if (preset === "today") state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt) - Date.now() + 25)));
+    state.salesShiftRangeSignature = JSON.stringify(range);
+    window.clearTimeout(state.salesShiftBoundaryTimer);
+    if (preset !== "shift") {
+      state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt || SalesShift.range("today", null, new Date()).endAt) - Date.now() + 25)));
     }
     markIncomeRangePreset();
     renderSalesShift();
@@ -8433,7 +8422,7 @@ const App = (() => {
 
   const incomeFiltersFromForm = () => {
     initializeIncomeFilters();
-    const current = ["today", "shift"].includes(state.incomeRangePreset) ? incomeRangeDates(state.incomeRangePreset) : null;
+    const current = state.incomeRangePreset && state.incomeRangePreset !== "custom" ? incomeRangeDates(state.incomeRangePreset) : null;
     if (current) {
       $("#incomeDateFrom").value = current.dateFrom;
       $("#incomeDateTo").value = current.dateTo;
@@ -8484,13 +8473,14 @@ const App = (() => {
       const page = await appsScriptRequest("get_income_report", { filters: { ...filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
       if (requestId !== state.incomeRequestId) return report;
       if (!page?.ok || page.stale || !Array.isArray(page.records)
+        || (typeof page.revision === "string" && page.revision !== report.revision)
         || (filters.startAt && page.intervalApplied !== true)) throw new Error(page?.error || "El historial cambio. Actualiza el filtro de ventas.");
       const pageIds = new Set(page.records.map((record) => String(record.saleId)));
       if (pageRows.some((row) => !pageIds.has(String(row.saleId)))) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
       page.records.forEach((record) => records.set(String(record.saleId), record));
     }
     if (Number(report.totalRecords || 0) > records.size) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
-    return { ...report, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
+    return { ...report, truncated: false, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
   };
 
   const incomeSaleTypeFiltersKey = (filters) => JSON.stringify({ ...filters, saleType: "all" });
@@ -8630,36 +8620,35 @@ const App = (() => {
 
   const mergeIncomeReport = (remote, filters) => {
     const jobs = readAppsScriptOutbox();
-    const pendingSaleIds = new Set(jobs
-      .filter((job) => ["record_sale", "edit_sale"].includes(job.action))
-      .map((job) => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || ""))
-      .filter(Boolean));
-    const deletedSaleIds = new Set(jobs
-      .filter((job) => job.action === "delete_sale")
-      .map((job) => String(job.payload?.saleId || ""))
-      .filter(Boolean));
-    const excludedRemote = (remote.records || []).filter((record) => deletedSaleIds.has(String(record.saleId || "")) || pendingSaleIds.has(String(record.saleId || "")));
-    const visibleRemote = (remote.records || []).filter((record) => !deletedSaleIds.has(String(record.saleId || "")) && !pendingSaleIds.has(String(record.saleId || "")));
-    const pending = localIncomeRecords(filters)
-      .filter((record) => pendingSaleIds.has(String(record.saleId || "")));
-    const pendingTotals = incomeTotalsFromRecords(pending);
-    const excludedTotals = incomeTotalsFromRecords(excludedRemote);
-    const totals = { ...(remote.totals || {}) };
-    Object.keys(pendingTotals).forEach((key) => {
-      if (key === "averageTicket") return;
-      totals[key] = Number(totals[key] || 0) - Number(excludedTotals[key] || 0) + Number(pendingTotals[key] || 0);
-    });
+    const history = new Map((state.invoiceHistory || []).map(invoice => [String(invoice.id || invoice.sessionId), invoice]));
+    const pendingInvoices = new Map(), pendingPrevious = new Map();
+    const completeInvoice = invoice => invoice?.totals?.total != null && Number.isFinite(Number(invoice.totals.total)) && Array.isArray(invoice.items) && Number.isFinite(Date.parse(invoice.createdAt || ""));
+    for (const job of jobs) {
+      if (!["record_sale", "edit_sale"].includes(job.action)) continue;
+      const queued = job.payload?.invoice, id = String(queued?.id || queued?.sessionId || "");
+      const invoice = completeInvoice(queued) ? queued : history.get(id);
+      if (!id || !completeInvoice(invoice)) continue;
+      pendingInvoices.set(id, invoice);
+      if (job.action === "edit_sale" && job.payload?.previousRecord && !pendingPrevious.has(id)) pendingPrevious.set(id, job.payload.previousRecord);
+    }
+    const pendingIds = new Set(pendingInvoices.keys());
+    const deletedIds = new Set(jobs.filter(job => job.action === "delete_sale").map(job => String(job.payload?.saleId || "")).filter(Boolean));
+    const excluded = (remote.records || []).filter(record => deletedIds.has(String(record.saleId)) || pendingIds.has(String(record.saleId)));
+    const visible = (remote.records || []).filter(record => !deletedIds.has(String(record.saleId)) && !pendingIds.has(String(record.saleId)));
+    const loadedIds = new Set((remote.records || []).map(record => String(record.saleId)));
+    const remoteIds = new Set([...(remote.recordRows || []).map(row => String(row.saleId)), ...(remote.recordKeys || []).map(String), ...loadedIds]);
+    const previousOutsidePage = [...pendingPrevious].filter(([id]) => remoteIds.has(id) && !loadedIds.has(id));
+    const previousIds = new Set(previousOutsidePage.map(([id]) => id));
+    const pending = localIncomeRecords(filters, [...pendingInvoices.values()]).filter(record => !deletedIds.has(String(record.saleId)));
+    const counted = pending.filter(record => !remoteIds.has(String(record.saleId)) || loadedIds.has(String(record.saleId)) || previousIds.has(String(record.saleId)));
+    const removed = [...excluded, ...previousOutsidePage.map(([, record]) => record)];
+    const addedTotals = incomeTotalsFromRecords(counted), removedTotals = incomeTotalsFromRecords(removed), totals = { ...(remote.totals || {}) };
+    for (const key of Object.keys(addedTotals)) if (key !== "averageTicket") totals[key] = Number(totals[key] || 0) - Number(removedTotals[key] || 0) + Number(addedTotals[key] || 0);
     totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
-    const report = {
-      ...remote,
-      filters,
-      appliedReportMutations: { ...(remote.appliedReportMutations || {}), ...Object.fromEntries(excludedRemote.map(record => [String(record.saleId), deletedSaleIds.has(String(record.saleId)) ? "deleted" : "edited"])) },
-      totals,
-      records: [...pending, ...visibleRemote].sort((left, right) => String(right.date).localeCompare(String(left.date))),
-      totalRecords: Math.max(0, Number(remote.totalRecords || 0) - excludedRemote.length + pending.length),
-      pendingCount: pending.length,
-      localOnly: false
-    };
+    const report = { ...remote, filters, totals,
+      appliedReportMutations: { ...(remote.appliedReportMutations || {}), ...Object.fromEntries(excluded.map(record => [String(record.saleId), deletedIds.has(String(record.saleId)) ? "deleted" : "edited"])) },
+      records: [...pending, ...visible].sort((a,b) => String(b.date).localeCompare(String(a.date))),
+      totalRecords: Math.max(0, Number(remote.totalRecords || 0) - removed.length + counted.length), pendingCount: pending.length, localOnly: false };
     const merged = typeof mergeConfirmedIncomeReport === "function" ? mergeConfirmedIncomeReport(report, filters) : report;
     return filters.saleType && filters.saleType !== "all" ? filterIncomeReportBySaleType(merged, filters) : merged;
   };
@@ -8760,17 +8749,21 @@ const App = (() => {
     const summaryTarget = $("#incomeFilterSummary");
     if (!kpis || !payments || !recordsTarget) return;
     const report = state.incomeReport;
-    const shiftSignature = report && !(state.incomeAwaitingRemote && navigator.onLine) ? JSON.stringify({
+    const shiftSignature = report ? JSON.stringify({
       filters: report.filters, totals: report.totals, records: report.records,
       recordRows: report.recordRows, recordKeys: report.recordKeys, totalRecords: report.totalRecords,
-      nextIndex: report.nextIndex, pendingCount: report.pendingCount, localOnly: report.localOnly,
+      nextIndex: report.nextIndex, readError: !report.records?.length ? report.error : "",
       truncated: report.truncated, visibleCount: state.incomeVisibleCount
     }) : "";
     if (shiftSignature && state.incomeRenderedShiftSignature === shiftSignature) {
+      if (state.incomeRenderedLocalOnly !== Boolean(report.localOnly)) {
+        setIncomeReportStatus(Number(report.totalRecords || 0).toLocaleString("es-CO") + " facturas", report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
+        state.incomeRenderedLocalOnly = Boolean(report.localOnly);
+      }
       state.incomeRenderedReport = report;
       return;
     }
-    if (!report || (state.incomeAwaitingRemote && navigator.onLine)) {
+    if (!report) {
       state.incomeRenderedShiftSignature = "";
       recordsTarget.rowPaintRevision = (recordsTarget.rowPaintRevision || 0) + 1;
       kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi is-loading"><span></span><strong></strong><small></small></article>').join("");
@@ -8778,6 +8771,15 @@ const App = (() => {
       if (summaryTarget) summaryTarget.innerHTML = "";
       recordsTarget.innerHTML = emptyState("Preparando contabilidad", "Estamos consultando las ventas cerradas.", "loader-circle");
       setIncomeReportStatus("Consultando ventas", "loading", "loader-circle");
+      return;
+    }
+    if (report.error && !(report.records || []).length && report.localOnly) {
+      kpis.innerHTML = Array.from({ length: 3 }, () => '<article class="income-kpi"><span>Ventas sin confirmar</span><strong>—</strong><small>Usa Actualizar para reintentar</small></article>').join("");
+      payments.innerHTML = "";
+      recordsTarget.innerHTML = emptyState("No se pudo consultar este periodo", "El último intento no confirmó las ventas. Usa Actualizar para reintentar.", "cloud-off");
+      setIncomeReportStatus("Ventas sin confirmar", "warning", "cloud-off");
+      state.incomeRenderedReport = report;
+      state.incomeRenderedShiftSignature = shiftSignature;
       return;
     }
     const totals = report.totals || {};
@@ -8830,144 +8832,141 @@ const App = (() => {
     const limitedText = report.truncated ? " · mostrando las 300 más recientes" : "";
     const visibleText = allRecords.length > visibleRecords.length ? ` · ${visibleRecords.length} visibles` : "";
     setIncomeReportStatus(`${Number(report.totalRecords || 0).toLocaleString("es-CO")} factura${Number(report.totalRecords || 0) === 1 ? "" : "s"}${visibleText}${limitedText}`, report.localOnly ? "warning" : "ready", report.localOnly ? "hard-drive" : "badge-check");
+    state.incomeRenderedLocalOnly = Boolean(report.localOnly);
     state.incomeRenderedReport = report;
     state.incomeRenderedShiftSignature = shiftSignature;
     refreshIcons();
   };
 
-  const loadIncomeReport = async ({ background = false, force = false, verifiedConnection = false } = {}) => {
-    if (!$("#income") || !canAccessAdminSection("income")) return false;
-    if (state.incomeLoading) {
-      if (force || !background) state.incomeReloadRequested = true;
-      return false;
-    }
+  const loadIncomeReport = async ({ background = false, force = false, manual = false, verifiedConnection = false } = {}) => {
+    if (!$("#income") || !canAccessAdminSection("income") || state.pendingIncomeEdits?.size) return false;
     const filters = incomeFiltersFromForm();
-    if (filters.dateFrom > filters.dateTo) {
-      toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
+    const key = JSON.stringify(filters);
+    if (filters.dateFrom > filters.dateTo) { toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range"); return false; }
+    if (state.incomeLoading && state.incomeLoadingFilters === key) {
+      if (force || manual) state.incomeReloadRequested = true;
       return false;
     }
-    if (readAppsScriptOutbox().some((job) => job.action === "clear_income")) {
+    const jobs = readAppsScriptOutbox();
+    if (jobs.some(job => job.action === "clear_income")) {
       state.incomeAwaitingRemote = false;
       state.incomeReport = localIncomeReport(filters);
       renderIncomeReport();
       setIncomeReportStatus("Reinicio pendiente de sincronización", "warning", "hard-drive");
       return true;
     }
+    const previousReport = state.incomeReport;
+    const samePrevious = previousReport?.filters && JSON.stringify(previousReport.filters) === key;
+    const snapshots = state.incomeReportSnapshots ||= new Map();
+    const stored = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
+    if (stored?.filters && Array.isArray(stored.report?.records)) snapshots.set(JSON.stringify(stored.filters), { ...stored.report, filters: stored.filters });
+    let base = snapshots.get(key) || null;
+    // A complete wider period can immediately provide a narrower day/range without another download.
+    if (!base) for (const candidate of snapshots.values()) {
+      const range = candidate.filters;
+      if (!range || candidate.truncated || (candidate.records || []).length < Number(candidate.totalRecords || 0)
+        || range.dateFrom > filters.dateFrom || range.dateTo < filters.dateTo
+        || (range.startAt && Date.parse(range.startAt) > Date.parse(filters.startAt || filters.dateFrom + "T00:00:00-05:00"))
+        || (range.endAt && Date.parse(range.endAt) < Date.parse(filters.endAt || filters.dateTo + "T23:59:59.999-05:00"))
+        || (range.paymentMethod && range.paymentMethod !== "all" && range.paymentMethod !== filters.paymentMethod)
+        || (range.saleType && range.saleType !== "all" && range.saleType !== filters.saleType)
+        || (range.query && range.query !== filters.query)) continue;
+      if (JSON.stringify({ ...range, saleType: "all" }) === JSON.stringify({ ...filters, saleType: "all" })) {
+        base = candidate;
+        break;
+      }
+      const query = normalizeText(filters.query || "");
+      const records = candidate.records.filter(record => SalesShift.matches(record.date, filters)
+        && (!filters.saleType || filters.saleType === "all" || incomeRecordSaleType(record) === filters.saleType)
+        && (filters.paymentMethod === "all" || !filters.paymentMethod || (filters.paymentMethod === "mixed" ? record.isMixed : (record.payments || []).some(payment => payment.method === filters.paymentMethod)))
+        && (!query || normalizeText([record.invoice, record.table, record.payer, record.waiter, record.reference, (record.items || []).map(item => item.name).join(" ")].join(" ")).includes(query)));
+      const ids = new Set(records.map(record => String(record.saleId)));
+      base = { ...candidate, filters, records, totals: incomeTotalsFromRecords(records), totalRecords: records.length,
+        recordRows: (candidate.recordRows || []).filter(row => ids.has(String(row.saleId))), recordKeys: [...ids], truncated: false };
+      break;
+    }
+    let local;
+    const localReport = () => local ||= localIncomeReport(filters);
+    const available = samePrevious ? previousReport : base ? { ...mergeIncomeReport(base, filters), localOnly: true } : localReport().records.length ? local : null;
     if (!navigator.onLine && !verifiedConnection) {
       state.incomeAwaitingRemote = false;
-      const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
-      const matchesCache = cached?.filters && (JSON.stringify(cached.filters) === JSON.stringify(filters)
-        || ((cached.report?.records || []).length >= Number(cached.report?.totalRecords || 0)
-          && JSON.stringify({ ...cached.filters, saleType: "all" }) === JSON.stringify({ ...filters, saleType: "all" })))
-        && Array.isArray(cached.report?.records);
-      state.incomeReport = matchesCache
-        ? { ...mergeIncomeReport(cached.report, filters), localOnly: true }
-        : localIncomeReport(filters);
-      state.syncFresh.sales = false;
+      state.incomeReport = available ? { ...available, localOnly: true } : localReport();
+      if (state.syncFresh) state.syncFresh.sales = false;
       renderIncomeReport();
-      if (!state.offlineSalesProbeBusy) {
+      setIncomeReportStatus("Última copia disponible", "warning", "hard-drive");
+      if (typeof readAppsScriptStatus === "function" && !state.offlineSalesProbeBusy) {
         state.offlineSalesProbeBusy = true;
-        void readAppsScriptStatus(true)
-          .then((status) => status?.ok
-            ? loadIncomeReport({ background: true, force: true, verifiedConnection: true })
-            : false)
-          .catch(() => false)
-          .finally(() => { state.offlineSalesProbeBusy = false; });
+        void readAppsScriptStatus(true).then(status => status?.ok ? loadIncomeReport({ background: true, force: true, verifiedConnection: true }) : false)
+          .catch(() => false).finally(() => { state.offlineSalesProbeBusy = false; });
       }
       return true;
     }
     const requestId = ++state.incomeRequestId;
-    const previousReport = state.incomeReport;
-    const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
-    const matchesCache = cached?.filters && (JSON.stringify(cached.filters) === JSON.stringify(filters)
-      || ((cached.report?.records || []).length >= Number(cached.report?.totalRecords || 0)
-        && JSON.stringify({ ...cached.filters, saleType: "all" }) === JSON.stringify({ ...filters, saleType: "all" })))
-      && Array.isArray(cached.report?.records);
-    const filtersChanged = JSON.stringify(previousReport?.filters || null) !== JSON.stringify(filters);
-    state.syncFresh.sales = false;
     state.incomeLoading = true;
-    if (!background || !previousReport || filtersChanged) {
-      if (filtersChanged) state.incomeVisibleCount = 60;
-      state.incomeAwaitingRemote = true;
-      state.incomeReport = matchesCache
-        ? { ...mergeIncomeReport(cached.report, filters), localOnly: true }
-        : localIncomeReport(filters);
-      renderIncomeReport();
-      setIncomeReportStatus("Consultando ventas actuales", "loading", "loader-circle");
-    }
+    state.incomeLoadingFilters = key;
+    state.incomeAwaitingRemote = !available;
+    state.incomePageLoading = false;
+    state.incomeReport = available;
+    if (!samePrevious) state.incomeVisibleCount = 60;
+    renderIncomeReport();
+    if (!available || manual) setIncomeReportStatus(available ? "Actualizando informe desde el respaldo" : "Consultando ventas", "loading", "loader-circle");
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
-      if (!force && matchesCache && typeof cached.report.revision === "string") {
+      let result = null;
+      if (!force && base && typeof base.revision === "string") {
         try {
-          const status = await readAppsScriptStatus();
+          const status = typeof readAppsScriptStatus === "function" ? await readAppsScriptStatus() : await appsScriptRequest("status", {}, 12000);
           if (requestId !== state.incomeRequestId) return false;
-          if (status?.ok && Object.prototype.hasOwnProperty.call(status, "historyRevision")
-            && String(status.historyRevision || "") === cached.report.revision) {
-            if (JSON.stringify(filters) !== JSON.stringify(incomeFiltersFromForm())) {
-              state.incomeReloadRequested = true;
-              return false;
-            }
-            state.incomeReport = mergeIncomeReport(cached.report, filters);
-            state.incomeRevision = cached.report.revision;
-            state.incomeFetchedAt = Date.now();
-            state.syncFresh.sales = true;
-            state.incomeAwaitingRemote = false;
-            if (state.activeAdminSection === "income") renderIncomeReport();
-            void updateGlobalSyncStatus();
-            return true;
-          }
-        } catch (_) { /* Si no hay revision verificable, consultar el informe completo. */ }
+          if (status?.ok && String(status.historyRevision ?? "") === base.revision) result = base;
+        } catch (_) { /* La lectura completa sigue disponible si falla la comprobación ligera. */ }
       }
-      let result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
+      if (!result) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
       if (requestId !== state.incomeRequestId) return false;
-      if (!result?.ok) throw new Error(result?.error || "No se pudo consultar el historial.");
-      if (filters.startAt && result.intervalApplied !== true) throw new Error("Publica la actualización de turnos en Apps Script para consultar este horario.");
+      if (result?.stale) result = await appsScriptRequest("get_income_report", { filters }, APPS_SCRIPT_TIMEOUT_MS);
+      if (!result?.ok && result !== base) throw new Error(result?.error || "No se pudo consultar el historial.");
       if (result.stale || !Array.isArray(result.records) || !result.totals) throw new Error("El historial remoto no quedó confirmado; se reintentará.");
+      if (filters.startAt && result.intervalApplied !== true) throw new Error("El respaldo todavía no confirmó el horario consultado.");
+      const editIds = new Set(readAppsScriptOutbox().filter(job => job.action === "edit_sale").map(job => String(job.payload?.invoice?.id || "")));
+      const loaded = new Set(result.records.map(record => String(record.saleId)));
+      const pendingPages = (result.recordRows || []).some(row => editIds.has(String(row.saleId)) && !loaded.has(String(row.saleId)));
+      if ((filters.saleType && filters.saleType !== "all") || pendingPages) result = await completeIncomeSaleTypeReport(result, { ...filters, complete: true }, requestId);
       if (requestId !== state.incomeRequestId) return false;
-      if (filters.saleType && filters.saleType !== "all") result = await completeIncomeSaleTypeReport(result, filters, requestId);
-      if (requestId !== state.incomeRequestId) return false;
-      if (JSON.stringify(filters) !== JSON.stringify(incomeFiltersFromForm())) {
-        state.incomeReloadRequested = true;
-        return false;
-      }
+      if (key !== JSON.stringify(incomeFiltersFromForm())) { state.incomeReloadRequested = true; return false; }
       state.incomeLoading = false;
-      if ((result.records || []).length >= Number(result.totalRecords || 0)) {
-        state.incomeSaleTypeSnapshot = { key: JSON.stringify({ ...filters, saleType: "all" }), report: result };
-      } else {
-        state.incomeSaleTypeSnapshot = null;
-      }
+      state.incomeAwaitingRemote = false;
       state.incomeReport = mergeIncomeReport(result, filters);
+      if (manual) state.incomeRenderedLocalOnly = null;
       state.incomeRevision = result.revision || "";
       state.incomeFetchedAt = Date.now();
-      state.syncFresh.sales = true;
-      state.incomeAwaitingRemote = false;
-      void persistDurableJson(INCOME_REPORT_CACHE_KEY, { filters, report: result, fetchedAt: new Date().toISOString() });
+      if (state.syncFresh) state.syncFresh.sales = true;
+      if (result.records.length >= Number(result.totalRecords || 0)) state.incomeSaleTypeSnapshot = { key: JSON.stringify({ ...filters, saleType: "all" }), report: result };
+      else state.incomeSaleTypeSnapshot = null;
+      const snapshot = { ...result, filters };
+      snapshots.set(key, snapshot);
+      while (snapshots.size > 8) snapshots.delete(snapshots.keys().next().value);
+      if (result !== base) void persistDurableJson(INCOME_REPORT_CACHE_KEY, { filters, report: snapshot, fetchedAt: new Date().toISOString() });
       if (state.activeAdminSection === "income") renderIncomeReport();
-      void updateGlobalSyncStatus();
+      if (typeof updateGlobalSyncStatus === "function") void updateGlobalSyncStatus();
       return true;
     } catch (error) {
       if (requestId !== state.incomeRequestId) return false;
       state.incomeLoading = false;
-      state.syncFresh.sales = false;
       state.incomeAwaitingRemote = false;
-      if (background && previousReport) {
-        state.incomeReport = { ...previousReport, localOnly: true };
-        if (state.activeAdminSection === "income") { renderIncomeReport(); setIncomeReportStatus("Última copia disponible", "warning", "hard-drive"); }
-        return false;
-      }
-      state.incomeReport = state.incomeReport?.records?.length
-        ? { ...state.incomeReport, localOnly: true, error: String(error?.message || error) }
-        : localIncomeReport(filters, String(error?.message || error));
       state.incomeFetchedAt = Date.now();
+      if (state.syncFresh) state.syncFresh.sales = false;
+      state.incomeReport = available ? { ...available, localOnly: true, error: String(error?.message || error) } : localIncomeReport(filters, String(error?.message || error));
       renderIncomeReport();
-      setIncomeReportStatus("Mostrando ventas disponibles en esta caja", "warning", "hard-drive");
+      setIncomeReportStatus(available ? "Última copia disponible" : "No se pudo consultar este periodo. Usa Actualizar.", "warning", "hard-drive");
+      if (manual) toast(String(error?.message || error), "error", "manual-income-refresh-failed");
       return false;
     } finally {
       if (requestId === state.incomeRequestId) {
         state.incomeLoading = false;
-        if (state.incomeReloadRequested) {
+        state.incomeLoadingFilters = "";
+        if (state.incomeReloadRequested || state.incomeForceReloadRequested) {
           state.incomeReloadRequested = false;
-          window.setTimeout(() => void loadIncomeReport({ background: Boolean(state.incomeReport), force: true }), 0);
+          state.incomeForceReloadRequested = false;
+          window.setTimeout(() => void loadIncomeReport({ background: true, force: true }), 0);
         }
       }
     }
@@ -9005,6 +9004,12 @@ const App = (() => {
     if (state.confirmedReportSyncBusy) return false;
     if (state.backgroundReportSyncBusy) return false;
     if (!force && now - state.backgroundReportCheckedAt < 1500) return false;
+    if (canCheckIncome && state.activeAdminSection === "income" && !state.incomeLoading
+      && (state.incomeReport?.localOnly || state.incomeReport?.error)
+      && now - Number(state.incomeFetchedAt || 0) >= 5000
+      && !readAppsScriptOutbox().some(job => job.action === "clear_income")) {
+      return loadIncomeReport({ background: true, force: true });
+    }
     state.backgroundReportSyncBusy = true;
     state.backgroundReportCheckedAt = now;
     try {
@@ -9051,7 +9056,7 @@ const App = (() => {
       movements: {
         eyebrow: "Reiniciar movimientos",
         title: "¿Eliminar todos los movimientos?",
-        message: "Se borrará todo el historial de entradas y salidas. Las existencias actuales no cambiarán.",
+        message: "Se eliminarán todos los movimientos de entradas y salidas. No se devolverán productos al inventario ni se modificarán las existencias actuales. Las ventas se conservarán.",
         action: "clear_inventory_movements",
         success: "Movimientos eliminados. El historial quedó en cero."
       },
@@ -9094,6 +9099,8 @@ const App = (() => {
       lastPaidReceipt: state.lastPaidReceipt
     };
 
+    const movementMirrorBefore = section === "movements" ? JSON.parse(JSON.stringify(reportMirror())) : null;
+
     try {
       if (section === "inventory") {
         state.items = [];
@@ -9111,6 +9118,10 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
+        const mirror = reportMirror();
+        mirror.movements = {};
+        mirror.movementsClearAt = new Date().toISOString();
+        if (!await saveReportSyncValue(reportMirrorKey(), mirror)) throw new Error("No se pudo guardar el reinicio de movimientos. Intenta de nuevo.");
         state.inventoryMovements = [];
         state.movementSearch = "";
         state.movementTypeFilter = "all";
@@ -9147,6 +9158,8 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
+        state.reportMirror = movementMirrorBefore;
+        await saveReportSyncValue(reportMirrorKey(), movementMirrorBefore);
         state.inventoryMovements = snapshot.inventoryMovements;
         persistInventoryMovements();
         renderInventoryMovements();
@@ -11118,19 +11131,19 @@ const App = (() => {
   const formatConsumptionTimestamp = (value) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return "";
-    const dateParts = new Intl.DateTimeFormat("es-CO", {
+    const dateParts = (formatConsumptionTimestamp.dateFormatter ||= new Intl.DateTimeFormat("es-CO", {
       timeZone: "America/Bogota",
       day: "numeric",
       month: "short",
       year: "numeric"
-    }).formatToParts(date).reduce((parts, part) => ({ ...parts, [part.type]: part.value }), {});
+    })).formatToParts(date).reduce((parts, part) => ({ ...parts, [part.type]: part.value }), {});
     const dateText = `${dateParts.day} ${String(dateParts.month || "").replace(/\./g, "")} ${dateParts.year}`;
-    const timeText = new Intl.DateTimeFormat("en-US", {
+    const timeText = (formatConsumptionTimestamp.timeFormatter ||= new Intl.DateTimeFormat("en-US", {
       timeZone: "America/Bogota",
       hour: "numeric",
       minute: "2-digit",
       hour12: true
-    }).format(date).toLowerCase();
+    })).format(date).toLowerCase();
     return `${dateText} · ${timeText}`;
   };
 
@@ -11227,7 +11240,6 @@ const App = (() => {
     form.session_id.value = optimisticSessionId;
     form.pending_table_id.value = "";
     state.accountsRenderSignature = "";
-    persistOfflineAdminSnapshot();
     renderAdminLive();
     renderTableConsumptionPreview(optimisticSession);
     renderLastConsumptionTime(optimisticSession);
@@ -11289,7 +11301,6 @@ const App = (() => {
       form.session_id.value = "";
       form.pending_table_id.value = table.id;
       state.accountsRenderSignature = "";
-      persistOfflineAdminSnapshot();
       renderAdminLive();
       toast("No fue posible abrir la cuenta de la mesa. La selección fue restaurada.", "error", `batch-session-failed:${optimisticSessionId}`);
       return null;

@@ -98,7 +98,7 @@ test('Preparar categorias no retrasa la interfaz ni devuelve al usuario a otra s
 
 const worker = fs.readFileSync(path.join(__dirname, '..', 'service-worker.js'), 'utf8');
 test('Una respuesta remota anterior no reemplaza la busqueda que se sigue tecleando', async () => {
-  let query = 'primera', resolveRead, reload;
+  let query = 'primera'; const reads = [];
   const state = { incomeRequestId: 0, incomeLoading: false, syncFresh: {} };
   const context = vm.createContext({ state, Date, navigator: { onLine: true },
     $: () => ({}), canAccessAdminSection: () => true,
@@ -106,23 +106,15 @@ test('Una respuesta remota anterior no reemplaza la busqueda que se sigue teclea
     readAppsScriptOutbox: () => [], readLocalJson: () => null, INCOME_REPORT_CACHE_KEY: 'sales',
     localIncomeReport: filters => ({ records: [], filters }), renderIncomeReport() {}, setIncomeReportStatus() {},
     isAppsScriptConfigured: () => true, APPS_SCRIPT_TIMEOUT_MS: 45000,
-    appsScriptRequest: () => new Promise(resolve => { resolveRead = resolve; }),
+    appsScriptRequest: () => new Promise(resolve => { reads.push(resolve); }),
     mergeIncomeReport: (report, filters) => ({ ...report, filters }),
     persistDurableJson: async () => true, updateGlobalSyncStatus: async () => true,
-    window: { setTimeout: callback => { reload = callback; } } });
+    window: { setTimeout() {} } });
   vm.runInContext(section('loadIncomeReport', 'refreshBackgroundReports') + ';globalThis.load = loadIncomeReport;', context);
-  const first = context.load();
-  query = 'segunda';
-  await context.load();
-  const preview = { records: [{ saleId: 'preview-segunda' }] };
-  state.incomeReport = preview;
-  resolveRead({ ok: true, records: [{ saleId: 'resultado-primera' }], totalRecords: 1, totals: {} });
-  await first;
-  assert.equal(state.incomeReport, preview);
-  assert.equal(typeof reload, 'function');
-  const latest = context.load();
-  resolveRead({ ok: true, records: [{ saleId: 'resultado-segunda' }], totalRecords: 1, totals: {} });
-  await latest;
+  const first = context.load(); query = 'segunda'; const latest = context.load();
+  assert.equal(reads.length, 2);
+  reads[1]({ ok: true, records: [{ saleId: 'resultado-segunda' }], totalRecords: 1, totals: {} }); await latest;
+  reads[0]({ ok: true, records: [{ saleId: 'resultado-primera' }], totalRecords: 1, totals: {} }); await first;
   assert.equal(state.incomeReport.records[0].saleId, 'resultado-segunda');
   assert.equal(state.incomeReport.filters.query, 'segunda');
 });

@@ -5495,18 +5495,3 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 .movement-product-chevron { position: absolute; right: .9rem; top: 50%; transform: translateY(-50%); pointer-events: none; color: #566478; }
 .movement-product-empty { padding: .65rem; color: #667085; font-weight: 400; }
 .inventory-sync-status.is-pending, .income-report-status.is-warning { color: #117343; border-color: rgba(22,150,83,.2); background: #ecf9f1; }
-
-/* Análisis por producto: conserva los colores habituales al quitar la selección. */
-#income .income-filter-panel { overflow: visible; }
-#incomeProductToggle { width: 100%; min-width: 0; min-height: 48px; padding: .7rem 2.5rem .7rem .9rem; border: 1px solid #d5d9e0; border-radius: 10px; background: #f8fafc; color: #17191f; font: inherit; }
-#incomeProductOptions button { display: block; }
-#incomeProductOptions button[aria-selected="true"] { background: #eaf1ff; color: #123f91; }
-#income .income-kpi.is-product { color: #4c287c; border-color: #ccb4e9; background: linear-gradient(135deg,#f5efff,#e7dcfa); }
-#income .income-kpi.is-product > span, #income .income-kpi.is-product > small { color: #63458b; }
-#income .income-kpi.is-product svg { color: #7945b2; }
-#incomePaymentBreakdown[hidden], #clearIncomeProduct[hidden] { display: none; }
-
-.income-product-empty { padding: .65rem; color: #667085; font-weight: 400; }
-@media (min-width: 1241px) {
-  .income-filter-form { grid-template-columns: minmax(180px,1.3fr) minmax(180px,1.2fr) repeat(2,minmax(120px,.8fr)) repeat(2,minmax(115px,.7fr)) auto; }
-}

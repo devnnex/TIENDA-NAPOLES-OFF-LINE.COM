@@ -90,10 +90,10 @@ if(!offline)test('si el backend rechaza borrar una venta se restauran también s
  assert.equal(h.state.inventoryMeta.p.stock,10);assert.equal(h.state.incomeReport.records.length,1);
  assert.equal(h.state.inventoryMovements.length,1);assert.equal(h.mirror.deleted['sale-a'],undefined);
 });
-test('entrar conserva la carga habitual; seleccionar un producto completa su historial y mantiene tres KPI',()=>{
+test('entrar y filtrar no inicia consultas completas de ventas o movimientos y mantiene tres KPI',()=>{
  assert.doesNotMatch(block('showAdminSection','ensureOpenSession'),/loadMovementSalesTotals\(|ensureCompleteMovementHistory\(/);
  const a=source.indexOf('    $("#movementProductFilter")?.addEventListener'),b=source.indexOf('    $("#exportPurchasesPdf")',a);
- assert.match(source.slice(a,b),/loadSelectedMovementHistory\(/);
+ assert.doesNotMatch(source.slice(a,b),/appsScriptRequest\(|ensureCompleteMovementHistory\(|loadIncomeReport\(/);
  assert.equal((block('renderMovementTotals','buildBusinessReportPdf').match(/<article /g)||[]).length,3);
  assert.ok(!fs.readFileSync(path.join(__dirname,'../admin.html'),'utf8').includes('id="completeMovementHistory"'));
 });

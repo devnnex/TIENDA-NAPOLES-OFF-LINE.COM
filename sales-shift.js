@@ -2,11 +2,10 @@
 const SalesShift = (() => {
   const zone = "America/Bogota";
   const dayMs = 86400000;
-  const dateKeyFormatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit"
-  });
   const dateKey = (date = new Date()) => {
-    const parts = Object.fromEntries(dateKeyFormatter.formatToParts(date).map(({ type, value }) => [type, value]));
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit"
+    }).formatToParts(date).map(({ type, value }) => [type, value]));
     return `${parts.year}-${parts.month}-${parts.day}`;
   };
   const midnight = (date) => Date.parse(`${date}T00:00:00-05:00`);

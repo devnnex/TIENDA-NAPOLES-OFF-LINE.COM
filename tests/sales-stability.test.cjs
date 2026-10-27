@@ -20,7 +20,7 @@ function harness(initialCache=null){
  vm.runInContext(part('incomeTotalsFromRecords','setIncomeReportStatus')+part('renderIncomeReport','refreshBackgroundReports')+';globalThis.api={load:loadIncomeReport,merge:mergeIncomeReport,render:renderIncomeReport};',context);
  return {state,jobs,responses,calls,nodes,context,api:context.api,setFilters:value=>{current={...value};},clearCache:()=>{cached=null;},cache:()=>cached};
 }
-test('Hoy cuenta el día completo de Bogotá aunque el turno empiece más tarde; el turno explícito mantiene sus horas',()=>{
+test('un turno futuro conserva el día disponible en Hoy; el turno explícito mantiene sus horas',()=>{
  const state={salesShift:{id:'shift',date:'2026-10-27',startMinutes:1140,endMinutes:60},salesShiftHistory:[],selectedSalesShiftId:'shift'};state.salesShiftHistory=[state.salesShift];
  const context=vm.createContext({state,SalesShift,Date:Clock});vm.runInContext(part('incomeRangeDates','markIncomeRangePreset')+';globalThis.range=incomeRangeDates;',context);
  const today=context.range('today'),shift=context.range('shift');assert.equal(today.startAt,'2026-10-27T05:00:00.000Z');assert.equal(today.endAt,'2026-10-28T05:00:00.000Z');
@@ -67,7 +67,7 @@ if(source.includes('formatConsumptionTimestamp.dateFormatter'))test('formatear m
 });
 
 
-test('al pasar medianoche se desplazan Hoy, Ayer, semana, mes y año; el rango personalizado permanece intacto',()=>{
+test('sin turno vigente, al pasar medianoche se desplazan Hoy y los periodos relativos; el rango personalizado permanece intacto',()=>{
  let time=Date.parse('2026-12-31T23:59:59-05:00');class MutableClock extends Date{constructor(...args){super(...(args.length?args:[time]));}static now(){return time;}}
  for(const preset of ['today','yesterday','7days','month','year','custom']){
   time=Date.parse('2026-12-31T23:59:59-05:00');const state={incomeRangePreset:preset,activeAdminSection:'income'},nodes=new Map();let loads=0;

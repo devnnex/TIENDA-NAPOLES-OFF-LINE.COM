@@ -5,12 +5,12 @@ async function launch(){
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',headless:true});
  return {server,browser,url:'http://127.0.0.1:'+server.address().port+'/admin.html',close:async()=>{await browser.close();await new Promise(resolve=>server.close(resolve));}};
 }
-const instrument=source=>source.replace('  return { init };','  return { init, state, bindAdmin, showAdminSection, renderIncomeReport, loadIncomeReport, incomeFiltersFromForm, refreshBackgroundReports, persistSalesShift, openSalesShift, syncSalesShift, saveSalesShift, addConsumptionBatch, confirmConsumptionSelection, renderConsumptionSelection, openConsumptionDialog };').replace('document.addEventListener("DOMContentLoaded", App.init);','window.repairApi=App;');
+const instrument=source=>source.replace('  return { init };','  return { init, state, bindAdmin, showAdminSection, renderIncomeReport, loadIncomeReport, incomeFiltersFromForm, refreshBackgroundReports, persistSalesShift, openSalesShift, syncSalesShift, saveSalesShift, addConsumptionBatch, confirmConsumptionSelection, renderConsumptionSelection, openConsumptionDialog, setIncomeRange, refreshSalesShiftRange };').replace('document.addEventListener("DOMContentLoaded", App.init);','window.repairApi=App;');
 test('Hoy/Ayer/semana conservan sus cifras al navegar, las horas del turno se pueden editar y solo datos nuevos cambian los KPI',async()=>{
  const session=await launch(),errors=[];
  try{for(const width of [1440,390]){
   const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(10000);page.on('pageerror',error=>errors.push(error.message));
-  await page.goto(session.url);await page.addScriptTag({path:path.join(root,'sales-shift.js')});await page.addScriptTag({content:instrument(fs.readFileSync(path.join(root,'app.js'),'utf8'))});
+  await page.goto(session.url);await page.addScriptTag({content:"window.businessNow=Date.parse('2026-10-27T17:00:00-05:00');window.Date=class extends Date{constructor(...args){super(...(args.length?args:[businessNow]));}static now(){return businessNow;}};"});await page.addScriptTag({path:path.join(root,'sales-shift.js')});await page.addScriptTag({content:instrument(fs.readFileSync(path.join(root,'app.js'),'utf8'))});
   await page.evaluate(async()=>{
    document.body.classList.add('admin-authenticated');Object.assign(repairApi.state,{page:'admin',currentUser:{id:'boss',role:'boss',full_name:'Caja'},authToken:'test',business:{business_name:'Prueba'},businessTimeZone:'America/Bogota',activeAdminSection:'dashboard'});
    const today=SalesShift.dateKey(),yesterday=SalesShift.range('yesterday').dateFrom,older=SalesShift.range('7days').dateFrom;
@@ -51,5 +51,38 @@ test('Hoy/Ayer/semana conservan sus cifras al navegar, las horas del turno se pu
   const saved=await page.evaluate(()=>({base:repairApi.state.salesShift.base,end:repairApi.state.salesShift.endMinutes,action:calls.find(call=>call.action==='save_sales_shift')?.payload.action}));assert.deepEqual(saved,{base:50000,end:1380,action:'edit'});
   await page.locator('[data-income-range="today"]').click();await page.waitForFunction(()=>repairApi.state.incomeReport.totals.income===6400&&!repairApi.state.incomeLoading);
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));await context.close();
+ }assert.deepEqual(errors,[]);}finally{await session.close();}
+});
+﻿
+test('Hoy selecciona el turno automáticamente, conserva los KPI a medianoche y cambia al cierre o al nuevo turno de las 00:00',async()=>{
+ const session=await launch(),errors=[];
+ try{for(const scenario of ['overnight','new-at-midnight','cold-login']){
+  const context=await session.browser.newContext({viewport:{width:390,height:1000}}),page=await context.newPage();page.setDefaultTimeout(10000);page.on('pageerror',error=>errors.push(error.message));
+  await page.goto(session.url);await page.addScriptTag({content:"window.businessNow=Date.parse('2026-10-27T23:59:59-05:00');window.Date=class extends Date{constructor(...args){super(...(args.length?args:[businessNow]));}static now(){return businessNow;}};"});await page.addScriptTag({path:path.join(root,'sales-shift.js')});await page.addScriptTag({content:instrument(fs.readFileSync(path.join(root,'app.js'),'utf8'))});
+  await page.evaluate(async scenario=>{
+   document.body.classList.add('admin-authenticated');Object.assign(repairApi.state,{page:'admin',currentUser:{id:'boss',role:'boss',full_name:'Caja'},authToken:'test',business:{business_name:'Prueba'},businessTimeZone:'America/Bogota',activeAdminSection:'dashboard'});
+   window.oldShift={id:'night',date:'2026-10-27',startMinutes:1080,endMinutes:scenario==='new-at-midnight'?0:120,initialBase:50000,base:50000,version:1,updatedAt:new Date().toISOString()};
+   window.nextShift={...oldShift,id:'next',date:'2026-10-28',startMinutes:scenario==='new-at-midnight'?0:540,endMinutes:1020};window.shifts=[oldShift,nextShift];window.remoteShift=nextShift;window.calls=[];window.revision='r1';
+   if(scenario==='cold-login')businessNow=Date.parse('2026-10-28T00:30:00-05:00');
+   window.rows=[['evening','2026-10-27T23:00:00-05:00',100],['midnight','2026-10-28T00:00:00-05:00',200],['after-close','2026-10-28T02:00:00-05:00',300],['morning','2026-10-28T09:00:00-05:00',400]].map(([saleId,date,total])=>({saleId,invoice:'TN-'+saleId,date,table:'Mesa 1',total,subtotal:total,cost:0,profit:total,payments:[{method:'cash',amount:total}],items:[]}));
+   window.fetch=async(_url,options={})=>{const request=options.body?JSON.parse(options.body):{};calls.push(request);let result={ok:true};if(request.action==='status')result={ok:true,historyRevision:revision,movementRevision:'m1'};if(request.action==='get_sales_shift')result={ok:true,shift:remoteShift,shifts};if(request.action==='get_inventory_movements')result={ok:true,movements:[],hasMore:false,revision:'m1'};
+    if(request.action==='get_income_report'){const filters=request.payload.filters,records=rows.filter(row=>SalesShift.matches(row.date,filters)),income=records.reduce((sum,row)=>sum+row.total,0);result={ok:true,filters,intervalApplied:true,revision,generatedAt:new Date().toISOString(),records,recordRows:records.map(row=>({saleId:row.saleId,row:rows.indexOf(row)+2})),totals:{income,sales:records.length,cash:income,profit:income,cost:0},totalRecords:records.length,truncated:false};}return new Response(JSON.stringify(result));};
+   repairApi.state.sb={rpc:async()=>({data:{ok:true,changes:[],hasMore:false}}),channel:()=>({on(){return this;},subscribe(){return this;},send:async()=> 'ok'})};
+   await repairApi.persistSalesShift(remoteShift,null,shifts);repairApi.bindAdmin();repairApi.showAdminSection('income');repairApi.setIncomeRange('today',false);
+  },scenario);
+  const initial=scenario==='new-at-midnight'?100:300;
+  await page.waitForFunction(total=>repairApi.state.incomeReport?.totals.income===total&&!repairApi.state.incomeLoading,initial);
+  assert.equal(await page.locator('#salesShiftHistory').inputValue(),'night');assert.equal(await page.locator('[data-income-range="today"]').getAttribute('aria-pressed'),'true');
+  if(scenario==='cold-login'){await context.close();continue;}
+  await page.evaluate(()=>{window.card=document.querySelector('#incomeKpis article');window.readCount=calls.filter(call=>call.action==='get_income_report').length;businessNow=Date.parse('2026-10-28T00:00:00-05:00');repairApi.refreshSalesShiftRange();});
+  if(scenario==='overnight'){
+   const midnight=await page.evaluate(()=>({same:card===document.querySelector('#incomeKpis article'),total:repairApi.state.incomeReport.totals.income,reads:calls.filter(call=>call.action==='get_income_report').length-readCount}));assert.deepEqual(midnight,{same:true,total:300,reads:0});assert.equal(await page.locator('#salesShiftHistory').inputValue(),'night');
+   await page.evaluate(()=>{businessNow=Date.parse('2026-10-28T02:00:00-05:00');repairApi.refreshSalesShiftRange();});await page.waitForFunction(()=>repairApi.state.incomeReport?.totals.income===700&&!repairApi.state.incomeLoading);assert.equal(await page.locator('#salesShiftHistory').inputValue(),'');
+   await page.evaluate(()=>{businessNow=Date.parse('2026-10-28T09:00:00-05:00');repairApi.refreshSalesShiftRange();});await page.waitForFunction(()=>repairApi.state.incomeReport?.totals.income===400&&!repairApi.state.incomeLoading);
+  }else{await page.waitForFunction(()=>repairApi.state.incomeReport?.totals.income===900&&!repairApi.state.incomeLoading);}
+  assert.equal(await page.locator('#salesShiftHistory').inputValue(),'next');assert.equal(await page.locator('[data-income-range="today"]').getAttribute('aria-pressed'),'true');
+  await page.locator('#salesShiftHistory').selectOption('night');await page.waitForFunction(total=>repairApi.state.incomeRangePreset==='shift'&&repairApi.state.incomeReport?.totals.income===total&&!repairApi.state.incomeLoading,initial);
+  await page.evaluate(()=>{businessNow=Date.parse('2026-10-29T09:00:00-05:00');repairApi.refreshSalesShiftRange();});assert.equal(await page.locator('#salesShiftHistory').inputValue(),'night');assert.equal(await page.locator('[data-income-range="today"]').getAttribute('aria-pressed'),'false');
+  await context.close();
  }assert.deepEqual(errors,[]);}finally{await session.close();}
 });

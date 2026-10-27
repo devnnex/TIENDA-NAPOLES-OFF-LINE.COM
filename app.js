@@ -8186,7 +8186,8 @@ const App = (() => {
         history.innerHTML = options;
         state.salesShiftRenderedOptions = options;
       }
-      const selected = state.incomeRangePreset === "shift" ? state.selectedSalesShiftId || "" : "";
+      const selected = state.incomeRangePreset === "shift" ? state.selectedSalesShiftId || ""
+        : state.incomeRangePreset === "today" ? SalesShift.range("today", state.salesShift, new Date(), state.salesShiftHistory).shiftId || "" : "";
       if (history.value !== selected) history.value = selected;
       if (edit) edit.disabled = !history.value || Boolean(state.salesShiftPending);
     }
@@ -8333,7 +8334,8 @@ const App = (() => {
       if (index < 0) shifts.push(next); else shifts[index] = next;
       await persistSalesShift(action === "edit" && previous.id !== state.salesShift?.id ? state.salesShift : next, operation, shifts);
       $("#salesShiftDialog").close();
-      refreshSalesShiftRange();
+      if (action === "new") setIncomeRange("today", state.activeAdminSection === "income");
+      else refreshSalesShiftRange();
       void syncSalesShift();
     } catch (error) { errorBox.textContent = error.message; }
     finally { button.disabled = false; }
@@ -8350,7 +8352,7 @@ const App = (() => {
       state.selectedSalesShiftId = id;
       setIncomeRange("shift");
     });
-    $("#editSalesShiftHistory")?.addEventListener("click", () => openSalesShift(state.selectedSalesShiftId));
+    $("#editSalesShiftHistory")?.addEventListener("click", () => openSalesShift($("#salesShiftHistory")?.value || state.selectedSalesShiftId));
     const form = $("#salesShiftForm");
     form?.addEventListener("submit", (event) => { event.preventDefault(); void saveSalesShift(form); });
     form?.elements.namedItem("action").addEventListener("change", updateSalesShiftForm);
@@ -8378,8 +8380,8 @@ const App = (() => {
   };
 
   const incomeRangeDates = (preset = "today") => preset === "shift"
-    ? SalesShift.shiftRange((state.salesShiftHistory || []).find((item) => item.id === state.selectedSalesShiftId)) || SalesShift.range("today", null, new Date())
-    : SalesShift.range(preset, preset === "today" ? null : state.salesShift, new Date());
+    ? SalesShift.shiftRange((state.salesShiftHistory || []).find((item) => item.id === state.selectedSalesShiftId)) || SalesShift.range("today", state.salesShift, new Date(), state.salesShiftHistory)
+    : SalesShift.range(preset, state.salesShift, new Date(), state.salesShiftHistory);
 
   const markIncomeRangePreset = () => {
     $$('[data-income-range]').forEach((button) => {
@@ -8413,7 +8415,11 @@ const App = (() => {
     state.salesShiftRangeSignature = JSON.stringify(range);
     window.clearTimeout(state.salesShiftBoundaryTimer);
     if (preset !== "shift") {
-      state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, Date.parse(range.endAt || SalesShift.range("today", null, new Date()).endAt) - Date.now() + 25)));
+      const now = Date.now();
+      const starts = preset === "today" ? [...(state.salesShiftHistory || []), state.salesShift]
+        .map(shift => SalesShift.bounds(shift)?.start).filter(start => start > now) : [];
+      const boundary = Math.min(Date.parse(range.endAt || SalesShift.range("today", null, new Date()).endAt), ...starts);
+      state.salesShiftBoundaryTimer = window.setTimeout(refreshSalesShiftRange, Math.max(25, Math.min(2147483647, boundary - now + 25)));
     }
     markIncomeRangePreset();
     renderSalesShift();

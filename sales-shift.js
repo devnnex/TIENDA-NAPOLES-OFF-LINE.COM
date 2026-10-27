@@ -48,16 +48,19 @@ const SalesShift = (() => {
     const interval = bounds(shift);
     return !interval || (dateKey(now) > shift.date && Number(now) >= interval.end);
   };
-  const today = (shift, now = new Date()) => {
-    const date = dateKey(now), interval = bounds(shift), timestamp = Number(now);
-    if (interval && timestamp >= midnight(shift.date) && timestamp < interval.end) {
-      return { dateFrom: shift.date, dateTo: dateKey(new Date(interval.end - 1)),
-        startAt: new Date(interval.start).toISOString(), endAt: new Date(interval.end).toISOString(), shiftId: shift.id };
-    }
-    // El tramo después de medianoche ya pertenece al turno anterior; no se cuenta dos veces en Hoy.
-    const start = interval && dateKey(new Date(interval.end)) === date && timestamp >= interval.end
-      ? Math.max(midnight(date), interval.end) : midnight(date);
-    return { dateFrom: date, dateTo: date, startAt: new Date(start).toISOString(), endAt: new Date(midnight(date) + dayMs).toISOString() };
+  const today = (shift, now = new Date(), history = []) => {
+    const date = dateKey(now), timestamp = Number(now);
+    const shifts = new Map((history || []).filter(item => item?.id).map(item => [item.id, item]));
+    if (shift) shifts.set(shift.id || "current", shift);
+    const intervals = [...shifts.values()].map(item => ({ item, interval: bounds(item) })).filter(entry => entry.interval);
+    const active = intervals.filter(({ interval }) => timestamp >= interval.start && timestamp < interval.end)
+      .sort((a, b) => b.interval.start - a.interval.start)[0];
+    if (active) return shiftRange(active.item);
+    // Antes del inicio de un turno futuro se conserva el tramo del día disponible.
+    // Después de un cierre no se vuelve a contar el tramo que pertenecía al turno terminado.
+    const lastEnd = intervals.filter(({ interval }) => interval.end <= timestamp && dateKey(new Date(interval.end)) === date)
+      .reduce((end, { interval }) => Math.max(end, interval.end), midnight(date));
+    return { dateFrom: date, dateTo: date, startAt: new Date(lastEnd).toISOString(), endAt: new Date(midnight(date) + dayMs).toISOString() };
   };
   const shiftRange = (shift) => {
     const interval = bounds(shift);
@@ -65,8 +68,8 @@ const SalesShift = (() => {
     return { dateFrom: shift.date, dateTo: dateKey(new Date(interval.end - 1)),
       startAt: new Date(interval.start).toISOString(), endAt: new Date(interval.end).toISOString(), shiftId: shift.id };
   };
-  const range = (preset, shift, now = new Date()) => {
-    if (preset === "today") return today(shift, now);
+  const range = (preset, shift, now = new Date(), history = []) => {
+    if (preset === "today") return today(shift, now, history);
     const date = dateKey(now);
     let from = date, to = date;
     if (preset === "yesterday") from = to = addDays(date, -1);

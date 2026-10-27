@@ -56,6 +56,19 @@ test("la consulta periodica conserva el control por revision y offline conserva 
   assert.deepEqual(h.calls, ["status"]);
 });
 
+if (source.includes('state.syncFresh?.sales === false')) test("un informe local en cero vuelve a consultar sin depender de que status cambie o responda", async () => {
+  const h = harness();
+  h.state.incomeReport = { records: [], localOnly: true };
+  h.state.incomeFetchedAt = 0;
+  h.context.readAppsScriptStatus = async () => { throw Error('status no disponible'); };
+  const loading = h.context.refresh();
+  assert.equal(h.calls[0][0], 'income');
+  assert.equal(h.calls[0][1].force, true);
+  h.income.resolve(true);
+  assert.equal(await loading, true);
+  assert.equal(h.calls.length, 1);
+});
+
 test("un aviso no espera una consulta de status que todavia no ha respondido", async () => {
   const h=harness(), status=deferred();
   const waiting=()=>{h.calls.push("status");return status.promise;};

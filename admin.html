@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261021-inventory-remote-v1">
+    <link rel="stylesheet" href="style.css?v=20261027-sales-online-v2">
     <link rel="stylesheet" href="menu-cards.css?v=20261019-visual-details-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
@@ -376,7 +376,7 @@
           </div>
           <div class="inventory-heading-actions">
             <button class="primary" id="refreshInventoryMovements" type="button"><i data-lucide="refresh-cw"></i> Actualizar</button>
-            <button class="ghost danger-text section-reset-button" type="button" data-reset-section="movements"><i data-lucide="trash-2"></i> Eliminar todo</button>
+            <button class="ghost danger-text section-reset-button" type="button" data-reset-section="movements"><i data-lucide="trash-2"></i> Eliminar movimientos</button>
           </div>
         </div>
         <div class="movement-summary" id="movementSummary"></div>
@@ -420,6 +420,15 @@
           <form class="income-filter-form" id="incomeFilterForm">
             <label class="income-search">Buscar factura, mesa, producto o responsable
               <span><i data-lucide="search"></i><input id="incomeSearch" name="query" type="search" autocomplete="off" placeholder="Ej. TN-2026, Mesa 4, cerveza..."></span>
+            </label>
+            <label class="income-product-field" for="incomeProductToggle">Producto
+              <span class="movement-product-picker" id="incomeProductPicker">
+                <select id="incomeProductFilter" class="visually-hidden" tabindex="-1" aria-hidden="true"><option value="all">Todos los productos</option></select>
+                <input type="text" id="incomeProductToggle" role="combobox" aria-label="Buscar producto en ventas" aria-autocomplete="list" aria-expanded="false" aria-controls="incomeProductOptions" aria-haspopup="listbox" autocomplete="off" placeholder="Todos los productos">
+                <span class="movement-product-chevron" aria-hidden="true">⌄</span>
+                <span class="movement-product-options" id="incomeProductOptions" role="listbox" aria-label="Productos en ventas" hidden></span>
+              </span>
+              <button type="button" class="ghost" id="clearIncomeProduct" hidden>Quitar producto</button>
             </label>
             <label>Tipo de venta
               <select id="incomeSaleType" name="sale_type">
@@ -937,8 +946,8 @@
     <script defer src="vendor/lucide.min.js"></script>
     <script defer src="vendor/qrcode.min.js"></script>
     <script defer src="vendor/jspdf.umd.min.js"></script>
-    <script defer src="sales-shift.js?v=20261019-pos-integrity-v1"></script>
+    <script defer src="sales-shift.js?v=20261027-sales-online-v2"></script>
     <script defer src="menu-cards.js?v=20261019-visual-details-v1"></script>
-    <script defer src="app.js?v=20261021-inventory-remote-v1"></script>
+    <script defer src="app.js?v=20261027-sales-online-v2"></script>
   </body>
 </html>

@@ -387,8 +387,7 @@ const App = (() => {
 
   const persistDurableJson = (key, value) => {
     if (checkoutBatch) {
-      const snapshot = JSON.parse(JSON.stringify(value));
-      checkoutBatch.set(key, snapshot);
+      checkoutBatch.set(key, value);
       return Promise.resolve(true);
     }
     const revision = nextDurableRevision();
@@ -466,7 +465,12 @@ const App = (() => {
     if (checkoutBatch) throw new Error("Ya hay un cobro en procesamiento.");
     const values = new Map();
     checkoutBatch = values;
-    try { project(); } finally { checkoutBatch = null; }
+    try {
+      project();
+      for (const [key, value] of values) {
+        values.set(key, JSON.parse(JSON.stringify(value)));
+      }
+    } finally { checkoutBatch = null; }
     let committed = false;
     const commit = async () => {
       const database = await openLocalDataDb();
@@ -1109,7 +1113,7 @@ const App = (() => {
       renderSalesShift();
       initializeIncomeFilters();
       if (state.incomeRangePreset !== "shift" || state.incomeRenderedReport !== state.incomeReport) renderIncomeReport();
-      if (!state.incomeReport) void loadIncomeReport();
+      if (enteringIncome || !state.incomeReport) void loadIncomeReport({ background: Boolean(state.incomeReport), force: Boolean(state.incomeReport?.localOnly || !state.syncFresh.sales) });
       else if (state.incomeRangePreset !== "shift") void refreshBackgroundReports();
     }
     if (section === "brand" && !state.outdoorTableDraftDirty) renderBusinessForm();
@@ -6879,7 +6883,11 @@ const App = (() => {
           delete mirror.sales[id]; mirror.deleted[id] = change.confirmedAt || payload.occurredAt || true;
         }
       }
-      if (change.action === "clear_inventory_movements") { mirror.movements = {}; mirror.movementsClearAt = change.confirmedAt || payload.occurredAt; }
+      if (change.action === "clear_inventory_movements") {
+        mirror.movements = {};
+        Object.values(mirror.sales || {}).forEach(invoice => { if (invoice.reportMutation) invoice.reportMovementSettled = true; });
+        mirror.movementsClearAt = change.confirmedAt || payload.occurredAt;
+      }
       (payload.movements || []).forEach(row => { if (row.movementId) mirror.movements[row.movementId] = { ...row, googlePending: Boolean(payload.invoice?.googlePending), reportConfirmedAt: change.confirmedAt || payload.occurredAt }; });
       (payload.items || []).forEach(item => inventory.set(String(item.productId), item));
       mirror.cursor = Number(change.sequence);
@@ -7166,8 +7174,109 @@ const App = (() => {
     window.addEventListener("resize",close);
   };
 
+  // Product summaries use line identities and amounts; invoices remain intact for editing/printing.
+  const incomeProductSummary = (report, productId) => {
+    const summary = { quantity: 0, income: 0, cost: 0, profit: 0, sales: 0,
+      complete: (report.records || []).length >= Number(report.totalRecords || 0) && !report.truncated };
+    for (const record of report.records || []) {
+      let matched = false;
+      for (const line of record.items || []) {
+        if (String(line.menuItemId || line.menu_item_id || "") !== String(productId)) continue;
+        matched = true;
+        const quantity = Number(line.quantity || 0);
+        const amount = Number(line.total ?? quantity * Number(line.unitPrice ?? line.unit_price ?? 0));
+        const cost = Number(line.cost ?? quantity * Number(line.unitCost ?? line.unit_cost ?? 0));
+        summary.quantity += quantity;
+        summary.income += amount;
+        summary.cost += cost;
+        summary.profit += amount - cost;
+      }
+      if (matched) summary.sales += 1;
+    }
+    return summary;
+  };
+  const renderIncomeProductOptions = () => {
+    const select = $("#incomeProductFilter");
+    if (!select) return;
+    const products = new Map(state.items.map(item => [String(item.id), String(item.name || "Producto")]));
+    for (const invoice of state.invoiceHistory || []) for (const line of invoice.items || []) {
+      const id = String(line.menu_item_id || line.menuItemId || "");
+      if (id && !products.has(id)) products.set(id, String(line.item_name || line.name || "Producto"));
+    }
+    for (const record of state.incomeReport?.records || []) for (const line of record.items || []) {
+      const id = String(line.menuItemId || line.menu_item_id || "");
+      if (id && !products.has(id)) products.set(id, String(line.name || line.item_name || "Producto"));
+    }
+    const chosen = state.incomeProductFilter || "all";
+    if (chosen !== "all" && !products.has(chosen)) products.set(chosen, select.selectedOptions[0]?.textContent || "Producto seleccionado");
+    const markup = '<option value="all">Todos los productos</option>' + [...products].sort((a,b) => a[1].localeCompare(b[1],"es"))
+      .map(([id,name]) => '<option value="' + escapeHTML(id) + '">' + escapeHTML(name) + '</option>').join("");
+    if (select.innerHTML !== markup) select.innerHTML = markup;
+    select.value = chosen;
+    $("#clearIncomeProduct").hidden = chosen === "all";
+    syncIncomeProductPicker();
+  };
+  const syncIncomeProductPicker = () => {
+    const select=$("#incomeProductFilter"),toggle=$("#incomeProductToggle"),list=$("#incomeProductOptions");
+    if(!select || !toggle || !list) return;
+    const label=select.selectedOptions[0]?.textContent || "Todos los productos";
+    if(!toggle.dataset.searching) toggle.value=label;
+    toggle.placeholder=label;
+    const terms=normalizeText(toggle.dataset.searching ? toggle.value : "").split(/\s+/).filter(Boolean);
+    const options=[...select.options].filter(option=>{
+      const words=option.textContent.split(/\s+/).map(word=>word[0] || "").join("");
+      const text=normalizeText(option.textContent+" "+(state.inventoryMeta?.[option.value]?.code || "")+" "+words);
+      return option.value==="all" || terms.every(term=>text.includes(term));
+    });
+    const markup=options.map(option=>'<button type="button" role="option" id="income-product-option-'+option.index+'" data-income-product="'+escapeHTML(option.value)+'" aria-selected="'+String(option.selected)+'">'+escapeHTML(option.textContent)+'</button>').join("")
+      +(terms.length && options.length===1 && options[0].value==="all" ? '<span class="income-product-empty" role="status">Sin coincidencias</span>' : '');
+    if(list.innerHTML!==markup)list.innerHTML=markup;
+  };
+  const bindIncomeProductPicker = () => {
+    const select=$("#incomeProductFilter"),toggle=$("#incomeProductToggle"),list=$("#incomeProductOptions"),picker=$("#incomeProductPicker");
+    if(!select || !toggle || !list || !picker || toggle.dataset.bound) return;
+    toggle.dataset.bound="1";
+    const close=()=>{if(list.hidden&&!toggle.dataset.searching)return;list.hidden=true;toggle.setAttribute("aria-expanded","false");toggle.removeAttribute("aria-activedescendant");delete toggle.dataset.searching;toggle.value=select.selectedOptions[0]?.textContent || "Todos los productos";};
+    const choose=option=>{if(!option)return;select.value=option.dataset.incomeProduct;select.dispatchEvent(new Event("change",{bubbles:true}));close();};
+    const open=()=>{
+      syncIncomeProductPicker();
+      if(toggle.getBoundingClientRect().bottom>window.innerHeight-180)toggle.scrollIntoView({block:"center",behavior:"instant"});
+      list.style.maxHeight=Math.max(96,Math.min(280,window.innerHeight-toggle.getBoundingClientRect().bottom-12))+"px";
+      list.hidden=false;toggle.setAttribute("aria-expanded","true");
+    };
+    toggle.addEventListener("focus",()=>{toggle.dataset.searching="1";toggle.value="";open();});
+    toggle.addEventListener("click",()=>{if(list.hidden){toggle.dataset.searching="1";toggle.value="";open();}});
+    toggle.addEventListener("input",()=>{toggle.dataset.searching="1";toggle.removeAttribute("aria-activedescendant");open();});
+    list.addEventListener("pointerdown",event=>{if(event.target.closest("[data-income-product]"))event.preventDefault();});
+    list.addEventListener("click",event=>{const option=event.target.closest("[data-income-product]");if(option)choose(option);});
+    toggle.addEventListener("keydown",event=>{
+      if(event.key==="Escape"||event.key==="Tab"){close();return;}
+      if(!["ArrowDown","ArrowUp","Enter"].includes(event.key))return;
+      event.preventDefault();if(list.hidden)open();
+      const options=[...list.querySelectorAll('[role="option"]')];if(!options.length)return;
+      let index=options.findIndex(option=>option.id===toggle.getAttribute("aria-activedescendant"));
+      if(event.key==="Enter"){choose(options[index<0 ? (options.length>1 ? 1 : 0) : index]);return;}
+      index=Math.max(0,Math.min(options.length-1,index+(event.key==="ArrowDown"?1:-1)));
+      toggle.setAttribute("aria-activedescendant",options[index].id);options[index].scrollIntoView({block:"nearest"});
+    });
+    document.addEventListener("click",event=>{if(!picker.contains(event.target))close();});
+    document.addEventListener("keydown",event=>{if(event.key==="Escape")close();});
+    window.addEventListener("resize",close);
+  };
+
+
+  const applyIncomeProductFilter = () => {
+    state.incomeProductFilter = $("#incomeProductFilter")?.value || "all";
+    state.incomeRenderedShiftSignature = "";
+    renderIncomeReport();
+    if (state.incomeProductFilter !== "all" && state.incomeReport
+      && !incomeProductSummary(state.incomeReport, state.incomeProductFilter).complete) {
+      void loadIncomeReport({ background: true, force: true });
+    }
+  };
+
   let completeMovementsPromise = null;
-  const ensureCompleteMovementHistory = () => {
+  const ensureCompleteMovementHistory = ({ force = false } = {}) => {
     if (completeMovementsPromise) return completeMovementsPromise;
     completeMovementsPromise = (async () => {
       if (!navigator.onLine) return false;
@@ -7179,6 +7288,10 @@ const App = (() => {
         const result = await appsScriptRequest("get_inventory_movements", { limit: 800, cursor, revision });
         if (!result?.ok || result.stale || !Array.isArray(result.movements)) throw new Error("El historial cambió. Vuelve a intentar la consulta.");
         if (cursor && String(result.revision || "") !== revision) throw new Error("El historial cambió durante la consulta.");
+        if (!force && !cursor && result.revision && state.completeMovementRevision === result.revision && state.movementLoaded) {
+          state.movementFetchedAt = Date.now();
+          return true;
+        }
         result.movements.forEach(row => collected.set(String(row.movementId), row));
         revision = String(result.revision || "");
         const next = result.hasMore ? result.nextCursor : null;
@@ -7209,17 +7322,40 @@ const App = (() => {
     })().finally(() => { completeMovementsPromise = null; });
     return completeMovementsPromise;
   };
+  const loadSelectedMovementHistory = async (options = {}) => {
+    if (state.movementCompleting) return false;
+    state.movementCompleting = true;
+    try { return await ensureCompleteMovementHistory(options); }
+    catch (error) {
+      state.movementHasMore = true;
+      const feedback = $("#movementTotalsFeedback");
+      if (feedback) feedback.textContent = "Historial parcial. No se pudo completar el conteo: " + String(error?.message || error);
+      return false;
+    } finally { state.movementCompleting = false; }
+  };
   const movementViewRows = () => removeDeletedSaleMovements(state.inventoryMovements);
 
+  const movementSoldUnits = (movements) => {
+    const open = new Set((state.sessions || []).filter(session => session.status === "open").map(session => String(session.id)));
+    return movements.reduce((sum, row) => {
+      const type = String(row.type || "").toUpperCase();
+      if (!["SALIDA_VENTA", "CORRECCION_VENTA", "CONSUMO_MESA", "DEVOLUCION_CONSUMO"].includes(type)) return sum;
+      if (["CONSUMO_MESA", "DEVOLUCION_CONSUMO"].includes(type) && open.has(String(row.sessionId))) return sum;
+      return sum - Number(row.delta ?? row.quantityChange ?? 0);
+    }, 0);
+  };
   const renderMovementTotals = (movements) => {
     const entries = movements.filter(row => movementKind(row) === "entry").reduce((sum,row) => sum + Number(row.delta ?? row.quantityChange ?? 0),0);
     const exits = movements.filter(row => movementKind(row) === "exit").reduce((sum,row) => sum + Math.abs(Number(row.delta ?? row.quantityChange ?? 0)),0);
+    const selectedProduct = state.movementProductFilter && state.movementProductFilter !== "all";
+    const sold = selectedProduct ? movementSoldUnits(movements) : exits;
     const summary = $("#movementSummary");
     if (summary) summary.innerHTML = `<article class="movement-kpi entry">${icon("arrow-down-to-line",19)}<span><small>Unidades ingresadas</small><strong>+${reportNumber(entries)}</strong></span></article>
-      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>${state.movementProductFilter && state.movementProductFilter !== "all" ? "De este producto has vendido" : "Unidades retiradas"}</small><strong>${reportNumber(exits)}</strong></span></article>
+      <article class="movement-kpi exit">${icon("arrow-up-from-line",19)}<span><small>${state.movementProductFilter && state.movementProductFilter !== "all" ? "De este producto has vendido" : "Unidades retiradas"}</small><strong>${reportNumber(sold)}</strong></span></article>
       <article class="movement-kpi">${icon("list-checks",19)}<span><small>Movimientos visibles</small><strong>${movements.length}</strong></span></article>`;
     const feedback = $("#movementTotalsFeedback");
-    if (feedback) feedback.textContent = "Cantidades de los movimientos cargados para el producto seleccionado.";
+    if (feedback) feedback.textContent = (state.movementHasMore ? "Historial parcial: faltan movimientos por cargar. " : "")
+      + "Vendidas: salidas por venta menos devoluciones y correcciones; no incluye retiros manuales ni cuentas abiertas. Ventas usa su periodo seleccionado; Movimientos conserva el historial desde su último borrado.";
   };
 
   const buildBusinessReportPdf = ({ title, subtitle, metrics = [], sections = [], note = "", filename }) => {
@@ -7865,6 +8001,7 @@ const App = (() => {
   let movementLoadPromise = null;
   let movementRefreshPending = false;
   const loadInventoryMovements = ({ force = false } = {}) => {
+    if (state.movementProductFilter && state.movementProductFilter !== "all" && navigator.onLine) return loadSelectedMovementHistory({ force });
     if (movementLoadPromise) { if (force) movementRefreshPending = true; return movementLoadPromise; }
     movementLoadPromise = (async () => {
     if (!isAppsScriptConfigured() || !state.currentUser) return false;
@@ -7893,6 +8030,7 @@ const App = (() => {
       state.movementHasMore = Boolean(result.hasMore);
       state.movementCursor = result.nextCursor || null;
       state.movementLoaded = true;
+      state.movementFetchedAt = Date.now();
       persistInventoryMovements();
       state.syncFresh.movements = true;
       renderInventoryMovements();
@@ -8484,13 +8622,14 @@ const App = (() => {
       const page = await appsScriptRequest("get_income_report", { filters: { ...filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
       if (requestId !== state.incomeRequestId) return report;
       if (!page?.ok || page.stale || !Array.isArray(page.records)
+        || (typeof page.revision === "string" && page.revision !== report.revision)
         || (filters.startAt && page.intervalApplied !== true)) throw new Error(page?.error || "El historial cambio. Actualiza el filtro de ventas.");
       const pageIds = new Set(page.records.map((record) => String(record.saleId)));
       if (pageRows.some((row) => !pageIds.has(String(row.saleId)))) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
       page.records.forEach((record) => records.set(String(record.saleId), record));
     }
     if (Number(report.totalRecords || 0) > records.size) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
-    return { ...report, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
+    return { ...report, truncated: false, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
   };
 
   const incomeSaleTypeFiltersKey = (filters) => JSON.stringify({ ...filters, saleType: "all" });
@@ -8630,20 +8769,39 @@ const App = (() => {
 
   const mergeIncomeReport = (remote, filters) => {
     const jobs = readAppsScriptOutbox();
-    const pendingSaleIds = new Set(jobs
-      .filter((job) => ["record_sale", "edit_sale"].includes(job.action))
-      .map((job) => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || ""))
-      .filter(Boolean));
+    const history = new Map((state.invoiceHistory || []).map(invoice => [String(invoice.id || invoice.sessionId), invoice]));
+    const pendingInvoices = new Map();
+    const pendingPrevious = new Map();
+    const hasInvoice = invoice => invoice?.totals?.total != null && Number.isFinite(Number(invoice.totals.total))
+      && Array.isArray(invoice.items) && Number.isFinite(Date.parse(invoice.createdAt || ""));
+    jobs.filter(job => ["record_sale", "edit_sale"].includes(job.action)).forEach(job => {
+      const queued = job.payload?.invoice;
+      const id = String(queued?.id || queued?.sessionId || "");
+      const invoice = hasInvoice(queued) ? queued : history.get(id);
+      // A queue marker alone cannot replace a paid sale with an empty local projection.
+      if (id && hasInvoice(invoice)) {
+        pendingInvoices.set(id, invoice);
+        if (job.action === "edit_sale" && job.payload?.previousRecord && !pendingPrevious.has(id)) pendingPrevious.set(id, job.payload.previousRecord);
+      }
+    });
+    const pendingSaleIds = new Set(pendingInvoices.keys());
     const deletedSaleIds = new Set(jobs
       .filter((job) => job.action === "delete_sale")
       .map((job) => String(job.payload?.saleId || ""))
       .filter(Boolean));
     const excludedRemote = (remote.records || []).filter((record) => deletedSaleIds.has(String(record.saleId || "")) || pendingSaleIds.has(String(record.saleId || "")));
     const visibleRemote = (remote.records || []).filter((record) => !deletedSaleIds.has(String(record.saleId || "")) && !pendingSaleIds.has(String(record.saleId || "")));
-    const pending = localIncomeRecords(filters)
-      .filter((record) => pendingSaleIds.has(String(record.saleId || "")));
-    const pendingTotals = incomeTotalsFromRecords(pending);
-    const excludedTotals = incomeTotalsFromRecords(excludedRemote);
+    const loadedIds = new Set((remote.records || []).map(record => String(record.saleId)));
+    const remoteIds = new Set([...(remote.recordRows || []).map(row => String(row.saleId)), ...(remote.recordKeys || []).map(String), ...loadedIds]);
+    const previousOutsidePage = [...pendingPrevious].filter(([id]) => remoteIds.has(id) && !loadedIds.has(id));
+    const previousIds = new Set(previousOutsidePage.map(([id]) => id));
+    const pending = localIncomeRecords(filters, [...pendingInvoices.values()])
+      .filter((record) => pendingSaleIds.has(String(record.saleId || "")) && !deletedSaleIds.has(String(record.saleId || "")));
+    // The server totals already include sales outside the first 300 visible rows.
+    const countedPending = pending.filter(record => !remoteIds.has(String(record.saleId)) || loadedIds.has(String(record.saleId)) || previousIds.has(String(record.saleId)));
+    const replacedRemote = [...excludedRemote, ...previousOutsidePage.map(([, record]) => record)];
+    const pendingTotals = incomeTotalsFromRecords(countedPending);
+    const excludedTotals = incomeTotalsFromRecords(replacedRemote);
     const totals = { ...(remote.totals || {}) };
     Object.keys(pendingTotals).forEach((key) => {
       if (key === "averageTicket") return;
@@ -8656,7 +8814,7 @@ const App = (() => {
       appliedReportMutations: { ...(remote.appliedReportMutations || {}), ...Object.fromEntries(excludedRemote.map(record => [String(record.saleId), deletedSaleIds.has(String(record.saleId)) ? "deleted" : "edited"])) },
       totals,
       records: [...pending, ...visibleRemote].sort((left, right) => String(right.date).localeCompare(String(left.date))),
-      totalRecords: Math.max(0, Number(remote.totalRecords || 0) - excludedRemote.length + pending.length),
+      totalRecords: Math.max(0, Number(remote.totalRecords || 0) - replacedRemote.length + countedPending.length),
       pendingCount: pending.length,
       localOnly: false
     };
@@ -8759,9 +8917,12 @@ const App = (() => {
     const recordsTarget = $("#incomeRecords");
     const summaryTarget = $("#incomeFilterSummary");
     if (!kpis || !payments || !recordsTarget) return;
+    if (typeof renderIncomeProductOptions === "function") renderIncomeProductOptions();
+    const productId = state.incomeProductFilter || "all";
+    const productFiltered = productId !== "all";
     const report = state.incomeReport;
     const shiftSignature = report && !(state.incomeAwaitingRemote && navigator.onLine) ? JSON.stringify({
-      filters: report.filters, totals: report.totals, records: report.records,
+      productId, filters: report.filters, totals: report.totals, records: report.records,
       recordRows: report.recordRows, recordKeys: report.recordKeys, totalRecords: report.totalRecords,
       nextIndex: report.nextIndex, pendingCount: report.pendingCount, localOnly: report.localOnly,
       truncated: report.truncated, visibleCount: state.incomeVisibleCount
@@ -8791,6 +8952,18 @@ const App = (() => {
         <article class="income-kpi is-primary">${infoButton("Dinero vendido", "Todo el dinero cobrado en las ventas de este periodo.")}<span>${icon("circle-dollar-sign", 19)} Dinero vendido</span><strong>${money(totals.income)}</strong><small>Total vendido en el periodo seleccionado</small></article>
         <article class="income-kpi is-profit">${infoButton("Ganancia aproximada", "Lo que queda al restar del dinero vendido el costo de los productos.")}<span>${icon("trending-up", 19)} Ganancia aproximada</span><strong>${money(totals.profit)}</strong><small>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% del dinero vendido</small></article>
         <article class="income-kpi">${infoButton("Costo de los productos", "Lo que el negocio pagó por los productos que ya vendió.")}<span>${icon("package-search", 19)} Costo de los productos</span><strong>${money(totals.cost)}</strong><small>Valor de compra de lo que se vendió</small></article>`;
+    if (productFiltered) {
+      const selected = incomeProductSummary(report, productId);
+      const name = $("#incomeProductFilter")?.selectedOptions[0]?.textContent || "Producto seleccionado";
+      const pending = !selected.complete && state.incomeLoading && navigator.onLine;
+      const value = number => pending ? "…" : reportNumber(number);
+      const amount = number => pending ? "…" : money(number);
+      const scope = pending ? "Completando todas las facturas del periodo…" : selected.complete ? name : name + (navigator.onLine ? " · historial parcial; actualiza para completar" : " · copia parcial sin conexión");
+      kpis.innerHTML = '<article class="income-kpi is-product"><span>' + icon("package",19) + ' Unidades vendidas</span><strong>' + value(selected.quantity) + '</strong><small>' + escapeHTML(scope) + '</small></article>'
+        + '<article class="income-kpi is-product"><span>' + icon("circle-dollar-sign",19) + ' Vendido del producto</span><strong>' + amount(selected.income) + '</strong><small>Solo sus líneas; sin propinas ni otros productos</small></article>'
+        + '<article class="income-kpi is-product"><span>' + icon("trending-up",19) + ' Ganancia del producto</span><strong>' + amount(selected.profit) + '</strong><small>Costo: ' + amount(selected.cost) + '</small></article>';
+    }
+    payments.hidden = productFiltered;
     payments.innerHTML = [
       ["cash", "banknote", "Efectivo"],
       ["transfer", "landmark", "Transferencia"],
@@ -8803,6 +8976,7 @@ const App = (() => {
       const typeText = incomeSaleTypeLabel(filters.saleType);
       summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)} · ${escapeHTML(typeText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
     }
+    if (summaryTarget && productFiltered) summaryTarget.innerHTML += ' · <strong>Producto: ' + escapeHTML($("#incomeProductFilter")?.selectedOptions[0]?.textContent || productId) + '</strong> · Las facturas conservan su desglose completo.';
     const rowRenderers = allRecords.length
       ? visibleRecords.map((record) => () => {
           const paymentBadges = (record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
@@ -8842,6 +9016,12 @@ const App = (() => {
       return false;
     }
     const filters = incomeFiltersFromForm();
+    const needsPendingPages = report => {
+      const edits = new Set(readAppsScriptOutbox().filter(job => job.action === "edit_sale")
+        .map(job => String(job.payload?.invoice?.id || job.payload?.invoice?.sessionId || "")));
+      const loaded = new Set((report.records || []).map(record => String(record.saleId)));
+      return (report.recordRows || []).some(row => edits.has(String(row.saleId)) && !loaded.has(String(row.saleId)));
+    };
     if (filters.dateFrom > filters.dateTo) {
       toast("La fecha inicial no puede ser posterior a la fecha final.", "error", "invalid-income-range");
       return false;
@@ -8855,6 +9035,8 @@ const App = (() => {
     }
     if (!navigator.onLine && !verifiedConnection) {
       state.incomeAwaitingRemote = false;
+      const currentReport = state.incomeReport;
+      const matchesCurrent = currentReport?.filters && JSON.stringify(currentReport.filters) === JSON.stringify(filters);
       const cached = readLocalJson(INCOME_REPORT_CACHE_KEY, null);
       const matchesCache = cached?.filters && (JSON.stringify(cached.filters) === JSON.stringify(filters)
         || ((cached.report?.records || []).length >= Number(cached.report?.totalRecords || 0)
@@ -8862,7 +9044,7 @@ const App = (() => {
         && Array.isArray(cached.report?.records);
       state.incomeReport = matchesCache
         ? { ...mergeIncomeReport(cached.report, filters), localOnly: true }
-        : localIncomeReport(filters);
+        : matchesCurrent ? { ...mergeIncomeReport(currentReport, filters), localOnly: true } : localIncomeReport(filters);
       state.syncFresh.sales = false;
       renderIncomeReport();
       if (!state.offlineSalesProbeBusy) {
@@ -8907,7 +9089,10 @@ const App = (() => {
               state.incomeReloadRequested = true;
               return false;
             }
-            state.incomeReport = mergeIncomeReport(cached.report, filters);
+            const productReport = (state.incomeProductFilter && state.incomeProductFilter !== "all") || needsPendingPages(cached.report)
+              ? await completeIncomeSaleTypeReport(cached.report, { ...filters, complete: true }, requestId) : cached.report;
+            if (requestId !== state.incomeRequestId) return false;
+            state.incomeReport = mergeIncomeReport(productReport, filters);
             state.incomeRevision = cached.report.revision;
             state.incomeFetchedAt = Date.now();
             state.syncFresh.sales = true;
@@ -8924,7 +9109,7 @@ const App = (() => {
       if (filters.startAt && result.intervalApplied !== true) throw new Error("Publica la actualización de turnos en Apps Script para consultar este horario.");
       if (result.stale || !Array.isArray(result.records) || !result.totals) throw new Error("El historial remoto no quedó confirmado; se reintentará.");
       if (requestId !== state.incomeRequestId) return false;
-      if (filters.saleType && filters.saleType !== "all") result = await completeIncomeSaleTypeReport(result, filters, requestId);
+      if ((filters.saleType && filters.saleType !== "all") || (state.incomeProductFilter && state.incomeProductFilter !== "all") || needsPendingPages(result)) result = await completeIncomeSaleTypeReport(result, { ...filters, complete: true }, requestId);
       if (requestId !== state.incomeRequestId) return false;
       if (JSON.stringify(filters) !== JSON.stringify(incomeFiltersFromForm())) {
         state.incomeReloadRequested = true;
@@ -8950,8 +9135,9 @@ const App = (() => {
       state.incomeLoading = false;
       state.syncFresh.sales = false;
       state.incomeAwaitingRemote = false;
-      if (background && previousReport) {
-        state.incomeReport = { ...previousReport, localOnly: true };
+      if (previousReport && !filtersChanged) {
+        state.incomeReport = { ...previousReport, localOnly: true, error: String(error?.message || error) };
+        state.incomeFetchedAt = Date.now();
         if (state.activeAdminSection === "income") { renderIncomeReport(); setIncomeReportStatus("Última copia disponible", "warning", "hard-drive"); }
         return false;
       }
@@ -9003,6 +9189,11 @@ const App = (() => {
       }
     }
     if (state.confirmedReportSyncBusy) return false;
+    if (canCheckIncome && state.activeAdminSection === "income" && !state.incomeLoading
+      && (state.incomeReport?.localOnly || state.incomeAwaitingRemote || state.syncFresh?.sales === false)
+      && now - Number(state.incomeFetchedAt || 0) >= 5000) {
+      return loadIncomeReport({ background: Boolean(state.incomeReport), force: true });
+    }
     if (state.backgroundReportSyncBusy) return false;
     if (!force && now - state.backgroundReportCheckedAt < 1500) return false;
     state.backgroundReportSyncBusy = true;
@@ -9094,6 +9285,8 @@ const App = (() => {
       lastPaidReceipt: state.lastPaidReceipt
     };
 
+    const movementMirrorBefore = section === "movements" ? JSON.parse(JSON.stringify(reportMirror())) : null;
+
     try {
       if (section === "inventory") {
         state.items = [];
@@ -9111,6 +9304,14 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
+        state.movementHasMore = false;
+        state.movementCursor = null;
+        state.completeMovementRevision = "";
+        const mirror = reportMirror();
+        mirror.movements = {};
+        Object.values(mirror.sales || {}).forEach(invoice => { if (invoice.reportMutation) invoice.reportMovementSettled = true; });
+        mirror.movementsClearAt = new Date().toISOString();
+        if (!await saveReportSyncValue(reportMirrorKey(), mirror)) throw new Error("No se pudo proteger el reinicio de movimientos. Intenta de nuevo.");
         state.inventoryMovements = [];
         state.movementSearch = "";
         state.movementTypeFilter = "all";
@@ -9147,6 +9348,8 @@ const App = (() => {
         renderMenuManager();
       }
       if (section === "movements") {
+        state.reportMirror = movementMirrorBefore;
+        await saveReportSyncValue(reportMirrorKey(), movementMirrorBefore);
         state.inventoryMovements = snapshot.inventoryMovements;
         persistInventoryMovements();
         renderInventoryMovements();
@@ -10524,8 +10727,7 @@ const App = (() => {
 
   const reflectInvoiceInIncomeReport = (invoice) => {
     const filters = incomeFiltersFromForm();
-    const localRecord = localIncomeRecords(filters)
-      .find((record) => String(record.saleId) === String(invoice.id || invoice.sessionId));
+    const localRecord = localIncomeRecords(filters, [invoice])[0];
     if (!localRecord) return;
     state.incomeRequestId = Number(state.incomeRequestId || 0) + 1;
     state.incomeLoading = false;
@@ -10533,16 +10735,26 @@ const App = (() => {
       state.incomeReport = localIncomeReport(filters);
       return;
     }
-    const records = [
-      localRecord,
-      ...(state.incomeReport.records || []).filter((record) => String(record.saleId) !== String(localRecord.saleId))
-    ].sort((left, right) => String(right.date).localeCompare(String(left.date)));
+    if (JSON.stringify(state.incomeReport.filters) !== JSON.stringify(filters)) {
+      state.incomeReport = localIncomeReport(filters);
+      state.incomeReport.localOnly = true;
+      return;
+    }
+    const previous = (state.incomeReport.records || []).find(record => String(record.saleId) === String(localRecord.saleId));
+    const added = incomeTotalsFromRecords([localRecord]);
+    const removed = incomeTotalsFromRecords(previous ? [previous] : []);
+    const totals = { ...state.incomeReport.totals };
+    for (const key of Object.keys(added)) {
+      if (key !== "averageTicket") totals[key] = Number(totals[key] || 0) + added[key] - removed[key];
+    }
+    totals.averageTicket = totals.sales ? totals.income / totals.sales : 0;
+    const records = [localRecord, ...(state.incomeReport.records || []).filter(record => String(record.saleId) !== String(localRecord.saleId))];
     state.incomeReport = {
       ...state.incomeReport,
       filters,
       records,
-      totals: incomeTotalsFromRecords(records),
-      totalRecords: Math.max(Number(state.incomeReport.totalRecords || 0) + 1, records.length),
+      totals,
+      totalRecords: Math.max(Number(state.incomeReport.totalRecords || 0) + (previous ? 0 : 1), records.length),
       pendingCount: Number(state.incomeReport.pendingCount || 0) + 1
     };
   };
@@ -12252,10 +12464,17 @@ const App = (() => {
       state.serviceTableZoneFilter = event.currentTarget.value || "all";
       renderServiceTables();
     });
+    bindIncomeProductPicker();
+    $("#incomeProductFilter")?.addEventListener("change", applyIncomeProductFilter);
+    $("#clearIncomeProduct")?.addEventListener("click", () => {
+      $("#incomeProductFilter").value = "all";
+      applyIncomeProductFilter();
+    });
     bindMovementProductPicker();
     $("#movementProductFilter")?.addEventListener("change", event => {
       state.movementProductFilter = event.currentTarget.value || "all";
       renderInventoryMovements();
+      if (state.movementProductFilter !== "all" && navigator.onLine) void loadSelectedMovementHistory();
     });
     $("#exportPurchasesPdf")?.addEventListener("click", () => void exportPurchasesPdf());
     $("#movementSearch")?.addEventListener("input", (event) => {

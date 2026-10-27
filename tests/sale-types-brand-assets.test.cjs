@@ -71,8 +71,8 @@ test('Combina las ventas individuales pendientes y remotas con totales exactos',
     { action: 'record_sale', payload: { invoice: { id: 'local-table' } } }
   ] });
   f.state.inventoryMeta = {};
-  f.state.invoiceHistory = [{ id: 'local-individual', table: 'Cliente', saleChannel: 'walk_in', totals: { total: 15000 }, payments: [{ method: 'cash', amount: 15000 }] },
-    { id: 'local-table', table: 'Mesa 2', totals: { total: 30000 }, payments: [{ method: 'cash', amount: 30000 }] }];
+  f.state.invoiceHistory = [{ id: 'local-individual', table: 'Cliente', saleChannel: 'walk_in', createdAt: '2026-10-09T15:00:00Z', items: [], totals: { total: 15000 }, payments: [{ method: 'cash', amount: 15000 }] },
+    { id: 'local-table', table: 'Mesa 2', createdAt: '2026-10-09T15:00:00Z', items: [], totals: { total: 30000 }, payments: [{ method: 'cash', amount: 30000 }] }];
   vm.runInContext(section('localIncomeRecords', 'localIncomeReport') + section('mergeIncomeReport', 'setIncomeReportStatus') + ';globalThis.merge = mergeIncomeReport;', f);
   const records = [{ saleId: 'remote-individual', table: 'Venta individual', total: 10000, payments: [{ method: 'transfer', amount: 10000 }] },
     { saleId: 'remote-table', table: 'Mesa 1', total: 50000, payments: [{ method: 'cash', amount: 50000 }] }];

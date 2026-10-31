@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261021-inventory-remote-v1">
+    <link rel="stylesheet" href="style.css?v=20261030-balance-eye-v1">
     <link rel="stylesheet" href="menu-cards.css?v=20261019-visual-details-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
@@ -97,7 +97,7 @@
         <article class="metric-card"><span>Mesas</span><strong id="metricTables">0</strong></article>
         <article class="metric-card urgent"><span>Llamados</span><strong id="metricAlerts">0</strong></article>
         <article class="metric-card"><span>Cuentas</span><strong id="metricOpen">0</strong></article>
-        <article class="metric-card"><span>Abierto</span><strong id="metricSales">$0</strong></article>
+        <article class="metric-card metric-open-balance"><div class="metric-label-row"><span>Abierto</span><button class="metric-balance-toggle" id="toggleOpenBalance" type="button" aria-label="Ocultar saldo abierto" aria-controls="metricSales" aria-pressed="false" title="Ocultar saldo abierto"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></button></div><strong id="metricSales">$0</strong></article>
       </section>
 
       <section class="admin-grid" data-admin-section="dashboard">
@@ -939,6 +939,6 @@
     <script defer src="vendor/jspdf.umd.min.js"></script>
     <script defer src="sales-shift.js?v=20261027-today-shift-v2"></script>
     <script defer src="menu-cards.js?v=20261019-visual-details-v1"></script>
-    <script defer src="app.js?v=20261027-today-shift-v2"></script>
+    <script defer src="app.js?v=20261030-balance-eye-v1"></script>
   </body>
 </html>

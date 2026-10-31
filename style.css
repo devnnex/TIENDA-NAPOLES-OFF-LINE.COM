@@ -1119,6 +1119,12 @@ button:hover, .primary:hover, .ghost:hover, .icon-btn:hover, .chip:hover {
   color: var(--red);
 }
 
+.metric-label-row { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+.metric-balance-toggle { width: 32px; height: 32px; display: inline-grid; place-items: center; flex: 0 0 auto; padding: 0; margin: -7px -5px -7px 0; border: 0; border-radius: 50%; color: #574719; background: transparent; cursor: pointer; }
+.metric-balance-toggle:hover { background: rgba(87, 71, 25, .1); }
+.metric-balance-toggle:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.metric-open-balance.is-balance-hidden #metricSales { letter-spacing: .12em; }
+
 .admin-grid {
   display: grid;
   grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);

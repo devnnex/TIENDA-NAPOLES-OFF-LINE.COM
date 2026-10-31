@@ -5651,6 +5651,26 @@ const App = (() => {
     state.lastRequestBadgeCount = count;
   };
 
+  const OPEN_BALANCE_PRIVACY_KEY = "napoles_offline_open_balance_hidden_v1";
+  let openBalanceHidden = false;
+  try { openBalanceHidden = localStorage.getItem(OPEN_BALANCE_PRIVACY_KEY) === "1"; } catch (_) { /* La preferencia funciona en memoria si no hay almacenamiento. */ }
+  let openBalanceValue = 0;
+  const renderOpenBalance = (amount = openBalanceValue) => {
+    openBalanceValue = amount;
+    const value = $("#metricSales"), button = $("#toggleOpenBalance");
+    if (!value || !button) return;
+    value.textContent = openBalanceHidden ? "******" : money(amount);
+    value.setAttribute("aria-label", openBalanceHidden ? "Saldo abierto oculto" : "Saldo abierto: " + money(amount));
+    value.closest(".metric-open-balance")?.classList.toggle("is-balance-hidden", openBalanceHidden);
+    const label = openBalanceHidden ? "Mostrar saldo abierto" : "Ocultar saldo abierto";
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    button.setAttribute("aria-pressed", String(openBalanceHidden));
+    button.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${openBalanceHidden
+      ? '<path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 5.2A11.2 11.2 0 0 1 12 5c6.4 0 10 7 10 7a19 19 0 0 1-3.2 4.1M6.2 6.2A20 20 0 0 0 2 12s3.6 7 10 7a11 11 0 0 0 5.8-1.8"/>'
+      : '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>'}</svg>`;
+  };
+
   const renderAdminShell = () => {
     renderBrand();
     syncTipFeatureVisibility();
@@ -5664,7 +5684,7 @@ const App = (() => {
     $("#metricTables").textContent = totals.tables;
     $("#metricAlerts").textContent = totals.alerts;
     $("#metricOpen").textContent = totals.open;
-    $("#metricSales").textContent = money(totals.sales);
+    renderOpenBalance(totals.sales);
     updateNavRequestBadge();
   };
 
@@ -12092,6 +12112,11 @@ const App = (() => {
   };
 
   const bindAdmin = () => {
+    $("#toggleOpenBalance")?.addEventListener("click", () => {
+      openBalanceHidden = !openBalanceHidden;
+      try { localStorage.setItem(OPEN_BALANCE_PRIVACY_KEY, openBalanceHidden ? "1" : "0"); } catch (_) { /* La preferencia se mantiene en memoria. */ }
+      renderOpenBalance();
+    });
     $("#businessForm")?.addEventListener("input",event=>{
       if (["business_name","subtitle","accent_color"].includes(event.target.name)) {
         state.businessFormDirty = true;

@@ -6472,7 +6472,8 @@ const App = (() => {
     try {
       const existing = state.sessions.find((session) => isLocalWalkInSession(session) && session.status === "open");
       if (existing) {
-        openPaymentDialog(existing.id);
+        if (existing.consumption_draft) openConsumptionDialog(existing.id, { quickCheckout: true });
+        else openPaymentDialog(existing.id);
         return;
       }
       const openedAt = new Date().toISOString();
@@ -8399,7 +8400,8 @@ const App = (() => {
     for (const event of ["online", "focus"]) window.addEventListener(event, () => { refreshSalesShiftRange(); void syncSalesShift(); });
   };
 
-  const incomeRangeDates = (preset = "today") => preset === "shift"
+  const incomeRangeDates = (preset = "today") => preset === "all"
+    ? { dateFrom: "1900-01-01", dateTo: "9999-12-31" } : preset === "shift"
     ? SalesShift.shiftRange((state.salesShiftHistory || []).find((item) => item.id === state.selectedSalesShiftId)) || SalesShift.range("today", state.salesShift, new Date(), state.salesShiftHistory)
     : SalesShift.range(preset, state.salesShift, new Date(), state.salesShiftHistory);
 
@@ -8415,7 +8417,12 @@ const App = (() => {
     const from = $("#incomeDateFrom");
     const to = $("#incomeDateTo");
     if (!from || !to) return;
-    if (!from.value || !to.value) {
+    if (state.incomeRangePreset === "all") {
+      state.incomeAppliedRange = incomeRangeDates("all");
+      markIncomeRangePreset();
+      return;
+    }
+    if (!state.incomeAppliedRange && (!from.value || !to.value)) {
       const range = incomeRangeDates(state.incomeRangePreset);
       from.value = range.dateFrom;
       to.value = range.dateTo;
@@ -8429,12 +8436,12 @@ const App = (() => {
     const to = $("#incomeDateTo");
     if (!from || !to) return;
     state.incomeRangePreset = preset;
-    from.value = range.dateFrom;
-    to.value = range.dateTo;
+    from.value = preset === "all" ? "" : range.dateFrom;
+    to.value = preset === "all" ? "" : range.dateTo;
     state.incomeAppliedRange = range;
     state.salesShiftRangeSignature = JSON.stringify(range);
     window.clearTimeout(state.salesShiftBoundaryTimer);
-    if (preset !== "shift") {
+    if (preset !== "shift" && preset !== "all") {
       const now = Date.now();
       const starts = preset === "today" ? [...(state.salesShiftHistory || []), state.salesShift]
         .map(shift => SalesShift.bounds(shift)?.start).filter(start => start > now) : [];
@@ -8450,13 +8457,13 @@ const App = (() => {
     initializeIncomeFilters();
     const current = state.incomeRangePreset && state.incomeRangePreset !== "custom" ? incomeRangeDates(state.incomeRangePreset) : null;
     if (current) {
-      $("#incomeDateFrom").value = current.dateFrom;
-      $("#incomeDateTo").value = current.dateTo;
+      $("#incomeDateFrom").value = state.incomeRangePreset === "all" ? "" : current.dateFrom;
+      $("#incomeDateTo").value = state.incomeRangePreset === "all" ? "" : current.dateTo;
       state.incomeAppliedRange = current;
     }
     return {
-      dateFrom: $("#incomeDateFrom")?.value || dateInputValue(new Date()),
-      dateTo: $("#incomeDateTo")?.value || dateInputValue(new Date()),
+      dateFrom: $("#incomeDateFrom")?.value || "1900-01-01",
+      dateTo: $("#incomeDateTo")?.value || "9999-12-31",
       ...(current || {}),
       paymentMethod: $("#incomePaymentMethod")?.value || "all",
       saleType: $("#incomeSaleType")?.value || "all",
@@ -8526,7 +8533,16 @@ const App = (() => {
 
   const previewIncomeSearch = () => {
     const filters = incomeFiltersFromForm();
-    const snapshot = state.incomeSaleTypeSnapshot;
+    let snapshot = state.incomeSaleTypeSnapshot;
+    const term = normalizeText(filters.query || "");
+    const candidates = [snapshot?.report, ...[...(state.incomeReportSnapshots?.values() || [])].reverse()].filter(Boolean);
+    const candidate = candidates.find((report) => {
+      const previous = report.filters || (report === snapshot?.report ? JSON.parse(snapshot.key) : {});
+      return Array.isArray(report.records) && report.records.length >= Number(report.totalRecords || 0)
+        && incomeSaleTypeFiltersKey({ ...previous, query: "" }) === incomeSaleTypeFiltersKey({ ...filters, query: "" })
+        && (!previous.query || term.includes(normalizeText(previous.query)));
+    });
+    if (candidate) snapshot = { key: incomeSaleTypeFiltersKey({ ...filters, query: "" }), report: candidate };
     if (!snapshot || snapshot.key !== incomeSaleTypeFiltersKey({ ...filters, query: "" })
       || !Array.isArray(snapshot.report.records)
       || snapshot.report.records.length < Number(snapshot.report.totalRecords || 0)) return false;
@@ -8808,8 +8824,9 @@ const App = (() => {
       state.incomeRenderedShiftSignature = shiftSignature;
       return;
     }
+    const product = incomeProductSummary(report);
     const totals = report.totals || {};
-    const allRecords = Array.isArray(report.records) ? report.records : [];
+    const allRecords = product ? product.records : Array.isArray(report.records) ? report.records : [];
     const visibleRecords = allRecords.slice(0, state.incomeVisibleCount);
     const margin = Number(totals.income || 0) > 0 ? Number(totals.profit || 0) / Number(totals.income) * 100 : 0;
     const infoButton = (label, explanation) => `<button class="income-kpi-info" type="button" aria-label="Qué significa ${escapeHTML(label)}" data-tooltip="${escapeHTML(explanation)}">${icon("info", 15)}</button>`;
@@ -8819,6 +8836,16 @@ const App = (() => {
         <article class="income-kpi is-primary">${infoButton("Dinero vendido", "Todo el dinero cobrado en las ventas de este periodo.")}<span>${icon("circle-dollar-sign", 19)} Dinero vendido</span><strong>${money(totals.income)}</strong><small>Total vendido en el periodo seleccionado</small></article>
         <article class="income-kpi is-profit">${infoButton("Ganancia aproximada", "Lo que queda al restar del dinero vendido el costo de los productos.")}<span>${icon("trending-up", 19)} Ganancia aproximada</span><strong>${money(totals.profit)}</strong><small>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% del dinero vendido</small></article>
         <article class="income-kpi">${infoButton("Costo de los productos", "Lo que el negocio pagó por los productos que ya vendió.")}<span>${icon("package-search", 19)} Costo de los productos</span><strong>${money(totals.cost)}</strong><small>Valor de compra de lo que se vendió</small></article>`;
+    if (product) {
+      const complete = product.complete;
+      const value = (amount, units = false) => complete ? (units ? amount.toLocaleString("es-CO", { maximumFractionDigits: 2 }) : money(amount)) : "—";
+      const detail = complete ? `${product.sales.toLocaleString("es-CO")} ventas con este producto` : "Completando todas las ventas del producto…";
+      kpis.innerHTML = `
+        <article class="income-kpi is-product"><span>${icon("package", 19)} Unidades vendidas</span><strong>${value(product.quantity, true)}</strong><small>${escapeHTML(detail)}</small></article>
+        <article class="income-kpi is-product"><span>${icon("circle-dollar-sign", 19)} Dinero del producto</span><strong>${value(product.income)}</strong><small>Solo los productos que coinciden con la búsqueda</small></article>
+        <article class="income-kpi is-product"><span>${icon("trending-up", 19)} Ganancia del producto</span><strong>${value(product.profit)}</strong><small>Costo de los productos: ${value(product.cost)}</small></article>`;
+    }
+    payments.hidden = Boolean(product);
     payments.innerHTML = [
       ["cash", "banknote", "Efectivo"],
       ["transfer", "landmark", "Transferencia"],
@@ -8829,25 +8856,25 @@ const App = (() => {
     if (summaryTarget) {
       const methodText = filters.paymentMethod === "all" ? "todos los medios" : incomePaymentLabel(filters.paymentMethod);
       const typeText = incomeSaleTypeLabel(filters.saleType);
-      summaryTarget.innerHTML = `${icon("calendar-range", 15)} <strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong> · ${escapeHTML(methodText)} · ${escapeHTML(typeText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
+      summaryTarget.innerHTML = `${icon("calendar-range", 15)} ${filters.dateFrom === "1900-01-01" && filters.dateTo === "9999-12-31" ? "<strong>Todo el historial</strong>" : `<strong>${escapeHTML(filters.dateFrom)}</strong> a <strong>${escapeHTML(filters.dateTo)}</strong>`} · ${escapeHTML(methodText)} · ${escapeHTML(typeText)}${filters.query ? ` · Búsqueda: “${escapeHTML(filters.query)}”` : ""}${filters.startAt ? ` · ${escapeHTML(formatIncomeDate(filters.startAt))} — ${escapeHTML(formatIncomeDate(filters.endAt))}` : ""}`;
     }
     const rowRenderers = allRecords.length
       ? visibleRecords.map((record) => () => {
-          const paymentBadges = (record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
+          const paymentBadges = (product ? [] : record.payments || []).map((payment) => `<span>${escapeHTML(incomePaymentLabel(payment.method))} <strong>${money(payment.amount)}</strong></span>`).join("");
           const itemRows = (record.items || []).map((item) => `<li><span>${Number(item.quantity || 0).toLocaleString("es-CO", { maximumFractionDigits: 2 })} × ${escapeHTML(item.name)}</span><strong>${money(item.total)}</strong></li>`).join("");
           return `<article class="income-record">
             <div class="income-record-main">
               <div class="income-record-invoice"><span>${escapeHTML(record.invoice || "Factura")}</span><small>${escapeHTML(formatIncomeDate(record.date))}</small><div class="income-record-actions"><button class="icon-btn" type="button" data-print-income="${escapeHTML(record.saleId)}" aria-label="Imprimir factura" title="Imprimir factura">${icon("printer", 15)}</button><button class="icon-btn" type="button" data-edit-income="${escapeHTML(record.saleId)}" aria-label="Editar venta">${icon("pencil", 15)}</button><button class="icon-btn danger" type="button" data-delete-income="${escapeHTML(record.saleId)}" aria-label="Eliminar venta completa">${icon("trash-2", 15)}</button></div></div>
               <div><small class="income-sale-type" data-sale-type="${incomeRecordSaleType(record)}">${escapeHTML(incomeSaleTypeLabel(incomeRecordSaleType(record)))}</small><strong>${escapeHTML(record.table || "Mesa")}</strong><span>${escapeHTML(record.payer || "Sin responsable")}</span></div>
               <div><small>Atendido por</small><strong>${escapeHTML(record.waiter || "Sin asignar")}</strong><span>${escapeHTML(record.reference || "Sin referencia")}</span></div>
-              <div class="income-record-total"><small>Total</small><strong>${money(record.total)}</strong><span class="income-record-profit">Ganancia ${money(record.profit)}</span></div>
+              <div class="income-record-total"><small>${product ? "Total del producto" : "Total"}</small><strong>${money(record.total)}</strong><span class="income-record-profit">Ganancia ${money(record.profit)}</span></div>
             </div>
-            <div class="income-payment-badges">${paymentBadges || "<span>Medio no registrado</span>"}</div>
+            <div class="income-payment-badges"${product ? " hidden" : ""}>${paymentBadges || "<span>Medio no registrado</span>"}</div>
             <details>
               <summary>${icon("list-collapse", 15)} Ver productos y desglose</summary>
               <div class="income-record-detail">
                 <ul>${itemRows || "<li><span>Sin detalle de productos</span></li>"}</ul>
-                <dl class="income-total-only"><div><dt>Total pagado</dt><dd>${money(record.total)}</dd></div></dl>
+                <dl class="income-total-only"><div><dt>${product ? "Total del producto" : "Total pagado"}</dt><dd>${money(record.total)}</dd></div></dl>
               </div>
             </details>
           </article>`;
@@ -8862,6 +8889,35 @@ const App = (() => {
     state.incomeRenderedReport = report;
     state.incomeRenderedShiftSignature = shiftSignature;
     refreshIcons();
+  };
+
+  // Product analysis is a view: original invoices remain available for printing/editing.
+  const incomeProductSummary = (report, query = report?.filters?.query) => {
+    if (!String(query || "").trim()) return null;
+    const term = normalizeText(query);
+    const records = report.allLocalRecords || report.records || [];
+    const names = new Set((state.items || []).map((item) => normalizeText(item.name || "")));
+    records.forEach((record) => (record.items || []).forEach((item) => names.add(normalizeText(item.name || ""))));
+    const exact = names.has(term);
+    const matches = (item) => exact ? normalizeText(item.name || "") === term : normalizeText(item.name || "").includes(term);
+    if (![...names].some((name) => exact ? name === term : name.includes(term))) return null;
+    const summary = { quantity: 0, income: 0, cost: 0, profit: 0, sales: 0, records: [],
+      complete: records.length >= Number(report.totalRecords || 0) };
+    for (const record of records) {
+      const items = (record.items || []).filter(matches);
+      if (!items.length) continue;
+      let quantity = 0, total = 0, cost = 0;
+      for (const item of items) {
+        quantity += Number(item.quantity || 0);
+        total += Number(item.total ?? Number(item.quantity || 0) * Number(item.unitPrice || 0));
+        cost += Number(item.cost || 0);
+      }
+      summary.quantity += quantity; summary.income += total; summary.cost += cost;
+      summary.sales += 1;
+      summary.records.push({ ...record, items, total, cost, profit: total - cost });
+    }
+    summary.profit = summary.income - summary.cost;
+    return summary;
   };
 
   const loadIncomeReport = async ({ background = false, force = false, manual = false, verifiedConnection = false } = {}) => {
@@ -8955,7 +9011,7 @@ const App = (() => {
       const editIds = new Set(readAppsScriptOutbox().filter(job => job.action === "edit_sale").map(job => String(job.payload?.invoice?.id || "")));
       const loaded = new Set(result.records.map(record => String(record.saleId)));
       const pendingPages = (result.recordRows || []).some(row => editIds.has(String(row.saleId)) && !loaded.has(String(row.saleId)));
-      if ((filters.saleType && filters.saleType !== "all") || pendingPages) result = await completeIncomeSaleTypeReport(result, { ...filters, complete: true }, requestId);
+      if ((filters.saleType && filters.saleType !== "all") || (filters.query && result.records.length < Number(result.totalRecords || 0)) || pendingPages) result = await completeIncomeSaleTypeReport(result, { ...filters, complete: true }, requestId);
       if (requestId !== state.incomeRequestId) return false;
       if (key !== JSON.stringify(incomeFiltersFromForm())) { state.incomeReloadRequested = true; return false; }
       state.incomeLoading = false;
@@ -10511,8 +10567,10 @@ const App = (() => {
     $("#paymentTotal").textContent = money(total);
     const paymentLines = $("#paymentSaleLines");
     if (paymentLines) paymentLines.innerHTML = activeItems.length
-      ? activeItems.map((item) => `<div class="${quickSale && state.individualProductFlashes?.get(item) > Date.now() ? "consumption-just-added" : ""}"><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("")
+      ? activeItems.map((item) => `<div${quickSale ? ` data-edit-walk-in-item="${escapeHTML(item.id)}" title="Doble clic para editar este producto"` : ""} class="${quickSale && state.individualProductFlashes?.get(item) > Date.now() ? "consumption-just-added" : ""}"><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("")
       : '<p class="payment-empty-sale">Agrega el producto para continuar con el cobro.</p>';
+    const exitButton = dialog.querySelector(".dialog-actions [data-cancel-payment], .modal-actions [data-cancel-payment]");
+    if (exitButton) exitButton.textContent = quickSale ? "Guardar y salir" : "Cancelar";
     const addItemButton = $("#paymentAddItem");
     if (addItemButton) {
       addItemButton.hidden = !quickSale;
@@ -10544,8 +10602,8 @@ const App = (() => {
     const session = state.sessions.find((entry) => entry.id === sessionId);
     $("#paymentDialog")?.close();
     if (isLocalWalkInSession(session)) {
-      discardLocalWalkInSession(sessionId);
-      toast("Venta individual cancelada. El inventario no fue modificado.", "ok", `walk-in-cancelled:${sessionId}`);
+      if (session.consumption_draft || (session.session_items || []).some((item) => item.status !== "cancelled")) persistWalkInDrafts();
+      else discardLocalWalkInSession(sessionId);
     }
   };
 
@@ -11021,6 +11079,22 @@ const App = (() => {
     }
   };
 
+  const saveWalkInConsumptionDraft = () => {
+    const form = $("#consumptionForm");
+    if (!$("#consumptionDialog")?.open || !form || form.quick_checkout.value !== "1"
+      || form.session_item_id.value || form.dataset.localSubmitInProgress === "1") return;
+    const session = state.sessions.find((entry) => entry.id === form.session_id.value);
+    if (!isLocalWalkInSession(session)) return;
+    const fields = Object.fromEntries(["menu_item_id", "item_name", "quantity", "unit_price", "notes", "payer_name"]
+      .map((name) => [name, form[name].value]));
+    const search = $("#consumptionProductSearch")?.value || "";
+    if (state.consumptionDrafts.length || fields.menu_item_id || fields.item_name || fields.quantity || search) {
+      session.consumption_draft = { drafts: state.consumptionDrafts.map((draft) => ({ ...draft })),
+        editIndex: state.consumptionDraftEditIndex ?? -1, fields, search };
+    } else delete session.consumption_draft;
+    persistWalkInDrafts();
+  };
+
   const renderConsumptionSelection = () => {
     const box = $("#consumptionSelection");
     const lines = $("#consumptionSelectionLines");
@@ -11035,10 +11109,45 @@ const App = (() => {
     count.textContent = `${drafts.length} ${drafts.length === 1 ? "producto" : "productos"}`;
     total.textContent = money(drafts.reduce((sum, draft) => sum + draft.quantity * draft.unitPrice, 0));
     if (priceWarning) priceWarning.hidden = !hasEditedPrice;
-    lines.innerHTML = drafts.map((draft, index) => `<div class="${state.individualProductFlashes?.get(draft) > Date.now() ? "consumption-just-added" : ""}"><span><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong${canEditPrice ? ` class="consumption-draft-price" data-edit-consumption-draft="${index}" title="Doble clic para editar el precio unitario"` : ""}>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
+    lines.innerHTML = drafts.map((draft, index) => `<div class="${state.individualProductFlashes?.get(draft) > Date.now() ? "consumption-just-added" : ""}"><span class="consumption-draft-product" data-edit-consumption-product="${index}" title="Doble clic para cambiar este producto"><strong>${escapeHTML(draft.itemName)}</strong><small>${draft.quantity} × ${money(draft.unitPrice)}</small></span><strong${canEditPrice ? ` class="consumption-draft-price" data-edit-consumption-draft="${index}" title="Doble clic para editar el precio unitario"` : ""}>${money(draft.quantity * draft.unitPrice)}</strong><button class="icon-btn danger" type="button" data-remove-consumption-draft="${index}" aria-label="Quitar ${escapeHTML(draft.itemName)}">${icon("x", 15)}</button></div>`).join("");
     const form = $("#consumptionForm");
     if (form) form.quantity.required = drafts.length === 0;
+    updateConsumptionDraftAction();
+    if (typeof saveWalkInConsumptionDraft === "function") saveWalkInConsumptionDraft();
     refreshIcons();
+  };
+
+  const updateConsumptionDraftAction = () => {
+    const queue = $("#consumptionQueueButton");
+    if (!queue) return;
+    queue.innerHTML = state.consumptionDraftEditIndex >= 0
+      ? `${icon("save", 16)} Guardar cambio`
+      : `${icon("list-plus", 16)} Añadir a selección`;
+    refreshIcons();
+  };
+
+  const editConsumptionDraftProduct = (index) => {
+    const draft = state.consumptionDrafts[index];
+    const form = $("#consumptionForm");
+    const search = $("#consumptionProductSearch");
+    if (!draft || !form || !search) return;
+    state.consumptionDraftEditIndex = index;
+    form.menu_item_id.value = draft.menuItemId || "";
+    form.item_name.value = draft.itemName || "";
+    form.quantity.value = draft.quantity || 1;
+    form.notes.value = draft.notes || "";
+    form.payer_name.value = draft.payerName || form.payer_name.value;
+    setCurrencyInputValue(form.unit_price, draft.unitPrice || 0);
+    const product = state.items.find((item) => item.id === draft.menuItemId);
+    search.value = product ? `${inventoryFor(product).code} · ${product.name}` : draft.itemName || "";
+    renderConsumptionProductOptions(product?.name || draft.itemName || "");
+    closeConsumptionProductOptions();
+    updateConsumptionDraftAction();
+    renderConsumptionSelection();
+    window.requestAnimationFrame(() => {
+      search.focus({ preventScroll: true });
+      search.select();
+    });
   };
 
   const editConsumptionDraftPrice = (priceElement) => {
@@ -11112,6 +11221,8 @@ const App = (() => {
     if ($("#consumptionProductSearch")) $("#consumptionProductSearch").value = "";
     renderConsumptionProductOptions("");
     closeConsumptionProductOptions();
+    state.consumptionDraftEditIndex = -1;
+    updateConsumptionDraftAction();
   };
 
   const queueConsumptionDraft = () => {
@@ -11123,7 +11234,8 @@ const App = (() => {
       state.individualProductFlashes ||= new WeakMap();
       state.individualProductFlashes.set(draft, Date.now() + 2200);
     }
-    state.consumptionDrafts.push(draft);
+    if (state.consumptionDraftEditIndex >= 0 && state.consumptionDrafts[state.consumptionDraftEditIndex]) state.consumptionDrafts[state.consumptionDraftEditIndex] = draft;
+    else state.consumptionDrafts.push(draft);
     clearConsumptionEntry(form);
     renderConsumptionSelection();
     window.requestAnimationFrame(() => $("#consumptionProductSearch")?.focus({ preventScroll: true }));
@@ -11423,6 +11535,11 @@ const App = (() => {
         return null;
       }
       confirmed = true;
+      if (quickCheckout) {
+        const session = state.sessions.find((entry) => entry.id === result.sessionId);
+        if (session) delete session.consumption_draft;
+        persistWalkInDrafts();
+      }
       state.consumptionDrafts = [];
       state.consumptionDraftEditIndex = -1;
       renderConsumptionSelection();
@@ -11505,7 +11622,9 @@ const App = (() => {
     form.quantity.required = true;
     applyConsumptionRoleRestrictions(form);
     state.consumptionDrafts = [];
+    state.consumptionDraftEditIndex = -1;
     const session = state.sessions.find((entry) => entry.id === sessionId);
+    const savedDraft = quickCheckout ? session?.consumption_draft : null;
     form.payer_name.value = session?.payer_name || "";
     form.quantity.value = "";
     setCurrencyInputValue(form.unit_price, 0);
@@ -11519,6 +11638,14 @@ const App = (() => {
     const submitLabel = $("#consumptionSubmitButton span");
     if (submitLabel) submitLabel.textContent = quickCheckout ? "Confirmar y cobrar" : "Confirmar selección";
     if ($("#consumptionQueueButton")) $("#consumptionQueueButton").hidden = false;
+    if (savedDraft) {
+      state.consumptionDrafts = (savedDraft.drafts || []).map((draft) => ({ ...draft }));
+      state.consumptionDraftEditIndex = Number.isInteger(savedDraft.editIndex) ? savedDraft.editIndex : -1;
+      Object.entries(savedDraft.fields || {}).forEach(([name, value]) => { if (form[name]) form[name].value = value; });
+      if (productSearch) productSearch.value = savedDraft.search || "";
+    }
+    const exitButton = dialog.querySelector(".dialog-actions [data-cancel-consumption], .modal-actions [data-cancel-consumption]");
+    if (exitButton) exitButton.textContent = quickCheckout ? "Guardar y salir" : "Cancelar";
     renderConsumptionSelection();
     renderTableConsumptionPreview(session);
     renderLastConsumptionTime(session);
@@ -11535,15 +11662,14 @@ const App = (() => {
     if (!form || form.dataset.localSubmitInProgress === "1") return;
     const session = state.sessions.find((entry) => entry.id === form.session_id.value);
     const quickCheckout = form.quick_checkout.value === "1";
-    state.consumptionDrafts = [];
-    renderConsumptionSelection();
+    saveWalkInConsumptionDraft();
     $("#consumptionDialog")?.close();
+    state.consumptionDrafts = [];
+    state.consumptionDraftEditIndex = -1;
+    renderConsumptionSelection();
     if (!quickCheckout || !isLocalWalkInSession(session)) return;
-    const hasItems = (session.session_items || []).some((item) => item.status !== "cancelled");
-    if (hasItems) openPaymentDialog(session.id);
-    else {
+    if (!session.consumption_draft && !(session.session_items || []).some((item) => item.status !== "cancelled")) {
       discardLocalWalkInSession(session.id);
-      toast("Venta individual cancelada.", "ok", `walk-in-cancelled:${session.id}`);
     }
   };
 
@@ -11562,7 +11688,7 @@ const App = (() => {
     form.session_id.value = session.id;
     form.session_item_id.value = item.id;
     form.pending_table_id.value = "";
-    form.quick_checkout.value = "0";
+    form.quick_checkout.value = isLocalWalkInSession(session) ? "1" : "0";
     form.quantity.required = true;
     applyConsumptionRoleRestrictions(form);
     state.consumptionDrafts = [];
@@ -12266,6 +12392,7 @@ const App = (() => {
     $("#incomeSaleType")?.addEventListener("change", applyIncomeSaleTypeFilter);
     [$("#incomeDateFrom"), $("#incomeDateTo")].filter(Boolean).forEach((input) => input.addEventListener("change", () => {
       state.incomeRangePreset = "custom";
+      if (!$("#incomeDateFrom")?.value && !$("#incomeDateTo")?.value) { setIncomeRange("all"); return; }
       markIncomeRangePreset();
       if ($("#incomeDateFrom")?.value && $("#incomeDateTo")?.value) void loadIncomeReport();
     }));
@@ -12357,9 +12484,26 @@ const App = (() => {
         if (submit) submit.disabled = false;
       }
     });
+    let walkInDraftTimer;
+    const scheduleWalkInDraft = () => {
+      window.clearTimeout(walkInDraftTimer);
+      walkInDraftTimer = window.setTimeout(saveWalkInConsumptionDraft, 120);
+    };
+    $("#consumptionForm")?.addEventListener("input", scheduleWalkInDraft);
+    $("#consumptionForm")?.addEventListener("change", scheduleWalkInDraft);
+    window.addEventListener("pagehide", saveWalkInConsumptionDraft);
+    $("#paymentSaleLines")?.addEventListener("dblclick", (event) => {
+      const row = event.target.closest("[data-edit-walk-in-item]");
+      if (!row || state.paymentProcessing) return;
+      const sessionId = $("#paymentForm")?.session_id.value;
+      $("#paymentDialog")?.close();
+      editConsumption(sessionId, row.dataset.editWalkInItem);
+    });
     $("#consumptionSelectionLines")?.addEventListener("dblclick", (event) => {
       const price = event.target.closest("[data-edit-consumption-draft]");
-      if (price) editConsumptionDraftPrice(price);
+      if (price) { editConsumptionDraftPrice(price); return; }
+      const product = event.target.closest("[data-edit-consumption-product]");
+      if (product) editConsumptionDraftProduct(Number(product.dataset.editConsumptionProduct));
     });
     $("#paymentForm")?.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -12447,7 +12591,12 @@ const App = (() => {
           selectConsumptionProduct(selected.dataset.consumptionProduct);
         }
       }
-      if (event.key === "Escape") closeConsumptionProductOptions();
+      if (event.key === "Escape") {
+        if (productSearch.form?.quick_checkout.value === "1") {
+          event.preventDefault();
+          cancelConsumption();
+        } else closeConsumptionProductOptions();
+      }
     });
     $("#consumptionProductOptions")?.addEventListener("click", (event) => {
       const option = event.target.closest("[data-consumption-product]");
@@ -12544,7 +12693,7 @@ const App = (() => {
     // La lista ocupa espacio en el modal. Cerrarla en pointerdown mueve
     // Confirmar antes de mouseup y el navegador pierde el clic.
     document.addEventListener("click", (event) => {
-      if (!event.target.closest("#consumptionProductCombobox")) closeConsumptionProductOptions();
+      if (!event.target.closest("#consumptionProductCombobox, #consumptionSelectionLines")) closeConsumptionProductOptions();
     });
     $("#logoutButton")?.addEventListener("click", logoutAdmin);
 
@@ -12766,7 +12915,10 @@ const App = (() => {
         return;
       }
       if (target.dataset.removeConsumptionDraft !== undefined) {
-        state.consumptionDrafts.splice(Number(target.dataset.removeConsumptionDraft), 1);
+        const removedIndex = Number(target.dataset.removeConsumptionDraft);
+        state.consumptionDrafts.splice(removedIndex, 1);
+        if (state.consumptionDraftEditIndex === removedIndex) clearConsumptionEntry($("#consumptionForm"));
+        else if (state.consumptionDraftEditIndex > removedIndex) state.consumptionDraftEditIndex -= 1;
         renderConsumptionSelection();
       }
       if (target.dataset.minimizeAdminChat) setAdminChatMinimized(target.dataset.minimizeAdminChat, !state.adminChats.get(String(target.dataset.minimizeAdminChat))?.minimized);

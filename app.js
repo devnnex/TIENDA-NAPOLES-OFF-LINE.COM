@@ -8497,7 +8497,7 @@ const App = (() => {
     if (Number(report.totalRecords || 0) > records.size && !Array.isArray(report.recordRows)) {
       throw new Error("El historial no devolvio las paginas necesarias para filtrar todas las ventas.");
     }
-    const concurrency = filters.backendOnly ? 3 : 1;
+    const concurrency = filters.backendOnly ? 4 : 1;
     for (let offset = 0; offset < missing.length; offset += 300 * concurrency) {
       if (requestId !== state.incomeRequestId) return report;
       const requests = [];
@@ -9087,7 +9087,7 @@ const App = (() => {
       let confirmed = null;
       // Retry once if sales changed while the pages were being read.
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const result = await appsScriptRequest("get_income_report", { filters: { ...filters, backendOnly: true } }, APPS_SCRIPT_TIMEOUT_MS);
+        const result = await appsScriptRequest("get_income_report", { filters: { ...filters, backendOnly: true, limit: 500 } }, APPS_SCRIPT_TIMEOUT_MS);
         if (requestId !== state.incomeRequestId) return false;
         if (result?.stale) { if (!attempt) continue; throw new Error("Las ventas cambiaron durante la consulta. Vuelve a buscar."); }
         if (!result?.ok || !Array.isArray(result.records) || !result.totals
@@ -9103,13 +9103,8 @@ const App = (() => {
           const complete = await completeIncomeSaleTypeReport(result, { ...filters, complete: true, backendOnly: true }, requestId);
           if (requestId !== state.incomeRequestId) return false;
           if (complete.records.length !== Number(result.totalRecords)) throw new Error("No se pudieron confirmar todas las ventas del backend.");
-          const status = await appsScriptRequest("status", { backendOnly: true }, 12000);
-          if (requestId !== state.incomeRequestId) return false;
-          if (!status?.ok || typeof status.historyRevision !== "string") throw new Error("No se pudo confirmar la revisión de ventas del backend.");
-          if (status.historyRevision !== result.revision) {
-            if (!attempt) continue;
-            throw new Error("Las ventas cambiaron durante la consulta. Vuelve a buscar.");
-          }
+          // The backend checks its revision before and after every report read.
+          // Each additional page is pinned to that revision; no extra status request is needed.
           confirmed = complete;
           break;
         } catch (error) {

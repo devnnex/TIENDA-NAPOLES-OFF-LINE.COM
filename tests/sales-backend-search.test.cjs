@@ -5,7 +5,7 @@ function between(from,to){const a=source.indexOf('  const '+from+' ='),b=source.
 const filters={dateFrom:'2026-01-01',dateTo:'2026-10-31',paymentMethod:'all',saleType:'all',query:'soda/ginger',limit:300};
 const sale=(id,quantity=1)=>({saleId:id,date:'2026-10-20T12:00:00-05:00',invoice:'TN-'+id,total:quantity*100+900,cost:quantity*20+100,
  profit:quantity*80+800,items:[{name:'SODA/GINGER',quantity,total:quantity*100,cost:quantity*20},{name:'Otro',quantity:1,total:900,cost:100}],payments:[]});
-const report=(records,revision='r1')=>({ok:true,revision,records:records.slice(0,300),recordRows:records.map((row,i)=>({saleId:row.saleId,row:i+2})),totalRecords:records.length,
+const report=(records,revision='r1',limit=300)=>({ok:true,revision,records:records.slice(0,limit),recordRows:records.map((row,i)=>({saleId:row.saleId,row:i+2})),totalRecords:records.length,
  truncated:records.length>300,totals:{income:records.reduce((sum,row)=>sum+row.total,0),cost:0,profit:0,sales:records.length}});
 function harness(rows=[sale('real',32)]){
  const state={page:'admin',activeAdminSection:'income',incomeRequestId:0,invoiceHistory:[{id:'local-fake'}],items:[{id:'p',name:'SODA/GINGER'}],inventoryMeta:{},syncFresh:{},
@@ -26,7 +26,7 @@ function harness(rows=[sale('real',32)]){
    if(handler)return handler(action,payload);
    if(action==='status')return {ok:true,historyRevision:revision};
    if(payload.filters.pageRows)return {ok:true,revision,records:payload.filters.pageRows.map(key=>backendRows.find(row=>row.saleId===key.saleId)).filter(Boolean)};
-   return report(backendRows,revision);
+   return report(backendRows,revision,payload.filters.limit);
   }});
  vm.runInContext(block('normalizeText')+between('filterIncomeReportBySaleType','incomeSaleTypeFiltersKey')+
   between('renderIncomeReport','refreshBackgroundReports')+';globalThis.api={load:loadIncomeReport,summary:incomeProductSummary};',context);
@@ -41,17 +41,27 @@ test('la misma búsqueda consulta otra vez al backend aunque la revisión no cam
  assert.equal(h.calls.filter(call=>call.action==='get_income_report'&&!call.payload.filters.pageRows).length,2);
  assert.ok(h.calls.every(call=>call.payload.backendOnly||call.payload.filters?.backendOnly));
 });
-test('1501 facturas se consultan completas con hasta tres páginas en paralelo, sin mostrar un total parcial',async()=>{
+test('hasta 500 facturas de un producto se confirman con una sola llamada al backend y ninguna lectura adicional de estado',async()=>{
+ for(const count of [0,32,300,450,500]){
+  const h=harness(Array.from({length:count},(_,i)=>sale(String(i))));
+  assert.equal(await h.api.load(),true);assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].action,'get_income_report');assert.equal(h.calls[0].payload.filters.limit,500);
+  assert.equal(h.api.summary(h.state.incomeReport).quantity,count);assert.equal(h.api.summary(h.state.incomeReport).income,count*100);
+ }
+});
+test('1501 facturas se consultan completas con hasta cuatro páginas en paralelo, sin mostrar un total parcial',async()=>{
  const rows=Array.from({length:1501},(_,i)=>sale(String(i))),h=harness(rows);let active=0,peak=0;
  h.setHandler(async(action,payload)=>{
   if(action==='status')return {ok:true,historyRevision:'r1'};
-  if(!payload.filters.pageRows)return report(rows);
+  if(!payload.filters.pageRows)return report(rows,'r1',payload.filters.limit);
   active++;peak=Math.max(peak,active);
   assert.equal(h.state.incomeReport.awaitingBackend,true);assert.doesNotMatch(h.nodes.get('#incomeKpis').innerHTML,/Unidades vendidas/);
   await new Promise(resolve=>setImmediate(resolve));active--;
   return {ok:true,revision:'r1',records:payload.filters.pageRows.map(key=>rows[Number(key.saleId)])};
  });
- assert.equal(await h.api.load(),true);assert.equal(peak,3);
+ assert.equal(await h.api.load(),true);assert.equal(peak,4);
+ assert.equal(h.calls.length,5);
+ assert.equal(h.calls.some(call=>call.action==='status'),false);
  assert.equal(h.api.summary(h.state.incomeReport).quantity,1501);assert.equal(h.api.summary(h.state.incomeReport).income,150100);
  assert.equal(new Set(h.state.incomeReport.records.map(row=>row.saleId)).size,1501);
 });
@@ -74,11 +84,17 @@ test('una página incompleta no se presenta como total y se vuelve a consultar t
  assert.equal(await h.api.load(),false);assert.equal(h.state.incomeReport.awaitingBackend,true);assert.equal(h.state.incomeReport.records.length,0);
  incomplete=false;assert.equal(await h.retry(),true);assert.equal(h.api.summary(h.state.incomeReport).quantity,650);
 });
-test('si las ventas cambian durante la lectura, repite desde el backend antes de confirmar el resultado',async()=>{
- const h=harness();let reads=0;
- h.setHandler(async action=>action==='status'?{ok:true,historyRevision:'r2'}:report([sale('real',++reads===1?26:32)],reads===1?'r1':'r2'));
- assert.equal(await h.api.load(),true);assert.equal(reads,2);assert.equal(h.api.summary(h.state.incomeReport).quantity,32);
+test('si el backend detecta cambios en una página, repite desde el principio antes de confirmar el resultado',async()=>{
+ const rows=Array.from({length:650},(_,i)=>sale(String(i),2)),h=harness(rows);let stale=true;
+ h.setHandler(async(_action,payload)=>{
+  if(!payload.filters.pageRows)return report(rows,stale?'r1':'r2',payload.filters.limit);
+  if(stale){stale=false;return {ok:true,stale:true,records:[]};}
+  return {ok:true,revision:'r2',records:payload.filters.pageRows.map(key=>rows[Number(key.saleId)])};
+ });
+ assert.equal(await h.api.load(),true);assert.equal(h.api.summary(h.state.incomeReport).quantity,1300);
+ assert.equal(h.state.incomeRevision,'r2');assert.equal(h.calls.length,4);
 });
+
 test('una respuesta anterior y un reintento de un filtro abandonado nunca reemplazan la nueva búsqueda',async()=>{
  const h=harness();let release;
  h.setHandler(async(action,payload)=>action==='status'?{ok:true,historyRevision:'r1'}:payload.filters.query==='soda/ginger'?new Promise(resolve=>{release=resolve;}):report([sale('latest',7)]));

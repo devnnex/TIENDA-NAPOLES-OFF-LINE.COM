@@ -48,7 +48,7 @@ async function boot(page,url,{productRanges=false}={}){
    if(request.action==='get_income_report'){
     const filters=request.payload.filters,term=(filters.query||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
     const selected=rows.filter(row=>SalesShift.matches(row.date,filters)&&(!term||[row.invoice,row.table,row.payer,...row.items.map(item=>item.name)].join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().includes(term)));
-    const records=filters.pageRows?filters.pageRows.map(key=>selected.find(row=>row.saleId===key.saleId)):selected.slice(0,300);
+    const records=filters.pageRows?filters.pageRows.map(key=>selected.find(row=>row.saleId===key.saleId)):selected.slice(0,Math.min(500,Number(filters.limit)||300));
     result={ok:true,intervalApplied:true,revision:'same',records,totalRecords:selected.length,recordRows:selected.map((row,i)=>({saleId:row.saleId,row:i+2})),truncated:selected.length>300,
      totals:{income:selected.reduce((sum,row)=>sum+row.total,0),profit:selected.reduce((sum,row)=>sum+row.profit,0),cost:selected.reduce((sum,row)=>sum+row.cost,0),sales:selected.length,cash:selected.reduce((sum,row)=>sum+row.total,0)}};
    }
@@ -67,8 +67,10 @@ test('soda/ginger y otros productos: mes 32, año 58, con consultas al backend y
   page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url,{productRanges:true});
   for(const query of ['soda/ginger','agua','cerveza','café']){
    await page.locator('#incomeSearch').fill(query);
+   await page.waitForFunction(query=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport?.awaitingBackend&&salesApi.state.incomeReport?.filters.query===query,query);
    for(const [range,count,units,money] of [['month',320,32,'32.000'],['year',580,58,'58.000'],['month',320,32,'32.000'],['year',580,58,'58.000']]){
     const before=await page.evaluate(()=>calls.filter(call=>call.action==='get_income_report'&&!call.payload.filters.pageRows).length);
+    const readsBefore=await page.evaluate(()=>calls.filter(call=>call.action==='get_income_report').length);
     await page.locator(`[data-income-range="${range}"]`).click();
     await page.waitForFunction(({query,count,range})=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport?.awaitingBackend&&salesApi.state.incomeRangePreset===range&&salesApi.state.incomeReport?.filters.query===query&&salesApi.state.incomeReport.records.length===count,{query,count,range});
     assert.equal((await page.locator('#incomeKpis .is-product strong').first().innerText()).trim(),String(units),query+' '+range);
@@ -76,6 +78,7 @@ test('soda/ginger y otros productos: mes 32, año 58, con consultas al backend y
     assert.equal(await page.locator('#incomeKpis .is-product').count(),3);
     assert.equal(await page.locator('#incomeSearch').inputValue(),query);
     assert.ok(await page.evaluate(before=>calls.filter(call=>call.action==='get_income_report'&&!call.payload.filters.pageRows).length>before,before),'cada clic consulta de nuevo al backend');
+    assert.equal(await page.evaluate(()=>calls.filter(call=>call.action==='get_income_report').length)-readsBefore,count<=500?1:2,'el mes requiere una petición y el año dos');
    }
   }
   const pages=await page.evaluate(()=>calls.filter(call=>call.action==='get_income_report'&&call.payload.filters.pageRows).length);
@@ -168,6 +171,7 @@ test('venta individual: selección editable, guardar al salir, otra mesa, recarg
    await page.locator('#consumptionForm [name="quantity"]').fill(qty);await page.locator('#consumptionQueueButton').click();
   }
   await page.locator('[data-edit-consumption-product="0"]').dblclick();
+  await page.waitForFunction(()=>document.activeElement===document.querySelector('#consumptionProductSearch'));
   await page.locator('#consumptionForm [name="quantity"]').fill('4');await page.locator('#consumptionQueueButton').click();
   assert.equal(await page.locator('#consumptionSelectionLines > div').count(),2);
   await page.locator('#consumptionProductSearch').fill('Agua');await page.locator('[data-consumption-product="p"]').click();

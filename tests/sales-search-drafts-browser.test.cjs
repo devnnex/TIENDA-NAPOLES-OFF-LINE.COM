@@ -60,7 +60,7 @@ async function boot(page,url,{productRanges=false}={}){
  },productRanges);
 }
 
-test('soda/ginger y otros productos: mes 32, año 58, con paginación, caché y cambios repetidos de rango',async()=>{
+test('soda/ginger y otros productos: mes 32, año 58, con consultas al backend y cambios repetidos de rango',async()=>{
  const session=await launch(),errors=[];
  try{for(const width of [1440,390]){
   const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(15000);
@@ -68,16 +68,58 @@ test('soda/ginger y otros productos: mes 32, año 58, con paginación, caché y 
   for(const query of ['soda/ginger','agua','cerveza','café']){
    await page.locator('#incomeSearch').fill(query);
    for(const [range,count,units,money] of [['month',320,32,'32.000'],['year',580,58,'58.000'],['month',320,32,'32.000'],['year',580,58,'58.000']]){
+    const before=await page.evaluate(()=>calls.filter(call=>call.action==='get_income_report'&&!call.payload.filters.pageRows).length);
     await page.locator(`[data-income-range="${range}"]`).click();
-    await page.waitForFunction(({query,count,range})=>!salesApi.state.incomeLoading&&salesApi.state.incomeRangePreset===range&&salesApi.state.incomeReport?.filters.query===query&&salesApi.state.incomeReport.records.length===count,{query,count,range});
+    await page.waitForFunction(({query,count,range})=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport?.awaitingBackend&&salesApi.state.incomeRangePreset===range&&salesApi.state.incomeReport?.filters.query===query&&salesApi.state.incomeReport.records.length===count,{query,count,range});
     assert.equal((await page.locator('#incomeKpis .is-product strong').first().innerText()).trim(),String(units),query+' '+range);
     assert.match(await page.locator('#incomeKpis .is-product').nth(1).innerText(),new RegExp(money.replace('.','[.,]')));
     assert.equal(await page.locator('#incomeKpis .is-product').count(),3);
     assert.equal(await page.locator('#incomeSearch').inputValue(),query);
+    assert.ok(await page.evaluate(before=>calls.filter(call=>call.action==='get_income_report'&&!call.payload.filters.pageRows).length>before,before),'cada clic consulta de nuevo al backend');
    }
   }
   const pages=await page.evaluate(()=>calls.filter(call=>call.action==='get_income_report'&&call.payload.filters.pageRows).length);
   assert.ok(pages>0,'debe consultar las páginas posteriores a las primeras 300 facturas');
+  await context.close();
+ }assert.deepEqual(errors,[]);}finally{await session.close();}
+});
+
+test('fallos de conexión se recuperan automáticamente y repetir la búsqueda lee ventas nuevas aunque la revisión coincida',async()=>{
+ const session=await launch(),errors=[];
+ try{for(const width of [1440,390]){
+  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
+  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
+  await page.waitForFunction(()=>!salesApi.state.incomeLoading);
+  await page.evaluate(()=>{
+   const backend=window.fetch;window.failuresLeft=2;window.holdBackend=true;window.backendSearchReads=0;
+   window.fetch=async(url,options={})=>{
+    const request=options.body?JSON.parse(options.body):{};
+    if(request.action==='get_income_report'&&request.payload.filters.query&&!request.payload.filters.pageRows){
+     backendSearchReads++;
+     if(failuresLeft>0){failuresLeft--;throw new TypeError('Failed to fetch');}
+     if(holdBackend)await new Promise(resolve=>{window.releaseBackend=resolve;});
+    }
+    return backend(url,options);
+   };
+  });
+  await page.locator('#incomeSearch').fill('Agua');
+  await page.waitForFunction(()=>window.backendSearchReads===3&&typeof window.releaseBackend==='function');
+  assert.equal(await page.locator('#incomeKpis .is-loading').count(),3);
+  assert.doesNotMatch(await page.locator('#incomeKpis').innerText(),/Ventas sin confirmar|130.000/);
+  assert.match(await page.locator('#incomeReportStatus').innerText(),/Consultando ventas/);
+  await page.evaluate(()=>{holdBackend=false;releaseBackend();});
+  await page.waitForFunction(()=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport.awaitingBackend&&document.querySelector('#incomeKpis').textContent.includes('130.000'));
+  await page.evaluate(()=>{
+   const sale=rows.find(row=>row.saleId==='sale-0');sale.items[0].quantity=4;sale.items[0].total=400;sale.total=1300;
+   document.querySelector('#incomeSearch').dispatchEvent(new Event('input',{bubbles:true}));
+  });
+  await page.waitForFunction(()=>window.backendSearchReads===4&&!salesApi.state.incomeLoading&&!salesApi.state.incomeReport.awaitingBackend&&document.querySelector('#incomeKpis').textContent.includes('130.200'));
+  await page.evaluate(()=>{
+   const sale=rows.find(row=>row.saleId==='sale-0');sale.items[0].quantity=6;sale.items[0].total=600;sale.total=1500;
+   salesApi.showAdminSection('service');salesApi.showAdminSection('income');
+  });
+  await page.waitForFunction(()=>window.backendSearchReads===5&&!salesApi.state.incomeLoading&&!salesApi.state.incomeReport.awaitingBackend&&document.querySelector('#incomeKpis').textContent.includes('130.400'));
+  assert.equal(await page.locator('#incomeKpis .is-product').count(),3);
   await context.close();
  }assert.deepEqual(errors,[]);}finally{await session.close();}
 });
@@ -96,8 +138,10 @@ test('búsqueda general: todas las páginas, rango, año actual, KPI y respuesta
   assert.equal(await page.locator('#incomePaymentBreakdown').isVisible(),false);
   assert.equal(await page.locator('#incomeRecords li').evaluateAll(nodes=>nodes.every(node=>node.textContent.includes('Agua')&&!node.textContent.includes('Café'))),true);
   assert.equal(await page.evaluate(()=>salesApi.state.incomeReport.records.find(row=>row.saleId==='sale-0').total),1100);
-  const timing=await page.evaluate(()=>{const input=document.querySelector('#incomeSearch');input.value='Agua';const start=performance.now();input.dispatchEvent(new Event('input',{bubbles:true}));return {ms:performance.now()-start,kpis:document.querySelector('#incomeKpis').textContent};});
-  assert.match(timing.kpis,/130.300/);assert.ok(timing.ms<150,JSON.stringify(timing));measurements.push({width,ms:timing.ms});
+  const timing=await page.evaluate(()=>{const input=document.querySelector('#incomeSearch');input.value='Agua';const before=calls.filter(call=>call.action==='get_income_report').length;const start=performance.now();input.dispatchEvent(new Event('input',{bubbles:true}));return {ms:performance.now()-start,kpis:document.querySelector('#incomeKpis').textContent,before};});
+  assert.doesNotMatch(timing.kpis,/130.300/);assert.ok(timing.ms<150,JSON.stringify(timing));measurements.push({width,ms:timing.ms});
+  await page.waitForFunction(()=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport?.awaitingBackend&&salesApi.state.incomeReport?.filters.query==='Agua');
+  assert.ok(await page.evaluate(before=>calls.filter(call=>call.action==='get_income_report').length>before,timing.before));
   await page.evaluate(()=>salesApi.setIncomeRange('today'));
   await page.waitForFunction(()=>!salesApi.state.incomeLoading&&salesApi.state.incomeReport?.filters.query==='Agua'&&document.querySelector('#incomeKpis').textContent.includes('130.000'));
   assert.match(await page.locator('#incomeKpis').innerText(),/1[.,]300/);
@@ -106,7 +150,7 @@ test('búsqueda general: todas las páginas, rango, año actual, KPI y respuesta
   assert.equal(await page.locator('#incomeDateFrom').inputValue(),await page.evaluate(()=>SalesShift.dateKey(new Date()).slice(0,4)+'-01-01'));
   assert.equal(await page.evaluate(()=>salesApi.state.incomeReport.records.some(row=>row.saleId==='previous-year')),false);
   await page.locator('#incomeSearch').fill('Mesa 1');
-  await page.waitForFunction(()=>!salesApi.state.incomeLoading&&salesApi.state.incomeReport?.filters.query==='Mesa 1');
+  await page.waitForFunction(()=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport?.awaitingBackend&&salesApi.state.incomeReport?.filters.query==='Mesa 1');
   assert.equal(await page.locator('#incomeKpis .is-product').count(),0);
   assert.equal(await page.locator('#incomePaymentBreakdown').isVisible(),true);
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));

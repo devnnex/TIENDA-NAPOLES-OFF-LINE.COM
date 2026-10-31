@@ -40,7 +40,7 @@ test('Navegacion muestra contenido durante el clic y conserva el control de perm
   assert.equal(calls.at(-1), 'service');
 });
 
-test('Teclear filtra todas las ventas disponibles sin perder filas al borrar la busqueda', () => {
+test('una búsqueda consulta el backend y borrar el texto restaura las ventas disponibles', () => {
   let query = 'cafe';
   const filters = { dateFrom: '2026-10-10', dateTo: '2026-10-10', saleType: 'all', query: '' };
   const records = [
@@ -55,15 +55,14 @@ test('Teclear filtra todas las ventas disponibles sin perder filas al borrar la 
     incomeTotalsFromRecords: rows => ({ income: rows.reduce((sum, row) => sum + row.total, 0) }),
     mergeIncomeReport: (report, applied) => ({ ...report, filters: applied }), renderIncomeReport: () => renders++ });
   vm.runInContext(section('previewIncomeSearch', 'incomePaymentLabel') + ';globalThis.preview = previewIncomeSearch;', context);
-  assert.equal(context.preview(), true);
-  assert.equal(state.incomeReport.records[0].saleId, 'a');
-  assert.equal(state.incomeReport.totals.income, 10);
-  assert.equal(state.incomeReport.recordRows.length, 1);
+  assert.equal(context.preview(), false);
+  assert.equal(state.incomeReport, undefined);
+  assert.equal(renders, 0);
   query = '';
   assert.equal(context.preview(), true);
   assert.equal(state.incomeReport.records.length, 2);
   assert.equal(state.incomeReport.totals.income, 30);
-  assert.equal(renders, 2);
+  assert.equal(renders, 1);
   state.incomeSaleTypeSnapshot.report.totalRecords = 3;
   assert.equal(context.preview(), false, 'Una pagina incompleta requiere consultar el servidor');
   state.incomeSaleTypeSnapshot.report.totalRecords = 2;
@@ -106,15 +105,15 @@ test('Una respuesta remota anterior no reemplaza la busqueda que se sigue teclea
     readAppsScriptOutbox: () => [], readLocalJson: () => null, INCOME_REPORT_CACHE_KEY: 'sales',
     localIncomeReport: filters => ({ records: [], filters }), renderIncomeReport() {}, setIncomeReportStatus() {},
     isAppsScriptConfigured: () => true, APPS_SCRIPT_TIMEOUT_MS: 45000,
-    appsScriptRequest: () => new Promise(resolve => { reads.push(resolve); }),
+    appsScriptRequest: action => action==='status'?Promise.resolve({ok:true,historyRevision:'same'}):new Promise(resolve => { reads.push(resolve); }),
     mergeIncomeReport: (report, filters) => ({ ...report, filters }),
     persistDurableJson: async () => true, updateGlobalSyncStatus: async () => true,
-    window: { setTimeout() {} } });
+    window: { setTimeout() {}, clearTimeout() {} }, completeIncomeSaleTypeReport: async report=>report, filterIncomeReportBySaleType: report=>report });
   vm.runInContext(section('loadIncomeReport', 'refreshBackgroundReports') + ';globalThis.load = loadIncomeReport;', context);
   const first = context.load(); query = 'segunda'; const latest = context.load();
   assert.equal(reads.length, 2);
-  reads[1]({ ok: true, records: [{ saleId: 'resultado-segunda' }], totalRecords: 1, totals: {} }); await latest;
-  reads[0]({ ok: true, records: [{ saleId: 'resultado-primera' }], totalRecords: 1, totals: {} }); await first;
+  reads[1]({ ok: true, records: [{ saleId: 'resultado-segunda' }], totalRecords: 1, recordRows:[{saleId:'resultado-segunda'}], revision:'same', totals: {} }); await latest;
+  reads[0]({ ok: true, records: [{ saleId: 'resultado-primera' }], totalRecords: 1, recordRows:[{saleId:'resultado-primera'}], revision:'same', totals: {} }); await first;
   assert.equal(state.incomeReport.records[0].saleId, 'resultado-segunda');
   assert.equal(state.incomeReport.filters.query, 'segunda');
 });

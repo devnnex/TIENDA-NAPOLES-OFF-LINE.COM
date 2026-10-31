@@ -7,17 +7,17 @@ const invoice={id:'paid',sessionId:'paid',createdAt:'2026-10-27T15:00:00Z',total
 const sale=(id='paid',date=invoice.createdAt,total=200)=>({saleId:id,invoice:'TN-'+id,date,total,subtotal:total,cost:80,profit:total-80,payments:[{method:'cash',amount:total}],items:[{menuItemId:'p',name:'Agua',quantity:2,total,cost:80}]});
 const report=(records=[sale()],range=filters)=>({ok:true,intervalApplied:true,filters:range,generatedAt:'2026-10-27T22:00:00Z',revision:'same',records,recordRows:records.map((row,i)=>({saleId:row.saleId,row:i+2})),totalRecords:records.length,totals:{income:records.reduce((n,row)=>n+row.total,0),sales:records.length,profit:records.reduce((n,row)=>n+row.profit,0),cost:records.reduce((n,row)=>n+row.cost,0)}});
 function harness(initialCache=null){
- const state={page:'admin',currentUser:{id:'staff'},invoiceHistory:[],inventoryMeta:{},incomeRequestId:0,incomeVisibleCount:60,activeAdminSection:'income',syncFresh:{}},jobs=[],responses=[],calls=[],renders=[];let cached=initialCache,current={...filters};
+ const state={page:'admin',currentUser:{id:'staff'},invoiceHistory:[],inventoryMeta:{},incomeRequestId:0,incomeVisibleCount:60,activeAdminSection:'income',syncFresh:{}},jobs=[],responses=[],calls=[],renders=[];let cached=initialCache,current={...filters},backendRevision="";
  const nodes=new Map();for(const id of ['#income','#incomeKpis','#incomePaymentBreakdown','#incomeRecords','#incomeFilterSummary','#moreIncomeRecords'])nodes.set(id,{markup:'',writes:0,querySelectorAll:()=>[],set innerHTML(value){this.markup=value;this.writes++;},get innerHTML(){return this.markup;}});
- const context=vm.createContext({state,SalesShift,Date:Clock,Map,Set,Number,Object,JSON,clearTimeout,navigator:{onLine:true},window:{setTimeout:()=>1},
+ const context=vm.createContext({state,SalesShift,Date:Clock,Map,Set,Number,Object,JSON,clearTimeout,navigator:{onLine:true},window:{setTimeout:()=>1,clearTimeout(){}},
   normalizeText:value=>String(value||'').toLowerCase(),incomeRecordSaleType:()=> 'table',incomeFiltersFromForm:()=>({...current}),$:id=>nodes.get(id),canAccessAdminSection:()=>true,
   readAppsScriptOutbox:()=>jobs,INCOME_REPORT_CACHE_KEY:'cache',readLocalJson:()=>cached,mergeConfirmedIncomeReport:value=>value,
   isAppsScriptConfigured:()=>true,APPS_SCRIPT_TIMEOUT_MS:1000,toast(){},updateGlobalSyncStatus(){},renderSalesShift(){},setIncomeReportStatus(){},isBoss:()=>false,incomePaymentLabel:String,incomeSaleTypeLabel:String,formatIncomeDate:String,
   escapeHTML:String,icon:()=>'',money:String,emptyState:(a,b)=>a+' '+b,refreshIcons(){},
   readAppsScriptStatus:async()=>{calls.push('status');return {ok:true,historyRevision:'same'};},
   persistDurableJson:async(_key,value)=>{cached=structuredClone(value);return true;},
-  appsScriptRequest:async(action)=>{calls.push(action);const next=responses.shift();if(next instanceof Error)throw next;if(!next)throw Error('Unexpected network read');return typeof next==='function'?next():structuredClone(next);}});
- vm.runInContext(part('incomeTotalsFromRecords','setIncomeReportStatus')+part('renderIncomeReport','refreshBackgroundReports')+';globalThis.api={load:loadIncomeReport,merge:mergeIncomeReport,render:renderIncomeReport};',context);
+  appsScriptRequest:async(action)=>{calls.push(action);if(action==='status')return {ok:true,historyRevision:backendRevision};const next=responses.shift();if(next instanceof Error)throw next;if(!next)throw Error('Unexpected network read');const result=await (typeof next==='function'?next():structuredClone(next));if(typeof result.revision==='string')backendRevision=result.revision;return result;}});
+ vm.runInContext(part('filterIncomeReportBySaleType','incomeSaleTypeFiltersKey')+part('incomeTotalsFromRecords','setIncomeReportStatus')+part('renderIncomeReport','refreshBackgroundReports')+';globalThis.api={load:loadIncomeReport,merge:mergeIncomeReport,render:renderIncomeReport};',context);
  return {state,jobs,responses,calls,nodes,context,api:context.api,setFilters:value=>{current={...value};},clearCache:()=>{cached=null;},cache:()=>cached};
 }
 test('un turno futuro conserva el día disponible en Hoy; el turno explícito mantiene sus horas',()=>{

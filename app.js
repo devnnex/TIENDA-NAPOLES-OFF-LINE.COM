@@ -1101,7 +1101,7 @@ const App = (() => {
       initializeIncomeFilters();
       const currentFilters = incomeFiltersFromForm();
       const samePeriod = state.incomeReport && JSON.stringify(state.incomeReport.filters) === JSON.stringify(currentFilters);
-      if (!samePeriod) void loadIncomeReport();
+      if (!samePeriod || currentFilters.query) void loadIncomeReport();
       else {
         renderIncomeReport();
         void refreshBackgroundReports();
@@ -2876,6 +2876,7 @@ const App = (() => {
           payload
         }),
         redirect: "follow",
+        ...((payload.backendOnly || payload.filters?.backendOnly) ? { cache: "no-store" } : {}),
         signal: controller.signal
       });
       if (!response.ok) throw new Error(`El respaldo remoto respondio con estado ${response.status}.`);
@@ -6187,6 +6188,7 @@ const App = (() => {
     refreshIcons();
     try {
       const refreshed = await action();
+      if (button.id === "refreshIncomeReport" && state.incomeReport?.backendSearch && state.incomeReport.awaitingBackend) return false;
       if (refreshed) toast(successMessage, "ok");
       else if (!navigator.onLine) toast("Información local actualizada. Los cambios pendientes se sincronizarán al volver la conexión.", "ok");
       else toast("No fue posible completar la actualización. La información visible se conservó.", "error", `refresh-failed:${button.id}`);
@@ -7043,6 +7045,7 @@ const App = (() => {
     return removeDeletedSaleMovements([...map.values()]);
   };
   const mergeConfirmedIncomeReport = (remote, filters) => {
+    if (remote.backendSearch) return remote;
     const mirror = reportMirror();
     const keys = new Set([...(remote.recordRows || []).map(row => String(row.saleId)), ...(remote.recordKeys || []).map(String)]);
     const snapshotAfterClear = !mirror.salesClearAt || Date.parse(remote.generatedAt || "") >= Date.parse(mirror.salesClearAt);
@@ -8494,17 +8497,26 @@ const App = (() => {
     if (Number(report.totalRecords || 0) > records.size && !Array.isArray(report.recordRows)) {
       throw new Error("El historial no devolvio las paginas necesarias para filtrar todas las ventas.");
     }
-    for (let offset = 0; offset < missing.length; offset += 300) {
+    const concurrency = filters.backendOnly ? 3 : 1;
+    for (let offset = 0; offset < missing.length; offset += 300 * concurrency) {
       if (requestId !== state.incomeRequestId) return report;
-      const pageRows = missing.slice(offset, offset + 300);
-      const page = await appsScriptRequest("get_income_report", { filters: { ...filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
+      const requests = [];
+      for (let index = offset; index < Math.min(missing.length, offset + 300 * concurrency); index += 300) {
+        const pageRows = missing.slice(index, index + 300);
+        requests.push((async () => {
+          const page = await appsScriptRequest("get_income_report", { filters: { ...filters, pageRows, revision: report.revision } }, APPS_SCRIPT_TIMEOUT_MS);
+          if (requestId !== state.incomeRequestId) return [];
+          if (!page?.ok || page.stale || !Array.isArray(page.records)
+            || (typeof page.revision === "string" && page.revision !== report.revision)
+            || (filters.startAt && page.intervalApplied !== true)) throw new Error(page?.error || "El historial cambio. Actualiza el filtro de ventas.");
+          const pageIds = new Set(page.records.map((record) => String(record.saleId)));
+          if (pageRows.some((row) => !pageIds.has(String(row.saleId)))) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
+          return page.records;
+        })());
+      }
+      const pages = await Promise.all(requests);
       if (requestId !== state.incomeRequestId) return report;
-      if (!page?.ok || page.stale || !Array.isArray(page.records)
-        || (typeof page.revision === "string" && page.revision !== report.revision)
-        || (filters.startAt && page.intervalApplied !== true)) throw new Error(page?.error || "El historial cambio. Actualiza el filtro de ventas.");
-      const pageIds = new Set(page.records.map((record) => String(record.saleId)));
-      if (pageRows.some((row) => !pageIds.has(String(row.saleId)))) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
-      page.records.forEach((record) => records.set(String(record.saleId), record));
+      pages.forEach((page) => page.forEach((record) => records.set(String(record.saleId), record)));
     }
     if (Number(report.totalRecords || 0) > records.size) throw new Error("No se pudieron confirmar todas las ventas del filtro.");
     return { ...report, truncated: false, records: [...records.values()].sort((left, right) => String(right.date).localeCompare(String(left.date)) || String(right.saleId).localeCompare(String(left.saleId))) };
@@ -8514,6 +8526,7 @@ const App = (() => {
 
   const applyIncomeSaleTypeFilter = () => {
     const filters = incomeFiltersFromForm();
+    if (filters.query) { void loadIncomeReport(); return; }
     const snapshot = state.incomeSaleTypeSnapshot;
     if (state.incomeLoading) state.incomeReloadRequested = true;
     if (snapshot && snapshot.key === incomeSaleTypeFiltersKey(filters)) {
@@ -8527,6 +8540,7 @@ const App = (() => {
 
   const previewIncomeSearch = () => {
     const filters = incomeFiltersFromForm();
+    if (filters.query) return false;
     let snapshot = state.incomeSaleTypeSnapshot;
     const term = normalizeText(filters.query || "");
     const candidates = [snapshot?.report, ...[...(state.incomeReportSnapshots?.values() || [])].reverse()].filter(Boolean);
@@ -8784,7 +8798,7 @@ const App = (() => {
     const recordsTarget = $("#incomeRecords");
     const summaryTarget = $("#incomeFilterSummary");
     if (!kpis || !payments || !recordsTarget) return;
-    const report = state.incomeReport;
+    const report = state.incomeReport?.awaitingBackend ? null : state.incomeReport;
     const shiftSignature = report ? JSON.stringify({
       filters: report.filters, totals: report.totals, records: report.records,
       recordRows: report.recordRows, recordKeys: report.recordKeys, totalRecords: report.totalRecords,
@@ -8927,6 +8941,7 @@ const App = (() => {
       if (force || manual) state.incomeReloadRequested = true;
       return false;
     }
+    if (filters.query) return loadIncomeBackendSearch(filters, key);
     const jobs = readAppsScriptOutbox();
     if (jobs.some(job => job.action === "clear_income")) {
       state.incomeAwaitingRemote = false;
@@ -9039,6 +9054,96 @@ const App = (() => {
       renderIncomeReport();
       setIncomeReportStatus(available ? "Última copia disponible" : "No se pudo consultar este periodo. Usa Actualizar.", "warning", "hard-drive");
       if (manual) toast(String(error?.message || error), "error", "manual-income-refresh-failed");
+      return false;
+    } finally {
+      if (requestId === state.incomeRequestId) {
+        state.incomeLoading = false;
+        state.incomeLoadingFilters = "";
+        if (state.incomeReloadRequested || state.incomeForceReloadRequested) {
+          state.incomeReloadRequested = false;
+          state.incomeForceReloadRequested = false;
+          window.setTimeout(() => void loadIncomeReport({ background: true, force: true }), 0);
+        }
+      }
+    }
+  };
+
+  const loadIncomeBackendSearch = async (filters, key) => {
+    window.clearTimeout(state.incomeSearchTimer);
+    window.clearTimeout(state.incomeBackendRetryTimer);
+    if (state.incomeBackendRetryKey !== key) state.incomeBackendRetryCount = 0;
+    state.incomeBackendRetryKey = key;
+    const requestId = ++state.incomeRequestId;
+    state.incomeLoading = true;
+    state.incomeLoadingFilters = key;
+    state.incomeAwaitingRemote = true;
+    state.incomePageLoading = false;
+    state.incomeVisibleCount = 60;
+    state.incomeSaleTypeSnapshot = null;
+    state.incomeReport = { filters, records: [], totalRecords: 0, backendSearch: true, awaitingBackend: true };
+    renderIncomeReport();
+    try {
+      if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
+      let confirmed = null;
+      // Retry once if sales changed while the pages were being read.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = await appsScriptRequest("get_income_report", { filters: { ...filters, backendOnly: true } }, APPS_SCRIPT_TIMEOUT_MS);
+        if (requestId !== state.incomeRequestId) return false;
+        if (result?.stale) { if (!attempt) continue; throw new Error("Las ventas cambiaron durante la consulta. Vuelve a buscar."); }
+        if (!result?.ok || !Array.isArray(result.records) || !result.totals
+          || typeof result.revision !== "string" || !Number.isSafeInteger(Number(result.totalRecords))
+          || Number(result.totalRecords) < 0 || (filters.startAt && result.intervalApplied !== true)) {
+          throw new Error(result?.error || "No se pudo confirmar el informe del backend.");
+        }
+        if (!Array.isArray(result.recordRows) || result.recordRows.length !== Number(result.totalRecords)
+          || new Set(result.recordRows.map((row) => String(row.saleId))).size !== Number(result.totalRecords)) {
+          throw new Error("No se pudieron confirmar todas las ventas del backend.");
+        }
+        try {
+          const complete = await completeIncomeSaleTypeReport(result, { ...filters, complete: true, backendOnly: true }, requestId);
+          if (requestId !== state.incomeRequestId) return false;
+          if (complete.records.length !== Number(result.totalRecords)) throw new Error("No se pudieron confirmar todas las ventas del backend.");
+          const status = await appsScriptRequest("status", { backendOnly: true }, 12000);
+          if (requestId !== state.incomeRequestId) return false;
+          if (!status?.ok || typeof status.historyRevision !== "string") throw new Error("No se pudo confirmar la revisión de ventas del backend.");
+          if (status.historyRevision !== result.revision) {
+            if (!attempt) continue;
+            throw new Error("Las ventas cambiaron durante la consulta. Vuelve a buscar.");
+          }
+          confirmed = complete;
+          break;
+        } catch (error) {
+          if (requestId !== state.incomeRequestId) return false;
+          if (!attempt && /historial cambio|ventas cambiaron/i.test(String(error?.message || error))) continue;
+          throw error;
+        }
+      }
+      if (requestId !== state.incomeRequestId) return false;
+      if (key !== JSON.stringify(incomeFiltersFromForm())) { state.incomeReloadRequested = true; return false; }
+      if (!confirmed) throw new Error("No se pudieron confirmar todas las ventas del backend.");
+      state.incomeReport = { ...filterIncomeReportBySaleType(confirmed, filters), filters,
+        backendSearch: true, localOnly: false, pendingCount: 0, awaitingBackend: false };
+      state.incomeBackendRetryCount = 0;
+      state.incomeRevision = confirmed.revision;
+      state.incomeFetchedAt = Date.now();
+      state.incomeLoading = false;
+      state.incomeAwaitingRemote = false;
+      if (state.syncFresh) state.syncFresh.sales = true;
+      renderIncomeReport();
+      return true;
+    } catch (_) {
+      if (requestId !== state.incomeRequestId) return false;
+      state.incomeLoading = false;
+      state.incomeAwaitingRemote = true;
+      if (state.syncFresh) state.syncFresh.sales = false;
+      state.incomeReport = { filters, records: [], totalRecords: 0, backendSearch: true, awaitingBackend: true };
+      renderIncomeReport();
+      setIncomeReportStatus("Consultando ventas", "loading", "loader-circle");
+      state.incomeBackendRetryCount = Number(state.incomeBackendRetryCount || 0) + 1;
+      const delay = Math.min(1600, 200 * 2 ** Math.min(state.incomeBackendRetryCount - 1, 3));
+      state.incomeBackendRetryTimer = window.setTimeout(() => {
+        if (state.activeAdminSection === "income" && key === JSON.stringify(incomeFiltersFromForm())) return loadIncomeReport();
+      }, delay);
       return false;
     } finally {
       if (requestId === state.incomeRequestId) {
@@ -10619,6 +10724,7 @@ const App = (() => {
   };
 
   const reflectInvoiceInIncomeReport = (invoice) => {
+    if (state.incomeReport?.backendSearch) return;
     const filters = incomeFiltersFromForm();
     const localRecord = localIncomeRecords(filters)
       .find((record) => String(record.saleId) === String(invoice.id || invoice.sessionId));
@@ -12384,6 +12490,16 @@ const App = (() => {
     });
     $("#incomeSearch")?.addEventListener("input", () => {
       clearTimeout(state.incomeSearchTimer);
+      state.incomeRequestId += 1;
+      state.incomeLoadingFilters = "";
+      state.incomePageLoading = false;
+      const filters = incomeFiltersFromForm();
+      if (filters.query) {
+        state.incomeReport = { filters, records: [], totalRecords: 0, backendSearch: true, awaitingBackend: true };
+        renderIncomeReport();
+        state.incomeSearchTimer = window.setTimeout(() => void loadIncomeReport(), 100);
+        return;
+      }
       const previewed = previewIncomeSearch();
       state.incomeSearchTimer = window.setTimeout(() => void loadIncomeReport({ background: previewed }), previewed ? 150 : 0);
     });

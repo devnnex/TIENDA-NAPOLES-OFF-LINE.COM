@@ -13,11 +13,11 @@ async function launch(){
  const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',headless:true});
  return {server,browser,url:`http://127.0.0.1:${server.address().port}/admin.html`,async close(){await browser.close();await new Promise(resolve=>server.close(resolve));}};
 }
-async function boot(page,url){
+async function boot(page,url,{productRanges=false}={}){
  await page.goto(url);
  await page.addScriptTag({path:path.join(root,'sales-shift.js')});
  await page.addScriptTag({content:instrument(fs.readFileSync(path.join(root,'app.js'),'utf8'))});
- await page.evaluate(()=>{
+ await page.evaluate(productRanges=>{
   document.body.classList.add('admin-authenticated');
   Object.assign(salesApi.state,{page:'admin',activeAdminSection:'income',currentUser:{id:'boss',role:'boss',full_name:'Caja'},authToken:'test',business:{business_name:'Prueba'},businessTimeZone:'America/Bogota',incomeAwaitingRemote:false});
   salesApi.state.items=[{id:'p',name:'Agua',price:100,category_id:'c',is_active:true},{id:'q',name:'Café',price:900,category_id:'c',is_active:true}];
@@ -29,6 +29,17 @@ async function boot(page,url){
   rows.push({...rows[0],saleId:'old',date:new Date(Date.now()-172800000).toISOString(),items:[line('Agua',3,100)],total:300,cost:30,profit:270});
   rows.push({...rows[0],saleId:'metadata',payer:'Agua',items:[line('Café',1,900)],total:900,cost:10,profit:890});
   rows.push({...rows[0],saleId:'previous-year',date:(Number(SalesShift.dateKey(new Date()).slice(0,4))-1)+'-12-31T12:00:00-05:00'});
+  if(productRanges){
+   const names=['Soda/Ginger','Agua','Cerveza','Café'];
+   const year=SalesShift.dateKey(new Date()).slice(0,4);
+   salesApi.state.items=names.map((name,i)=>({id:'p'+i,name:name+' grande',price:1000,is_active:true}));
+   const sale=(prefix,i,previous)=>{
+    const items=names.map((name,index)=>({menuItemId:'p'+index,name:name+(previous?'':' grande'),quantity:.1,unitPrice:1000,total:100,cost:20}));
+    items.push({menuItemId:'other',name:'Otro producto',quantity:1,total:900,cost:100});
+    return {saleId:prefix+i,invoice:'TN-'+prefix+i,date:previous?year+'-02-15T12:00:00-05:00':new Date().toISOString(),table:'Mesa 1',payer:'Cliente',total:1300,subtotal:1300,cost:180,profit:1120,items,payments:[{method:'cash',amount:1300}]};
+   };
+   rows=[...Array.from({length:320},(_,i)=>sale('month-',i,false)),...Array.from({length:260},(_,i)=>sale('older-',i,true))];
+  }
   window.fetch=async(_url,options={})=>{
    if(!options.body)return new Response('{}');
    const request=JSON.parse(options.body);calls.push(request);let result={ok:true};
@@ -46,8 +57,30 @@ async function boot(page,url){
   salesApi.state.sb={rpc:async()=>({data:{ok:true,changes:[],hasMore:false}}),channel:()=>({on(){return this;},subscribe(){return this;},send:async()=> 'ok'})};
   salesApi.bindAdmin();
   salesApi.showAdminSection('income');
- });
+ },productRanges);
 }
+
+test('soda/ginger y otros productos: mes 32, año 58, con paginación, caché y cambios repetidos de rango',async()=>{
+ const session=await launch(),errors=[];
+ try{for(const width of [1440,390]){
+  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(15000);
+  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url,{productRanges:true});
+  for(const query of ['soda/ginger','agua','cerveza','café']){
+   await page.locator('#incomeSearch').fill(query);
+   for(const [range,count,units,money] of [['month',320,32,'32.000'],['year',580,58,'58.000'],['month',320,32,'32.000'],['year',580,58,'58.000']]){
+    await page.locator(`[data-income-range="${range}"]`).click();
+    await page.waitForFunction(({query,count,range})=>!salesApi.state.incomeLoading&&salesApi.state.incomeRangePreset===range&&salesApi.state.incomeReport?.filters.query===query&&salesApi.state.incomeReport.records.length===count,{query,count,range});
+    assert.equal((await page.locator('#incomeKpis .is-product strong').first().innerText()).trim(),String(units),query+' '+range);
+    assert.match(await page.locator('#incomeKpis .is-product').nth(1).innerText(),new RegExp(money.replace('.','[.,]')));
+    assert.equal(await page.locator('#incomeKpis .is-product').count(),3);
+    assert.equal(await page.locator('#incomeSearch').inputValue(),query);
+   }
+  }
+  const pages=await page.evaluate(()=>calls.filter(call=>call.action==='get_income_report'&&call.payload.filters.pageRows).length);
+  assert.ok(pages>0,'debe consultar las páginas posteriores a las primeras 300 facturas');
+  await context.close();
+ }assert.deepEqual(errors,[]);}finally{await session.close();}
+});
 test('búsqueda general: todas las páginas, rango, año actual, KPI y respuesta inmediata en escritorio y móvil',async()=>{
  const session=await launch(),errors=[],measurements=[];
  try{for(const width of [1440,390]){

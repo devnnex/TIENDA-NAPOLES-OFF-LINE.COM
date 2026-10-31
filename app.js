@@ -8889,10 +8889,14 @@ const App = (() => {
   const incomeProductSummary = (report, query = report?.filters?.query) => {
     if (!String(query || "").trim()) return null;
     const term = normalizeText(query);
-    const records = report.allLocalRecords || report.records || [];
+    const loaded = report.records || [];
+    const records = report.localOnly && loaded.length < Number(report.totalRecords || 0)
+      && (report.allLocalRecords || []).length > loaded.length
+      ? [...new Map([...report.allLocalRecords, ...loaded].map((record) => [String(record.saleId), record])).values()] : loaded;
     const names = new Set((state.items || []).map((item) => normalizeText(item.name || "")));
-    records.forEach((record) => (record.items || []).forEach((item) => names.add(normalizeText(item.name || ""))));
+    // Historical names in a wider range must not change the meaning of the search.
     const exact = names.has(term);
+    records.forEach((record) => (record.items || []).forEach((item) => names.add(normalizeText(item.name || ""))));
     const matches = (item) => exact ? normalizeText(item.name || "") === term : normalizeText(item.name || "").includes(term);
     if (![...names].some((name) => exact ? name === term : name.includes(term))) return null;
     const summary = { quantity: 0, income: 0, cost: 0, profit: 0, sales: 0, records: [],
@@ -8989,7 +8993,8 @@ const App = (() => {
     try {
       if (!isAppsScriptConfigured()) throw new Error("El historial remoto no está configurado.");
       let result = null;
-      if (!force && base && typeof base.revision === "string") {
+      if (!force && base && typeof base.revision === "string"
+        && (!state.incomeRevision || state.incomeRevision === base.revision)) {
         try {
           const status = typeof readAppsScriptStatus === "function" ? await readAppsScriptStatus() : await appsScriptRequest("status", {}, 12000);
           if (requestId !== state.incomeRequestId) return false;

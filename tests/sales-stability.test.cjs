@@ -94,3 +94,17 @@ test('una consulta fallida vuelve a intentar aun con igual revisión y sin un st
  vm.runInContext(part('refreshBackgroundReports',end)+';globalThis.refresh=refreshBackgroundReports;',h.context);
  h.responses.push(report([sale('paid',invoice.createdAt,700)]));assert.equal(await h.context.refresh(),true);assert.equal(h.state.incomeReport.totals.income,700);assert.equal(h.state.incomeReport.localOnly,false);
 });
+
+test('SODA/GINGER: una revisión vieja del estado remoto no valida el año después de haber leído ventas más recientes en el mes',async()=>{
+ const h=harness();h.state.items=[{id:'soda',name:'SODA/GINGER'}];
+ const year={...filters,dateFrom:'2026-01-01',dateTo:'2026-10-27',query:'soda/ginger'},month={...year,dateFrom:'2026-10-01'};
+ const productSale=(id,quantity,date)=>({...sale(id,date,quantity*100),items:[{menuItemId:'soda',name:'SODA/GINGER',quantity,total:quantity*100,cost:quantity*20}]});
+ const old=productSale('old',26,'2026-06-20T12:00:00-05:00'),fresh=productSale('fresh',32,'2026-10-20T12:00:00-05:00');
+ h.setFilters(year);h.responses.push({...report([old],year),revision:'old'});await h.api.load({force:true});
+ h.setFilters(month);h.responses.push({...report([fresh],month),revision:'new'});await h.api.load({force:true});
+ assert.equal(vm.runInContext('incomeProductSummary(state.incomeReport).quantity',h.context),32);
+ h.context.readAppsScriptStatus=async()=>({ok:true,historyRevision:'old'});
+ h.setFilters(year);h.responses.push({...report([old,fresh],year),revision:'new'});await h.api.load();
+ assert.equal(vm.runInContext('incomeProductSummary(state.incomeReport).quantity',h.context),58);
+ assert.equal(h.state.incomeRevision,'new');assert.equal(h.responses.length,0);
+});

@@ -28,6 +28,7 @@ async function boot(page,url){
   window.rows=Array.from({length:650},(_,i)=>({saleId:'sale-'+i,invoice:'TN-'+i,date:new Date().toISOString(),table:'Mesa 1',payer:'Cliente',total:1100,subtotal:1100,cost:30,profit:1070,items:[line('Agua',2,100),line('Café',1,900)],payments:[{method:'cash',amount:1100}]}));
   rows.push({...rows[0],saleId:'old',date:new Date(Date.now()-172800000).toISOString(),items:[line('Agua',3,100)],total:300,cost:30,profit:270});
   rows.push({...rows[0],saleId:'metadata',payer:'Agua',items:[line('Café',1,900)],total:900,cost:10,profit:890});
+  rows.push({...rows[0],saleId:'previous-year',date:(Number(SalesShift.dateKey(new Date()).slice(0,4))-1)+'-12-31T12:00:00-05:00'});
   window.fetch=async(_url,options={})=>{
    if(!options.body)return new Response('{}');
    const request=JSON.parse(options.body);calls.push(request);let result={ok:true};
@@ -47,12 +48,13 @@ async function boot(page,url){
   salesApi.showAdminSection('income');
  });
 }
-test('búsqueda general: todas las páginas, rango, sin rango, KPI y respuesta inmediata en escritorio y móvil',async()=>{
+test('búsqueda general: todas las páginas, rango, año actual, KPI y respuesta inmediata en escritorio y móvil',async()=>{
  const session=await launch(),errors=[],measurements=[];
  try{for(const width of [1440,390]){
   const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
   page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
-  await page.evaluate(()=>salesApi.setIncomeRange('all'));
+  assert.equal(await page.locator('[data-income-range="all"]').count(),0);
+  await page.locator('[data-income-range="year"]').click();
   await page.waitForFunction(()=>salesApi.state.incomeReport?.totalRecords===652&&!salesApi.state.incomeLoading);
   await page.locator('#incomeSearch').fill('agu');
   await page.waitForFunction(()=>salesApi.state.incomeReport?.records.length===652&&!salesApi.state.incomeLoading&&document.querySelector('#incomeKpis').textContent.includes('130.300'));
@@ -66,10 +68,10 @@ test('búsqueda general: todas las páginas, rango, sin rango, KPI y respuesta i
   await page.evaluate(()=>salesApi.setIncomeRange('today'));
   await page.waitForFunction(()=>!salesApi.state.incomeLoading&&salesApi.state.incomeReport?.filters.query==='Agua'&&document.querySelector('#incomeKpis').textContent.includes('130.000'));
   assert.match(await page.locator('#incomeKpis').innerText(),/1[.,]300/);
-  await page.locator('#incomeDateFrom').fill('');await page.locator('#incomeDateFrom').dispatchEvent('change');
-  await page.locator('#incomeDateTo').fill('');await page.locator('#incomeDateTo').dispatchEvent('change');
+  await page.locator('[data-income-range="year"]').click();
   await page.waitForFunction(()=>!salesApi.state.incomeLoading&&document.querySelector('#incomeKpis').textContent.includes('130.300'));
-  assert.match(await page.locator('#incomeFilterSummary').innerText(),/Todo el historial/);
+  assert.equal(await page.locator('#incomeDateFrom').inputValue(),await page.evaluate(()=>SalesShift.dateKey(new Date()).slice(0,4)+'-01-01'));
+  assert.equal(await page.evaluate(()=>salesApi.state.incomeReport.records.some(row=>row.saleId==='previous-year')),false);
   await page.locator('#incomeSearch').fill('Mesa 1');
   await page.waitForFunction(()=>!salesApi.state.incomeLoading&&salesApi.state.incomeReport?.filters.query==='Mesa 1');
   assert.equal(await page.locator('#incomeKpis .is-product').count(),0);

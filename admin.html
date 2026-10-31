@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261031-sales-products-drafts-v1">
+    <link rel="stylesheet" href="style.css?v=20261031-sales-products-drafts-v2">
     <link rel="stylesheet" href="menu-cards.css?v=20261019-visual-details-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
@@ -409,7 +409,6 @@
 
         <div class="panel income-filter-panel">
           <div class="income-range-presets" role="group" aria-label="Rangos rápidos">
-            <button type="button" data-income-range="all">Todo el historial</button>
             <button type="button" data-income-range="today">Hoy</button>
             <button type="button" data-income-range="yesterday">Ayer</button>
             <button type="button" data-income-range="7days">7 días</button>
@@ -440,8 +439,8 @@
                 <option value="mixed">Pagos mixtos</option>
               </select>
             </label>
-            <label>Desde<input id="incomeDateFrom" name="date_from" type="date"></label>
-            <label>Hasta<input id="incomeDateTo" name="date_to" type="date"></label>
+            <label>Desde<input id="incomeDateFrom" name="date_from" type="date" required></label>
+            <label>Hasta<input id="incomeDateTo" name="date_to" type="date" required></label>
             <button class="primary" type="submit"><i data-lucide="sliders-horizontal"></i> Aplicar cambios</button>
           </form>
           <div class="income-filter-summary" id="incomeFilterSummary" aria-live="polite"></div>
@@ -940,6 +939,6 @@
     <script defer src="vendor/jspdf.umd.min.js"></script>
     <script defer src="sales-shift.js?v=20261027-today-shift-v2"></script>
     <script defer src="menu-cards.js?v=20261019-visual-details-v1"></script>
-    <script defer src="app.js?v=20261031-sales-products-drafts-v1"></script>
+    <script defer src="app.js?v=20261031-sales-products-drafts-v2"></script>
   </body>
 </html>

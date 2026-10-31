@@ -87,6 +87,53 @@ test('soda/ginger y otros productos: mes 32, año 58, con consultas al backend y
  }assert.deepEqual(errors,[]);}finally{await session.close();}
 });
 
+test('venta individual: X inmediata, saldo actualizado y burbuja roja del borrador al cerrar y recargar',async()=>{
+ const session=await launch(),errors=[];
+ try{for(const width of [1440,390]){
+  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
+  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
+  await page.evaluate(()=>salesApi.showAdminSection('dashboard'));
+  assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),false);
+  await page.locator('#newWalkInSale').click();await page.locator('#paymentAddItem').click();
+  for(const [id,name,qty] of [['p','Agua','2'],['q','Café','3']]){
+   await page.locator('#consumptionProductSearch').fill(name);await page.locator(`[data-consumption-product="${id}"]`).click();
+   await page.locator('#consumptionForm [name="quantity"]').fill(qty);await page.locator('#consumptionQueueButton').click();
+  }
+  await page.locator('#consumptionDialog [data-cancel-consumption]').first().click();
+  assert.equal(await page.locator('[data-walk-in-draft-count]').innerText(),'1');
+  assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),true);
+  assert.equal(await page.locator('[data-walk-in-draft-count]').evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(240, 68, 56)');
+  await boot(page,session.url);await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('dashboard');});
+  assert.equal(await page.locator('[data-walk-in-draft-count]').innerText(),'1');
+  await page.locator('#newWalkInSale').click();
+  await page.evaluate(()=>salesApi.confirmConsumptionSelection(document.querySelector('#consumptionForm')));
+  assert.equal(await page.locator('#paymentSaleLines [data-remove-walk-in-item]').count(),2);
+  await page.locator('#paymentForm .payment-methods label').filter({has:page.locator('input[value="transfer"]')}).click();
+  await page.getByRole('button',{name:'Quitar Café',exact:true}).click();
+  assert.equal(await page.locator('#paymentDialog').evaluate(node=>node.open),true);
+  assert.equal(await page.locator('#paymentSaleLines [data-remove-walk-in-item]').count(),1);
+  assert.match(await page.locator('#paymentTotal').innerText(),/200/);
+  assert.equal(await page.locator('#paymentForm [name="payment_method"]:checked').inputValue(),'transfer');
+  assert.equal(await page.locator('#consumptionDialog').evaluate(node=>node.open),false);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),true);
+  await boot(page,session.url);await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('dashboard');});
+  await page.locator('#newWalkInSale').click();
+  assert.equal(await page.locator('#paymentSaleLines [data-remove-walk-in-item]').count(),1);
+  assert.doesNotMatch(await page.locator('#paymentSaleLines').innerText(),/Café/);
+  await page.getByRole('button',{name:'Quitar Agua',exact:true}).click();
+  assert.equal(await page.locator('#paymentDialog').evaluate(node=>node.open),true);
+  assert.equal(await page.locator('#paymentSaleLines [data-remove-walk-in-item]').count(),0);
+  assert.equal(await page.locator('#paymentForm button[type="submit"]:enabled').count(),0);
+  await page.keyboard.press('Escape');assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),false);
+  assert.equal(await page.evaluate(()=>salesApi.state.sessions.filter(row=>row.local_only).length),0);
+  assert.equal(await page.evaluate(()=>salesApi.state.invoiceHistory.length),0);
+  assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.p.stock),100000);
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+  await context.close();
+ }assert.deepEqual(errors,[]);}finally{await session.close();}
+});
+
 test('fallos de conexión se recuperan automáticamente y repetir la búsqueda lee ventas nuevas aunque la revisión coincida',async()=>{
  const session=await launch(),errors=[];
  try{for(const width of [1440,390]){

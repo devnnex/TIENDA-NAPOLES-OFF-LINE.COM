@@ -2394,10 +2394,31 @@ const App = (() => {
   }
 
   const persistWalkInDrafts = () => {
+    renderWalkInDraftBadge();
     const drafts = state.sessions
       .filter((session) => isLocalWalkInSession(session) && session.status === "open")
       .slice(0, 50);
     void persistDurableJson(WALK_IN_DRAFTS_STORAGE_KEY, drafts);
+  };
+
+  const pendingWalkInSaleCount = () => state.sessions.filter((session) => {
+    if (!isLocalWalkInSession(session) || session.status !== "open") return false;
+    if ((session.session_items || []).some((item) => item.status !== "cancelled")) return true;
+    const draft = session.consumption_draft;
+    return Boolean(draft && (draft.drafts?.length || draft.fields?.menu_item_id || draft.fields?.item_name?.trim()
+      || draft.fields?.quantity || draft.search?.trim()));
+  }).length;
+
+  const renderWalkInDraftBadge = () => {
+    const button = $("#newWalkInSale");
+    const badge = button?.querySelector("[data-walk-in-draft-count]");
+    if (!badge) return;
+    const count = pendingWalkInSaleCount();
+    badge.hidden = count === 0;
+    badge.textContent = String(count);
+    const label = count ? `Venta individual: ${count} venta${count === 1 ? "" : "s"} pendiente${count === 1 ? "" : "s"}` : "Nueva venta individual";
+    button.setAttribute("aria-label", label);
+    button.title = label;
   };
 
   const persistInventoryStore = () => persistDurableJson(INVENTORY_STORAGE_KEY, state.inventoryMeta);
@@ -6059,7 +6080,8 @@ const App = (() => {
     const emptyText = normalTables().some((table) => table.is_active !== false)
       ? "No hay mesas que coincidan con este filtro."
       : "Crea las mesas del negocio para comenzar.";
-    box.innerHTML = `<button class="compact-table-tile walk-in-table" id="newWalkInSale" type="button" aria-label="Nueva venta individual"><span class="table-furniture-icon">${icon("plus", 23)}</span><small>Venta individual</small></button>` + (compactTableTiles(filter, state.dashboardTableGroupFilter, query) || emptyState("Sin mesas", emptyText, "layout-grid"));
+    box.innerHTML = `<button class="compact-table-tile walk-in-table" id="newWalkInSale" type="button" aria-label="Nueva venta individual"><span class="table-furniture-icon">${icon("plus", 23)}</span><small>Venta individual</small><em data-walk-in-draft-count hidden></em></button>` + (compactTableTiles(filter, state.dashboardTableGroupFilter, query) || emptyState("Sin mesas", emptyText, "layout-grid"));
+    renderWalkInDraftBadge();
     refreshIcons();
   };
 
@@ -10638,6 +10660,16 @@ const App = (() => {
     updateCashChange();
   };
 
+  const renderPaymentSaleLines = (session) => {
+    const target = $("#paymentSaleLines");
+    if (!target) return;
+    const quickSale = isLocalWalkInSession(session);
+    const items = (session.session_items || []).filter((item) => item.status !== "cancelled");
+    target.innerHTML = items.length
+      ? items.map((item) => `<div${quickSale ? ` data-edit-walk-in-item="${escapeHTML(item.id)}" title="Doble clic para editar este producto"` : ""} class="${quickSale ? "payment-walk-in-line" : ""} ${quickSale && state.individualProductFlashes?.get(item) > Date.now() ? "consumption-just-added" : ""}"><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong>${quickSale ? `<button class="icon-btn danger" type="button" data-remove-walk-in-item="${escapeHTML(item.id)}" aria-label="Quitar ${escapeHTML(item.item_name)}" title="Quitar producto">${icon("x", 15)}</button>` : ""}</div>`).join("")
+      : '<p class="payment-empty-sale">Agrega el producto para continuar con el cobro.</p>';
+  };
+
   const openPaymentDialog = (sessionId) => {
     const session = state.sessions.find((entry) => entry.id === sessionId);
     const dialog = $("#paymentDialog");
@@ -10664,10 +10696,7 @@ const App = (() => {
     state.activePaymentTotal = total;
     $("#paymentTableLabel").textContent = sessionLabel(session);
     $("#paymentTotal").textContent = money(total);
-    const paymentLines = $("#paymentSaleLines");
-    if (paymentLines) paymentLines.innerHTML = activeItems.length
-      ? activeItems.map((item) => `<div${quickSale ? ` data-edit-walk-in-item="${escapeHTML(item.id)}" title="Doble clic para editar este producto"` : ""} class="${quickSale && state.individualProductFlashes?.get(item) > Date.now() ? "consumption-just-added" : ""}"><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong></div>`).join("")
-      : '<p class="payment-empty-sale">Agrega el producto para continuar con el cobro.</p>';
+    renderPaymentSaleLines(session);
     const exitButton = dialog.querySelector(".dialog-actions [data-cancel-payment], .modal-actions [data-cancel-payment]");
     if (exitButton) exitButton.textContent = quickSale ? "Guardar y salir" : "Cancelar";
     const addItemButton = $("#paymentAddItem");
@@ -10683,6 +10712,29 @@ const App = (() => {
     updatePaymentTipChoice();
     dialog.showModal();
     void refreshConsumptionInventory();
+    refreshIcons();
+  };
+
+  const removeWalkInSaleItem = (itemId) => {
+    if (state.paymentProcessing) return;
+    const form = $("#paymentForm");
+    const session = state.sessions.find((entry) => entry.id === form?.session_id.value);
+    if (!isLocalWalkInSession(session) || session.status !== "open") return;
+    const item = (session.session_items || []).find((entry) => entry.id === itemId && entry.status !== "cancelled");
+    if (!item || !consumptionChangeAllowed(session, itemId, { status: "cancelled" })) return;
+    const updated = clearPaymentsWithoutConsumption({ ...session, updated_at: new Date().toISOString(),
+      session_items: session.session_items.map((entry) => entry.id === itemId
+        ? { ...entry, status: "cancelled", updated_at: new Date().toISOString() } : entry) });
+    state.sessions = state.sessions.map((entry) => entry.id === session.id ? updated : entry);
+    state.optimisticSessionStates.set(session.id, { mode: "upsert", localOnly: true, session: updated });
+    persistWalkInDrafts();
+    const hasItems = updated.session_items.some((entry) => entry.status !== "cancelled");
+    form.dataset.hasItems = hasItems ? "1" : "0";
+    state.activePaymentBase = sessionTotal(updated);
+    renderPaymentSaleLines(updated);
+    const addItem = $("#paymentAddItem");
+    if (addItem) addItem.innerHTML = `${icon("plus", 16)} ${hasItems ? "Agregar otro producto" : "Agregar producto"}`;
+    updatePaymentTipChoice();
     refreshIcons();
   };
 
@@ -12601,7 +12653,15 @@ const App = (() => {
     $("#consumptionForm")?.addEventListener("input", scheduleWalkInDraft);
     $("#consumptionForm")?.addEventListener("change", scheduleWalkInDraft);
     window.addEventListener("pagehide", saveWalkInConsumptionDraft);
+    $("#paymentSaleLines")?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-remove-walk-in-item]");
+      if (!button) return;
+      event.preventDefault();
+      event.stopPropagation();
+      removeWalkInSaleItem(button.dataset.removeWalkInItem);
+    });
     $("#paymentSaleLines")?.addEventListener("dblclick", (event) => {
+      if (event.target.closest("[data-remove-walk-in-item]")) return;
       const row = event.target.closest("[data-edit-walk-in-item]");
       if (!row || state.paymentProcessing) return;
       const sessionId = $("#paymentForm")?.session_id.value;

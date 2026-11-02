@@ -346,3 +346,71 @@ test('Ventas: lista de productos debajo del buscador, filtrado, clic y teclado s
   await context.close();
  }assert.deepEqual(errors,[]);}finally{await session.close();}
 });
+
+
+test('Atender mesa: papelera elimina solo el cuadro elegido, confirma borradores y conserva las demás ventas al recargar',async()=>{
+ const session=await launch(),errors=[];
+ try{for(const width of [1440,390]){
+  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
+  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
+  await page.evaluate(()=>{
+   localStorage.setItem('tienda_napoles_service_walk_in_slots_v1','6');
+   salesApi.showAdminSection('service');
+  });
+  assert.equal(await page.locator('[data-service-walk-in]').count(),6);
+  assert.equal(await page.locator('[data-delete-service-walk-in]').count(),6);
+  const sales={};
+  for(const [slot,product,name] of [[2,'p','Agua'],[5,'q','Café']]){
+   await page.locator('[data-service-walk-in="'+slot+'"]').click();
+   sales[slot]=await page.locator('#paymentForm [name="session_id"]').inputValue();
+   await page.locator('#paymentAddItem').click();
+   await page.locator('#consumptionProductSearch').fill(name);await page.locator('[data-consumption-product="'+product+'"]').click();
+   await page.locator('#consumptionForm [name="quantity"]').fill('3');await page.locator('#consumptionQueueButton').click();
+   await page.locator('#consumptionDialog [data-cancel-consumption]').first().click();
+  }
+  const trash=page.locator('[data-delete-service-walk-in="5"]'),tile=trash.locator('..');
+  const trashBox=await trash.boundingBox(),tileBox=await tile.boundingBox();
+  assert.ok(trashBox.x>tileBox.x+tileBox.width/2&&trashBox.y<tileBox.y+tileBox.height/2);
+  assert.equal(await tile.evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(229, 239, 255)');
+  await page.locator('[data-delete-service-walk-in="4"]').click();
+  assert.equal(await page.locator('[data-service-walk-in]').count(),5);
+  assert.equal(await page.locator('[data-service-walk-in="4"]').count(),0);
+  assert.equal(await page.locator('#paymentDialog').evaluate(node=>node.open),false);
+  assert.equal(await page.locator('#actionConfirmDialog').evaluate(node=>node.open),false);
+  await page.locator('[data-delete-service-walk-in="2"]').click();
+  assert.match(await page.locator('#actionConfirmMessage').innerText(),/venta pendiente/);
+  await page.locator('#actionConfirmCancel').click();
+  assert.equal(await page.locator('[data-service-walk-in="2"]').count(),1);
+  assert.equal(await page.locator('.service-walk-in-count').count(),2);
+  await page.locator('[data-delete-service-walk-in="2"]').click();await page.locator('#actionConfirmAccept').click();
+  await page.waitForFunction(()=>!document.querySelector('[data-service-walk-in="2"]'));
+  assert.equal(await page.locator('.service-walk-in-count').count(),1);
+  assert.equal(await page.evaluate(id=>salesApi.state.sessions.some(s=>s.id===id),sales[2]),false);
+  assert.equal(await page.evaluate(id=>salesApi.state.sessions.some(s=>s.id===id),sales[5]),true);
+  await page.evaluate(()=>salesApi.showAdminSection('dashboard'));
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').innerText(),'1');
+  await boot(page,session.url);
+  await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('service');});
+  assert.deepEqual(await page.locator('[data-service-walk-in]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.serviceWalkIn))),[1,3,5,6]);
+  await page.locator('[data-service-walk-in="5"]').click();
+  assert.equal(await page.locator('#consumptionForm [name="session_id"]').inputValue(),sales[5]);
+  assert.match(await page.locator('#consumptionSelectionLines').innerText(),/Café.*3 ×/s);
+  await page.keyboard.press('Escape');
+  await page.locator('#addServiceWalkIn').click();
+  assert.equal(await page.locator('[data-service-walk-in="7"]').count(),1);
+  await page.locator('[data-delete-service-walk-in="7"]').click();
+  for(const slot of [1,3,6])await page.locator('[data-delete-service-walk-in="'+slot+'"]').click();
+  await page.locator('[data-delete-service-walk-in="5"]').click();await page.locator('#actionConfirmAccept').click();
+  await page.waitForFunction(()=>document.querySelectorAll('[data-service-walk-in]').length===0);
+  assert.equal(await page.evaluate(()=>salesApi.state.invoiceHistory.length),0);
+  assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.p.stock),100000);
+  assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.q.stock),100000);
+  assert.equal(await page.evaluate(()=>calls.some(call=>call.action==='record_sale')),false);
+  await boot(page,session.url);
+  await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('service');});
+  assert.equal(await page.locator('[data-service-walk-in]').count(),0);
+  await page.locator('#addServiceWalkIn').click();assert.equal(await page.locator('[data-service-walk-in="1"]').count(),1);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await context.close();
+ }assert.deepEqual(errors,[]);}finally{await session.close();}
+});

@@ -322,7 +322,7 @@ const App = (() => {
     "napoles_report_published_checkouts_v1",
     "napoles_complete_movement_history_v1",
     "napoles_movement_sales_totals_v1",
-    WALK_IN_DRAFTS_STORAGE_KEY, "tienda_napoles_service_walk_in_slots_v1",
+    WALK_IN_DRAFTS_STORAGE_KEY, "tienda_napoles_service_walk_in_slots_v1", "tienda_napoles_service_walk_in_slots_v2",
     OFFLINE_ADMIN_SNAPSHOT_KEY,
     USER_LIST_CACHE_KEY,
     INCOME_REPORT_CACHE_KEY,
@@ -2423,30 +2423,64 @@ const App = (() => {
     return sessions;
   };
 
+  const serviceWalkInSlots = (sessions = serviceWalkInSessions()) => {
+    const stored = readLocalJson("tienda_napoles_service_walk_in_slots_v2", null);
+    const slots = Array.isArray(stored)
+      ? stored.map(Number).filter(slot => Number.isInteger(slot) && slot > 0)
+      : Array.from({ length: Math.max(4, Number(readLocalJson("tienda_napoles_service_walk_in_slots_v1", 4)) || 4,
+        ...sessions.map(session => session.service_slot)) }, (_, index) => index + 1);
+    // Recover every pending sale, including drafts created before this layout existed.
+    return [...new Set([...slots, ...sessions.map(session => session.service_slot)])].sort((a, b) => a - b);
+  };
+
   const renderServiceWalkInSales = () => {
     const grid = $("#serviceWalkInGrid");
     if (!grid) return;
     const sessions = serviceWalkInSessions();
-    const count = Math.max(4, Number(readLocalJson("tienda_napoles_service_walk_in_slots_v1", 4)) || 4,
-      ...sessions.map(session => session.service_slot));
-    grid.innerHTML = Array.from({ length: count }, (_, index) => {
-      const slot = index + 1;
+    const slots = serviceWalkInSlots(sessions);
+    grid.innerHTML = slots.map(slot => {
       const session = sessions.find(entry => entry.service_slot === slot);
       const draft = session?.consumption_draft;
       const pending = Boolean(session && ((session.session_items || []).some(item => item.status !== "cancelled")
         || draft && (draft.drafts?.length || draft.fields?.menu_item_id || draft.fields?.item_name?.trim()
           || draft.fields?.quantity || draft.search?.trim())));
-      return `<article class="service-point-tile service-walk-in-tile ${pending ? "occupied" : "free"}"><button type="button" data-service-walk-in="${slot}" aria-label="Venta individual ${slot}${pending ? ": venta pendiente" : ": libre"}">${icon("shopping-bag", 22)}<span><strong>Venta individual ${slot}</strong><small>${pending ? "Venta pendiente" : "Libre"}</small></span>${pending ? '<em class="service-walk-in-count" aria-label="1 venta pendiente">1</em>' : ""}</button></article>`;
+      return `<article class="service-point-tile service-walk-in-tile ${pending ? "occupied" : "free"}"><button type="button" data-service-walk-in="${slot}" aria-label="Venta individual ${slot}${pending ? ": venta pendiente" : ": libre"}">${icon("shopping-bag", 22)}<span><strong>Venta individual ${slot}</strong><small>${pending ? "Venta pendiente" : "Libre"}</small></span>${pending ? '<em class="service-walk-in-count" aria-label="1 venta pendiente">1</em>' : ""}</button><button class="icon-btn danger service-walk-in-delete" type="button" data-delete-service-walk-in="${slot}" aria-label="Eliminar cuadro de Venta individual ${slot}" title="Eliminar cuadro">${icon("trash-2", 16)}</button></article>`;
     }).join("") + `<button class="ghost service-walk-in-add" type="button" id="addServiceWalkIn" aria-label="Agregar cuadro de venta individual"><span aria-hidden="true" style="font-size:2rem;line-height:1">+</span></button>`;
     refreshIcons();
   };
 
   const addServiceWalkInSlot = () => {
-    const sessions = serviceWalkInSessions();
-    const count = Math.max(4, Number(readLocalJson("tienda_napoles_service_walk_in_slots_v1", 4)) || 4,
-      ...sessions.map(session => session.service_slot));
-    void persistDurableJson("tienda_napoles_service_walk_in_slots_v1", count + 1);
+    const slots = serviceWalkInSlots();
+    void persistDurableJson("tienda_napoles_service_walk_in_slots_v2", [...slots, Math.max(0, ...slots) + 1]);
     renderServiceWalkInSales();
+  };
+
+  const deleteServiceWalkInSlot = async (slot) => {
+    if (!isManager() || !canAccessAdminSection("service") || state.paymentProcessing) return;
+    const sessions = serviceWalkInSessions();
+    if (!serviceWalkInSlots(sessions).includes(slot)) return;
+    const session = sessions.find(entry => entry.service_slot === slot);
+    const draft = session?.consumption_draft;
+    const pending = session && ((session.session_items || []).some(item => item.status !== "cancelled")
+      || draft && (draft.drafts?.length || draft.fields?.menu_item_id || draft.fields?.item_name?.trim()
+        || draft.fields?.quantity || draft.search?.trim()));
+    if (pending && !await askForConfirmation({
+      eyebrow: "Eliminar venta individual",
+      title: `¿Quitar Venta individual ${slot}?`,
+      message: "Este cuadro contiene una venta pendiente. Se eliminarán su borrador y sus productos sin cobrarla.",
+      accept: "Sí, eliminar venta", cancel: "Conservar venta"
+    })) return;
+    if (state.paymentProcessing) return;
+    const current = serviceWalkInSessions().find(entry => entry.service_slot === slot);
+    if (current?.id !== session?.id) return;
+    const remainingSlots = serviceWalkInSlots().filter(value => value !== slot);
+    if (current) {
+      state.sessions = state.sessions.filter(entry => entry.id !== current.id);
+      state.optimisticSessionStates.delete(current.id);
+    }
+    void persistDurableJson("tienda_napoles_service_walk_in_slots_v2", remainingSlots);
+    persistWalkInDrafts();
+    renderAdminLive();
   };
 
   const renderWalkInDraftBadge = () => {
@@ -13256,6 +13290,10 @@ const App = (() => {
       if (target.id === "newWalkInSale") await createWalkInSale();
       if (target.dataset.serviceWalkIn) await createWalkInSale({ slot: Number(target.dataset.serviceWalkIn) });
       if (target.id === "addServiceWalkIn") addServiceWalkInSlot();
+      if (target.dataset.deleteServiceWalkIn) {
+        await deleteServiceWalkInSlot(Number(target.dataset.deleteServiceWalkIn));
+        return;
+      }
       if (target.id === "addServicePoint") addServicePoint();
       if (target.dataset.serviceZone) {
         state.activeServiceZone = target.dataset.serviceZone;

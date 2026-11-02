@@ -309,3 +309,40 @@ test('Atender mesa: cuatro ventas separadas, contador, salir, recargar y agregar
   await context.close();
  }assert.deepEqual(errors,[]);}finally{await session.close();}
 });
+
+
+test('Ventas: lista de productos debajo del buscador, filtrado, clic y teclado sin perder la búsqueda general',async()=>{
+ const session=await launch(),errors=[];
+ try{for(const width of [1440,390]){
+  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(15000);
+  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
+  await page.evaluate(()=>salesApi.state.items.push({id:'duplicate',name:'Agua'},{id:'c',name:'Cerveza',is_available:false}));
+  const input=page.locator('#incomeSearch'),list=page.locator('#incomeProductOptions');
+  assert.equal(await list.isVisible(),false);
+  await input.click();assert.equal(await input.getAttribute('aria-expanded'),'true');
+  assert.deepEqual(await list.locator('button').allTextContents(),['Agua','Café','Cerveza']);
+  const fieldBox=await input.boundingBox(),listBox=await list.boundingBox();
+  assert.ok(listBox.y>=fieldBox.y+fieldBox.height,'La lista abre hacia abajo.');
+  assert.ok(listBox.x>=0&&listBox.x+listBox.width<=width+1);
+  await page.screenshot({path:path.join(root,'..','income-picker-'+path.basename(root)+'-'+width+'.png'),fullPage:true});
+  await input.fill('cafe');assert.deepEqual(await list.locator('button').allTextContents(),['Café']);
+  await list.locator('button').click();assert.equal(await input.inputValue(),'Café');
+  assert.equal(await list.isVisible(),false);assert.equal(await input.getAttribute('aria-expanded'),'false');
+  await page.waitForFunction(()=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport?.awaitingBackend&&salesApi.state.incomeReport?.filters.query==='Café');
+  assert.ok(await page.evaluate(()=>calls.some(call=>call.action==='get_income_report'&&call.payload.filters.query==='Café')));
+  await input.fill('agu');await input.press('ArrowDown');
+  assert.equal(await list.locator('[aria-selected="true"]').innerText(),'Agua');
+  await input.press('Enter');assert.equal(await input.inputValue(),'Agua');assert.equal(await list.isVisible(),false);
+  await input.click();assert.equal(await list.isVisible(),true);
+  await input.press('Escape');assert.equal(await list.isVisible(),false);assert.equal(await input.inputValue(),'Agua');
+  await input.click();await page.locator('.income-heading h2').click();assert.equal(await list.isVisible(),false);
+  await input.fill('Mesa 1');assert.match(await list.innerText(),/Sin productos que coincidan/);
+  await input.press('Enter');
+  await page.waitForFunction(()=>!salesApi.state.incomeLoading&&!salesApi.state.incomeReport?.awaitingBackend&&salesApi.state.incomeReport?.filters.query==='Mesa 1');
+  assert.equal(await list.isVisible(),false);assert.equal(await input.inputValue(),'Mesa 1');
+  await input.fill('');assert.deepEqual(await list.locator('button').allTextContents(),['Agua','Café','Cerveza']);
+  await input.press('Tab');assert.equal(await list.isVisible(),false);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await context.close();
+ }assert.deepEqual(errors,[]);}finally{await session.close();}
+});

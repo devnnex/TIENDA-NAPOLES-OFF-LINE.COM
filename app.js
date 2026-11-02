@@ -8516,6 +8516,75 @@ const App = (() => {
     if (refresh) void loadIncomeReport();
   };
 
+  const bindIncomeProductSuggestions = () => {
+    const input = $("#incomeSearch"), list = $("#incomeProductOptions");
+    if (!input || !list || input.dataset.productsBound) return;
+    input.dataset.productsBound = "1";
+    const close = () => {
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+    };
+    const open = () => {
+      const query = normalizeText(input.value);
+      const names = [...new Set((state.items || []).map(item => String(item.name || "").trim()).filter(Boolean))]
+        .filter(name => !query || normalizeText(name).includes(query))
+        .sort((left, right) => left.localeCompare(right, "es"));
+      list.innerHTML = names.length ? names.map((name, index) =>
+        `<button type="button" role="option" tabindex="-1" id="income-product-option-${index}" data-income-product-name="${escapeHTML(name)}" aria-selected="false">${escapeHTML(name)}</button>`
+      ).join("") : '<span class="income-product-empty" role="status">Sin productos que coincidan</span>';
+      list.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+      input.removeAttribute("aria-activedescendant");
+    };
+    const choose = option => {
+      if (!option) return;
+      input.value = option.dataset.incomeProductName;
+      input.focus({ preventScroll: true });
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      close();
+    };
+    input.addEventListener("focus", open);
+    input.addEventListener("click", open);
+    input.addEventListener("input", open);
+    input.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !list.hidden) {
+        event.preventDefault(); close(); return;
+      }
+      if (event.key === "Tab") { close(); return; }
+      if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+        event.preventDefault();
+        if (list.hidden) open();
+        const options = [...list.querySelectorAll("[data-income-product-name]")];
+        if (!options.length) return;
+        const current = options.findIndex(option => option.id === input.getAttribute("aria-activedescendant"));
+        const next = current < 0 ? (event.key === "ArrowDown" ? 0 : options.length - 1)
+          : (current + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+        options.forEach((option, index) => option.setAttribute("aria-selected", String(index === next)));
+        input.setAttribute("aria-activedescendant", options[next].id);
+        options[next].scrollIntoView({ block: "nearest" });
+      } else if (event.key === "Enter" && !list.hidden) {
+        if (input.hasAttribute("aria-activedescendant")) {
+          event.preventDefault(); choose(list.querySelector('[aria-selected="true"]'));
+        } else close();
+      }
+    });
+    list.addEventListener("mousedown", event => {
+      if (event.target.closest("[data-income-product-name]")) event.preventDefault();
+    });
+    list.addEventListener("click", event => {
+      const option = event.target.closest("[data-income-product-name]");
+      if (!option) return;
+      event.preventDefault(); choose(option);
+    });
+    input.parentElement.addEventListener("focusout", event => {
+      if (!input.parentElement.contains(event.relatedTarget)) close();
+    });
+    document.addEventListener("pointerdown", event => {
+      if (!input.parentElement.contains(event.target)) close();
+    });
+  };
+
   const incomeFiltersFromForm = () => {
     initializeIncomeFilters();
     const current = state.incomeRangePreset && state.incomeRangePreset !== "custom" ? incomeRangeDates(state.incomeRangePreset) : null;
@@ -12627,6 +12696,7 @@ const App = (() => {
       const targetTableId = new FormData(event.currentTarget).get("target_table_id");
       await moveSessionToTable(event.currentTarget.session_id.value, targetTableId);
     });
+    bindIncomeProductSuggestions();
     $("#incomeSearch")?.addEventListener("input", () => {
       clearTimeout(state.incomeSearchTimer);
       state.incomeRequestId += 1;

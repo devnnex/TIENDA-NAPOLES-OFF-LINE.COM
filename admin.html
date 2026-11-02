@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261102-service-walk-in-table-move-v1">
+    <link rel="stylesheet" href="style.css?v=20261102-income-product-suggestions-v1">
     <link rel="stylesheet" href="menu-cards.css?v=20261019-visual-details-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
@@ -419,7 +419,7 @@
           </div>
           <form class="income-filter-form" id="incomeFilterForm">
             <label class="income-search">Buscar factura, mesa, producto o responsable
-              <span><i data-lucide="search"></i><input id="incomeSearch" name="query" type="search" autocomplete="off" placeholder="Ej. TN-2026, Mesa 4, cerveza..."></span>
+              <span><i data-lucide="search"></i><input id="incomeSearch" name="query" type="search" role="combobox" aria-label="Buscar factura, mesa, producto o responsable" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="incomeProductOptions" autocomplete="off" placeholder="Ej. TN-2026, Mesa 4, cerveza..."><span class="income-product-options" id="incomeProductOptions" role="listbox" aria-label="Productos guardados" hidden></span></span>
             </label>
             <label>Tipo de venta
               <select id="incomeSaleType" name="sale_type">

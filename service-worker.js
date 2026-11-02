@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v79";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v80";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -1008,7 +1008,7 @@ const writeReferences = (stored) => {
   const ids = [...new Set([...(entry.recordIds || []), entry.recordId,
     ...extractRecordIds(url, entry.payload)].filter(Boolean))];
   const refs = new Set(ids.map((id) => `${entry.entity}:${id}`));
-  const references = [...rows, ...rows.flatMap(row => Array.isArray(row.requests) ? row.requests : [])];
+  const references = [...rows, ...rows.flatMap(row => Array.isArray(row.requests) ? row.requests : []), ...rows.map(row => row.p_patch).filter(Boolean)];
   references.forEach((row) => {
     if (row.session_id || row.p_session_id) refs.add(`session:${row.session_id || row.p_session_id}`);
     if (row.table_id || row.p_table_id) refs.add(`table:${row.table_id || row.p_table_id}`);
@@ -1352,7 +1352,32 @@ self.addEventListener("sync", (event) => {
   if (event.tag === "tienda-napoles-sync") event.waitUntil(flushQueue());
 });
 
+let refreshingLoginCache = null;
+const refreshLoginCache = () => {
+  if (refreshingLoginCache) return refreshingLoginCache;
+  refreshingLoginCache = (async () => {
+    // Fetch from the installed local server, including when internet is unavailable.
+    // Do not remove the working shell unless every replacement is available.
+    const assets = await Promise.all(APP_SHELL.map(async asset => {
+      const request = new Request(new URL(asset, self.registration.scope), { cache: "reload" });
+      const response = await fetch(request);
+      if (!response.ok) throw new Error("shell_refresh_failed");
+      return [request, response];
+    }));
+    const cache = await caches.open(OFFLINE_CACHE);
+    await Promise.all(assets.map(([request, response]) => cache.put(request, response)));
+    const allowed = new Set(assets.map(([request]) => request.url));
+    await Promise.all((await cache.keys()).filter(request => !allowed.has(request.url)).map(request => cache.delete(request)));
+    await Promise.all((await caches.keys()).filter(name => name.startsWith("tienda-napoles-offline-") && name !== OFFLINE_CACHE).map(name => caches.delete(name)));
+    return true;
+  })().catch(() => false).finally(() => { refreshingLoginCache = null; });
+  return refreshingLoginCache;
+};
+
 self.addEventListener("message", (event) => {
+  if (event.data?.type === "REFRESH_LOGIN_CACHE" && event.source?.id) {
+    event.waitUntil(refreshLoginCache());
+  }
   if (event.data?.type === 'SET_SCOPED_CORE_READ') {
     if (event.source?.id) {
       if (event.data.enabled === true) scopedCoreReaders.add(event.source.id);

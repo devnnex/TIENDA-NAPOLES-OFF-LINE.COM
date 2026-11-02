@@ -322,7 +322,7 @@ const App = (() => {
     "napoles_report_published_checkouts_v1",
     "napoles_complete_movement_history_v1",
     "napoles_movement_sales_totals_v1",
-    WALK_IN_DRAFTS_STORAGE_KEY,
+    WALK_IN_DRAFTS_STORAGE_KEY, "tienda_napoles_service_walk_in_slots_v1",
     OFFLINE_ADMIN_SNAPSHOT_KEY,
     USER_LIST_CACHE_KEY,
     INCOME_REPORT_CACHE_KEY,
@@ -2396,8 +2396,7 @@ const App = (() => {
   const persistWalkInDrafts = () => {
     renderWalkInDraftBadge();
     const drafts = state.sessions
-      .filter((session) => isLocalWalkInSession(session) && session.status === "open")
-      .slice(0, 50);
+      .filter((session) => isLocalWalkInSession(session) && session.status === "open");
     void persistDurableJson(WALK_IN_DRAFTS_STORAGE_KEY, drafts);
   };
 
@@ -2409,7 +2408,49 @@ const App = (() => {
       || draft.fields?.quantity || draft.search?.trim()));
   }).length;
 
+  const serviceWalkInSessions = () => {
+    const sessions = state.sessions.filter(session => isLocalWalkInSession(session) && session.status === "open");
+    const used = new Set();
+    sessions.forEach(session => {
+      let slot = Number(session.service_slot);
+      if (!Number.isInteger(slot) || slot < 1 || used.has(slot)) {
+        slot = 1;
+        while (used.has(slot)) slot += 1;
+        session.service_slot = slot;
+      }
+      used.add(slot);
+    });
+    return sessions;
+  };
+
+  const renderServiceWalkInSales = () => {
+    const grid = $("#serviceWalkInGrid");
+    if (!grid) return;
+    const sessions = serviceWalkInSessions();
+    const count = Math.max(4, Number(readLocalJson("tienda_napoles_service_walk_in_slots_v1", 4)) || 4,
+      ...sessions.map(session => session.service_slot));
+    grid.innerHTML = Array.from({ length: count }, (_, index) => {
+      const slot = index + 1;
+      const session = sessions.find(entry => entry.service_slot === slot);
+      const draft = session?.consumption_draft;
+      const pending = Boolean(session && ((session.session_items || []).some(item => item.status !== "cancelled")
+        || draft && (draft.drafts?.length || draft.fields?.menu_item_id || draft.fields?.item_name?.trim()
+          || draft.fields?.quantity || draft.search?.trim())));
+      return `<article class="service-point-tile service-walk-in-tile ${pending ? "occupied" : "free"}"><button type="button" data-service-walk-in="${slot}" aria-label="Venta individual ${slot}${pending ? ": venta pendiente" : ": libre"}">${icon("shopping-bag", 22)}<span><strong>Venta individual ${slot}</strong><small>${pending ? "Venta pendiente" : "Libre"}</small></span>${pending ? '<em class="service-walk-in-count" aria-label="1 venta pendiente">1</em>' : ""}</button></article>`;
+    }).join("") + `<button class="ghost service-walk-in-add" type="button" id="addServiceWalkIn" aria-label="Agregar cuadro de venta individual"><span aria-hidden="true" style="font-size:2rem;line-height:1">+</span></button>`;
+    refreshIcons();
+  };
+
+  const addServiceWalkInSlot = () => {
+    const sessions = serviceWalkInSessions();
+    const count = Math.max(4, Number(readLocalJson("tienda_napoles_service_walk_in_slots_v1", 4)) || 4,
+      ...sessions.map(session => session.service_slot));
+    void persistDurableJson("tienda_napoles_service_walk_in_slots_v1", count + 1);
+    renderServiceWalkInSales();
+  };
+
   const renderWalkInDraftBadge = () => {
+    renderServiceWalkInSales();
     const button = $("#newWalkInSale");
     const badge = button?.querySelector("[data-walk-in-draft-count]");
     if (!badge) return;
@@ -4873,8 +4914,7 @@ const App = (() => {
           && !(serverSession.session_items || []).some((item) => String(item.id) === String(expectedItem.id)))
       );
       const expectedSessionConfirmed = !overlay.expectedSession || (
-        String(serverSession?.payer_name || "") === String(overlay.expectedSession.payer_name || "") &&
-        String(serverSession?.assigned_waiter_id || "") === String(overlay.expectedSession.assigned_waiter_id || "")
+        Object.keys(overlay.expectedSession).every(field => String(serverSession?.[field] ?? "") === String(overlay.expectedSession[field] ?? ""))
       );
       if (serverSession && expectedItemConfirmed && expectedSessionConfirmed) {
         const confirmedAt = Number(overlay.confirmedAt || now);
@@ -4892,6 +4932,7 @@ const App = (() => {
           if (Object.prototype.hasOwnProperty.call(overlay.session || {},field)) pending[field] = overlay.session[field];
         });
         if (overlay.expectedSession && Object.prototype.hasOwnProperty.call(overlay.expectedSession,'assigned_waiter_id')) pending.assigned_waiter = overlay.session?.assigned_waiter;
+        if (Object.prototype.hasOwnProperty.call(overlay.expectedSession || {}, "table_id")) pending.restaurant_tables = overlay.session?.restaurant_tables;
         merged.set(sessionId,pending);
       }
     });
@@ -6093,6 +6134,7 @@ const App = (() => {
     if (select) select.value = filter;
     box.innerHTML = compactTableTiles(filter) || emptyState("Sin mesas", filter === "all" ? "Crea una mesa activa para atenderla." : "No hay mesas en esta ubicación.", "armchair");
     renderServicePoints();
+    renderServiceWalkInSales();
     refreshIcons();
   };
 
@@ -6490,11 +6532,12 @@ const App = (() => {
     await openScannedTable(tableId);
   };
 
-  const createWalkInSale = async () => {
+  const createWalkInSale = async ({ slot = null } = {}) => {
     const button = $("#newWalkInSale");
     if (button) button.disabled = true;
     try {
-      const existing = state.sessions.find((session) => isLocalWalkInSession(session) && session.status === "open");
+      const sessions = serviceWalkInSessions();
+      const existing = sessions.find(session => slot === null || session.service_slot === slot);
       if (existing) {
         if (existing.consumption_draft) openConsumptionDialog(existing.id, { quickCheckout: true });
         else openPaymentDialog(existing.id);
@@ -6507,6 +6550,7 @@ const App = (() => {
         table_id: null,
         status: "open",
         sale_channel: "walk_in",
+        service_slot: slot || Array.from({ length: sessions.length + 1 }, (_, index) => index + 1).find(value => !sessions.some(entry => entry.service_slot === value)),
         payer_name: "Cliente individual",
         assigned_waiter_id: state.currentUser?.id || null,
         assigned_waiter: state.currentUser,
@@ -10357,7 +10401,7 @@ const App = (() => {
     if (!form || !options) return;
     form.reset();
     form.session_id.value = sessionId;
-    const occupiedIds = new Set(state.sessions.filter((entry) => entry.id !== sessionId && entry.status === "open").map((entry) => String(entry.table_id)));
+    const occupiedIds = new Set(state.sessions.filter((entry) => entry.id !== sessionId && sessionHasConsumption(entry)).map((entry) => String(entry.table_id)));
     const tables = state.tables.filter((table) => table.is_active !== false && String(table.id) !== String(session.table_id));
     $("#moveTableHint").textContent = `${sessionLabel(session)} · elige una mesa libre para trasladar todos los consumos.`;
     options.innerHTML = tables.length ? tables.map((table) => {
@@ -10377,40 +10421,88 @@ const App = (() => {
       return;
     }
     if (String(table.id) === String(session.table_id)) return;
-    if (state.sessions.some((entry) => entry.id !== sessionId && String(entry.table_id) === String(table.id) && entry.status === "open")) {
+    if (state.sessions.some((entry) => entry.id !== sessionId && String(entry.table_id) === String(table.id) && sessionHasConsumption(entry))) {
       toast("La mesa elegida ya tiene una cuenta abierta.", "error", "move-table-occupied");
       return;
     }
-    $("#moveTableDialog")?.close();
-    const original = session;
-    state.sessions = state.sessions.map((entry) => entry.id === sessionId ? { ...entry, table_id: table.id, restaurant_tables: table } : entry);
-    state.accountsRenderSignature = "";
-    renderAdminLive();
-    const saved = await retryQuiet(() => state.sb.from("table_sessions").update({ table_id: table.id, sale_channel: "table" }).eq("id", sessionId).select("*").single(), 4);
-    if (!saved) {
-      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? original : entry);
+    if (state.tableMoveBusy) return;
+    state.tableMoveBusy = true;
+    const submit = $("#moveTableForm")?.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const emptyDestinations = state.sessions.filter(entry => entry.id !== sessionId
+        && String(entry.table_id) === String(table.id) && entry.status === "open" && !sessionHasConsumption(entry));
+      for (const empty of emptyDestinations) {
+        const closedAt = new Date().toISOString();
+        const result = await retryQuiet(() => state.sb.rpc("replay_table_session_change", {
+          auth_token: state.authToken, p_session_id: empty.id,
+          p_patch: { table_id: table.id, status: "closed", closed_at: closedAt,
+            subtotal: 0, total: 0, discount: 0, tax: 0, service_fee: 0 },
+          p_expected_status: "open", p_expected_paid: 0
+        }), 1);
+        if (!result?.session) {
+          toast("La mesa de destino cambió. Actualiza sus consumos y abonos antes de trasladar la cuenta.", "error", "move-table-destination-changed");
+          return;
+        }
+        state.sessions = state.sessions.filter(entry => entry.id !== empty.id);
+        state.optimisticSessionStates.set(empty.id, { mode: "remove", session: empty, retainUntil: Date.now() + 30000 });
+      }
+      $("#moveTableDialog")?.close();
+      const original = session;
+      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? { ...entry, table_id: table.id, restaurant_tables: table } : entry);
       state.accountsRenderSignature = "";
+      const moved = state.sessions.find(entry => entry.id === sessionId);
+      const mutationStartedAt = Date.now();
+      state.optimisticSessionStates.set(sessionId, { mode: "upsert", session: moved, mutationStartedAt,
+        expectedSession: { table_id: table.id, sale_channel: "table" } });
+      persistOfflineAdminSnapshot();
       renderAdminLive();
-      toast("No se pudo cambiar la mesa. La cuenta fue restaurada.", "error", `move-table:${sessionId}`);
-      return;
-    }
-    const relatedUpdates = await Promise.all([
-      dbQuiet(state.sb.from("session_items").update({ table_id: table.id, updated_by_user_id: state.currentUser?.id || null }).eq("session_id", sessionId).select("id"), null),
-      dbQuiet(state.sb.from("service_requests").update({ table_id: table.id }).eq("session_id", sessionId).select("id"), null)
-    ]);
-    if (relatedUpdates.some((result) => result === null)) {
-      await Promise.all([
-        dbQuiet(state.sb.from("table_sessions").update({ table_id: original.table_id, sale_channel: original.sale_channel || "table" }).eq("id", sessionId), null),
-        dbQuiet(state.sb.from("session_items").update({ table_id: original.table_id }).eq("session_id", sessionId), null),
-        dbQuiet(state.sb.from("service_requests").update({ table_id: original.table_id }).eq("session_id", sessionId), null)
+      const result = await retryQuiet(() => state.sb.rpc("replay_table_session_change", {
+        auth_token: state.authToken, p_session_id: sessionId,
+        p_patch: { table_id: table.id, sale_channel: "table" }, p_expected_status: "open"
+      }), 4);
+      const saved = result?.session;
+      if (!saved) {
+        state.optimisticSessionStates.delete(sessionId);
+        state.sessions = state.sessions.map((entry) => entry.id === sessionId ? original : entry);
+        persistOfflineAdminSnapshot();
+        state.accountsRenderSignature = "";
+        renderAdminLive();
+        toast("No se pudo cambiar la mesa. La cuenta fue restaurada.", "error", `move-table:${sessionId}`);
+        return;
+      }
+      const relatedUpdates = await Promise.all([
+        dbQuiet(state.sb.from("session_items").update({ table_id: table.id, updated_by_user_id: state.currentUser?.id || null }).eq("session_id", sessionId).select("id"), null),
+        dbQuiet(state.sb.from("service_requests").update({ table_id: table.id }).eq("session_id", sessionId).select("id"), null)
       ]);
-      state.sessions = state.sessions.map((entry) => entry.id === sessionId ? original : entry);
-      state.accountsRenderSignature = "";
+      if (relatedUpdates.some((result) => result === null)) {
+        state.optimisticSessionStates.delete(sessionId);
+        await Promise.all([
+          dbQuiet(state.sb.from("table_sessions").update({ table_id: original.table_id, sale_channel: original.sale_channel || "table" }).eq("id", sessionId), null),
+          dbQuiet(state.sb.from("session_items").update({ table_id: original.table_id }).eq("session_id", sessionId), null),
+          dbQuiet(state.sb.from("service_requests").update({ table_id: original.table_id }).eq("session_id", sessionId), null)
+        ]);
+        state.sessions = state.sessions.map((entry) => entry.id === sessionId ? original : entry);
+        state.accountsRenderSignature = "";
+        persistOfflineAdminSnapshot();
+        renderAdminLive();
+        toast("No se pudo completar el cambio de mesa. La cuenta fue restaurada.", "error", `move-table-related:${sessionId}`);
+        return;
+      }
+      state.sessions = state.sessions.map(entry => entry.id === sessionId ? { ...entry,
+        session_items: (entry.session_items || []).map(item => ({ ...item, table_id: table.id })) } : entry);
+      state.requests = state.requests.map(request => request.session_id === sessionId
+        ? { ...request, table_id: table.id, restaurant_tables: table } : request);
+      const current = state.sessions.find(entry => entry.id === sessionId);
+      state.optimisticSessionStates.set(sessionId, { mode: "upsert", session: current, mutationStartedAt,
+        expectedSession: { table_id: table.id, sale_channel: "table" } });
+      persistOfflineAdminSnapshot();
       renderAdminLive();
-      toast("No se pudo completar el cambio de mesa. La cuenta fue restaurada.", "error", `move-table-related:${sessionId}`);
-      return;
+      toast(`Cuenta movida a ${tableLabel(table)}.`, "ok", `moved-table:${sessionId}`);
+    } finally {
+      state.tableMoveBusy = false;
+      if (submit) submit.disabled = false;
     }
-    toast(`Cuenta movida a ${tableLabel(table)}.`, "ok", `moved-table:${sessionId}`);
   };
 
   const closeSession = async (id, checkout = null) => {
@@ -13092,6 +13184,8 @@ const App = (() => {
       }
       if (target.dataset.minimizeAdminChat) setAdminChatMinimized(target.dataset.minimizeAdminChat, !state.adminChats.get(String(target.dataset.minimizeAdminChat))?.minimized);
       if (target.id === "newWalkInSale") await createWalkInSale();
+      if (target.dataset.serviceWalkIn) await createWalkInSale({ slot: Number(target.dataset.serviceWalkIn) });
+      if (target.id === "addServiceWalkIn") addServiceWalkInSlot();
       if (target.id === "addServicePoint") addServicePoint();
       if (target.dataset.serviceZone) {
         state.activeServiceZone = target.dataset.serviceZone;
@@ -14209,6 +14303,14 @@ const App = (() => {
     location.reload();
   };
 
+  const refreshOfflineLoginCache = async () => {
+    try {
+      const registration = await navigator.serviceWorker?.ready;
+      const worker = navigator.serviceWorker?.controller || registration?.active;
+      worker?.postMessage({ type: "REFRESH_LOGIN_CACHE" });
+    } catch (_) { /* La limpieza no interrumpe el inicio de sesión. */ }
+  };
+
   const initAdmin = async () => {
     setLoading(true);
     const launchUrl = new URL(location.href);
@@ -14219,6 +14321,7 @@ const App = (() => {
     }
     const pendingScan = new URLSearchParams(location.search).get("scan") || "";
     await waitForAdminLogin();
+    void refreshOfflineLoginCache();
     const bootstrapReady = loadBootstrap();
     const cachedPins = readLocalJson(USER_CREDENTIALS_CACHE_KEY, {});
     state.userCredentialPins = cachedPins && typeof cachedPins === "object" && !Array.isArray(cachedPins) ? cachedPins : {};

@@ -9,7 +9,7 @@ function harness(){
  const context=vm.createContext({state,$:selector=>nodes[selector],isLocalWalkInSession:s=>s?.local_only===true,Date,
   sessionTotal:s=>(s.session_items||[]).filter(row=>row.status!=='cancelled').reduce((sum,row)=>sum+row.quantity*row.unit_price,0),
   sessionPaid:()=>0,icon:()=>'',renderPaymentSaleLines:()=>renders++,updatePaymentTipChoice:()=>totals++,refreshIcons(){},
-  persistWalkInDrafts:()=>{persisted++;context.badge();}});
+  renderServiceWalkInSales(){},persistWalkInDrafts:()=>{persisted++;context.badge();}});
  vm.runInContext(block('consumptionChangeAllowed')+block('clearPaymentsWithoutConsumption')+block('pendingWalkInSaleCount')+block('renderWalkInDraftBadge')+block('removeWalkInSaleItem')+';globalThis.remove=removeWalkInSaleItem;globalThis.badge=renderWalkInDraftBadge;globalThis.count=pendingWalkInSaleCount;',context);
  return {context,state,form,badge,button,stats:()=>({persisted,renders,totals})};
 }

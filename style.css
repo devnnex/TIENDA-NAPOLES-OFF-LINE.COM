@@ -5512,3 +5512,11 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 .payment-sale-lines > .payment-walk-in-line { display: grid; grid-template-columns: minmax(0, 1fr) auto 34px; align-items: center; }
 .payment-walk-in-line > span { min-width: 0; overflow-wrap: anywhere; }
 #newWalkInSale [data-walk-in-draft-count][hidden] { display: none; }
+
+/* Ventas individuales retenidas en Atender mesa. */
+.service-walk-in-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: .65rem; margin-bottom: 1rem; }
+.service-walk-in-tile { grid-template-columns: minmax(0, 1fr); }
+.service-walk-in-tile > button:first-child { position: relative; min-height: 96px; padding-right: 2.3rem; }
+.service-walk-in-count { position: absolute; right: .55rem; top: .55rem; display: grid; place-items: center; min-width: 22px; height: 22px; padding: 0 .25rem; border-radius: 50%; background: #dc2626; color: #fff; font-size: .75rem; font-weight: 800; font-style: normal; }
+.service-walk-in-add { min-height: 96px; display: grid; place-items: center; border: 1px dashed #a9dcbc; border-radius: 14px; }
+@media (max-width: 560px) { .service-walk-in-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .service-walk-in-tile strong { font-size: .85rem; } }

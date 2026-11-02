@@ -1,7 +1,13 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.37.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.38.exe` con Inno Setup 6.
+
+La version 1.0.38 corrige las mesas libres al trasladar cuentas y valida las
+sesiones vacias sin eliminar consumos ni abonos. Agrega cuatro ventas individuales
+independientes en Atender mesa, contador y boton +. Renueva la cache al iniciar
+sesion sin recargar ni borrar ventas pendientes, borradores o acceso local.
+Usa cache v80. No requiere SQL ni cambios de Apps Script.
 
 La version 1.0.37 incluye el codigo actual de main: busqueda de productos
 directamente desde el backend, paginacion completa y reintentos automaticos;

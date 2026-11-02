@@ -263,3 +263,49 @@ test('venta individual: selección editable, guardar al salir, otra mesa, recarg
   await context.close();
  }assert.deepEqual(errors,[]);}finally{await session.close();}
 });
+
+
+test('Atender mesa: cuatro ventas separadas, contador, salir, recargar y agregar más cuadros',async()=>{
+ const session=await launch(),errors=[];
+ try{for(const width of [1440,390]){
+  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
+  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
+  await page.evaluate(()=>salesApi.showAdminSection('service'));
+  assert.equal(await page.locator('[data-service-walk-in]').count(),4);
+  assert.equal(await page.locator('#addServiceWalkIn').innerText(),'+');
+  const sales=[];
+  for(const slot of [1,2]){
+   await page.locator('[data-service-walk-in="'+slot+'"]').click();
+   sales.push(await page.locator('#paymentForm [name="session_id"]').inputValue());
+   await page.locator('#paymentAddItem').click();
+   await page.locator('#consumptionProductSearch').fill(slot===1?'Agua':'Café');
+   await page.locator('[data-consumption-product="'+(slot===1?'p':'q')+'"]').click();
+   await page.locator('#consumptionForm [name="quantity"]').fill(String(slot+2));
+   await page.locator('#consumptionQueueButton').click();
+   await page.locator('#consumptionDialog [data-cancel-consumption]').first().click();
+   assert.equal(await page.locator('[data-service-walk-in="'+slot+'"] .service-walk-in-count').innerText(),'1');
+  }
+  assert.notEqual(sales[0],sales[1]);
+  await page.evaluate(()=>salesApi.showAdminSection('dashboard'));
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').innerText(),'2');
+  await page.evaluate(()=>salesApi.showAdminSection('service'));
+  await page.locator('#addServiceWalkIn').click();assert.equal(await page.locator('[data-service-walk-in]').count(),5);
+  await boot(page,session.url);
+  await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('service');});
+  assert.equal(await page.locator('[data-service-walk-in]').count(),5);
+  assert.equal(await page.locator('.service-walk-in-count').count(),2);
+  for(const slot of [1,2]){
+   await page.locator('[data-service-walk-in="'+slot+'"]').click();
+   assert.equal(await page.locator('#consumptionForm [name="session_id"]').inputValue(),sales[slot-1]);
+   assert.match(await page.locator('#consumptionSelectionLines').innerText(),slot===1?/Agua[\s\S]*3 ×/:/Café[\s\S]*4 ×/);
+   await page.keyboard.press('Escape');
+  }
+  await page.locator('[data-service-walk-in="5"]').click();await page.keyboard.press('Escape');
+  assert.equal(await page.locator('.service-walk-in-count').count(),2);
+  assert.equal(await page.evaluate(()=>salesApi.state.invoiceHistory.length),0);
+  assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.p.stock),100000);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await page.screenshot({path:path.join(root,'..','proof-'+path.basename(root)+'-'+width+'.png'),fullPage:true});
+  await context.close();
+ }assert.deepEqual(errors,[]);}finally{await session.close();}
+});

@@ -84,7 +84,7 @@ const context = vm.createContext({
 const workerPath = path.join(__dirname, "..", "service-worker.js");
 const workerSource = fs.readFileSync(workerPath, "utf8");
 vm.runInContext(`${workerSource}\n;globalThis.__syncTest = {
-  directSupabaseRequest, flushQueue, isQueueableRpc, isRestMutation,
+  directSupabaseRequest, flushQueue, isQueueableRpc, isRestMutation, writesAreRelated,
   listEntries, networkFirst, normalizeStoredEntry, putEntry, queuedResponse,
   recoverInterruptedEntries, refreshQueuedSessionItemAuth, serializeRequest,
   syncStatusSnapshot, verifyRestMutation, verifySettledTableSessionPatch
@@ -1561,6 +1561,28 @@ test('86 no anuncia como confirmado un cambio local que el servidor rechazó', a
   await api.flushQueue(true);
   assert.equal(confirmedMessages.some((message) => message.type === 'OFFLINE_MUTATION_CONFIRMED'), false);
   assert.equal((await api.listEntries())[0].status, 'failed');
+});
+
+test('87 conserva el orden entre liberar destino vacío, mover cuenta y actualizar sus consumos', async () => {
+  const close = await api.serializeRequest(request('rpc/replay_table_session_change', 'POST', {
+    auth_token: 'staff', p_session_id: 'empty-session', p_patch: { table_id: 'target', status: 'closed', subtotal: 0, total: 0 }
+  }));
+  const move = await api.serializeRequest(request('rpc/replay_table_session_change', 'POST', {
+    auth_token: 'staff', p_session_id: 'source-session', p_patch: { table_id: 'target', sale_channel: 'table' }
+  }));
+  const items = await api.serializeRequest(request('session_items', 'PATCH', { table_id: 'target' }, '?session_id=eq.source-session'));
+  assert.equal(api.writesAreRelated(close, move), true);
+  assert.equal(api.writesAreRelated(move, items), true);
+  await api.putEntry(close); await api.putEntry(move); await api.putEntry(items);
+  const sent = [];
+  remoteFetch = async (input) => { sent.push(input.url); return Response.json({ message: 'El destino ahora tiene consumo' }, { status: 400 }); };
+  await api.flushQueue(true);
+  assert.equal(sent.length, 1, 'Un destino rechazado impide mover o modificar los consumos dependientes.');
+  const entries = await api.listEntries();
+  assert.equal(entries.find(entry => entry.id === close.id).status, 'failed');
+  assert.equal(entries.find(entry => entry.id === move.id).status, 'pending');
+  assert.equal(entries.find(entry => entry.id === items.id).status, 'pending');
+  records.clear();
 });
 
 (async () => {

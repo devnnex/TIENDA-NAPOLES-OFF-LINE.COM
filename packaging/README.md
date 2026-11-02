@@ -1,7 +1,10 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.39.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.40.exe` con Inno Setup 6.
+
+La version 1.0.40 aplica a las ventas individuales de Atender mesa el mismo
+azul de la venta individual de Inicio. Solo cambia sus colores. Usa cache v82.
 
 La version 1.0.39 agrega al buscador de Ventas una lista de productos guardados
 que abre hacia abajo al tocar el campo y se filtra al escribir. Permite elegir

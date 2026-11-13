@@ -1,7 +1,15 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.41.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.42.exe` con Inno Setup 6.
+
+La version 1.0.42 corrige la reaparicion de cuentas facturadas en todas las mesas.
+Guarda el recibo de cierre en la misma transaccion de IndexedDB que la factura,
+reconcilia cuentas antiguas con su factura original y recupera respaldos pendientes
+sin repetir la venta ni descontar otra vez inventario. Comprueba productos y abonos
+antes de cerrar; conserva cualquier consumo distinto para revision. Usa cache v84.
+No requiere SQL ni actualizar Apps Script. Instalar sobre la misma aplicacion con
+el mismo usuario de Windows conserva los datos locales.
 
 La version 1.0.41 agrega una papelera en cada venta individual de Atender mesa.
 Quita el cuadro elegido sin renumerar las demas ventas, conserva la eliminacion

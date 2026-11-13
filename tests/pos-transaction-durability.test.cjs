@@ -52,7 +52,6 @@ function checkout(h, remote = new Map()) {
       void h.api.persist('invoices', state.invoiceHistory);
       void h.api.persist('outbox', [...h.api.read('outbox', []), { id: 'job-' + sale.id, action: 'record_sale', payload: { invoice: sale } }]);
     },
-    persistOfflineAdminSnapshot() {},
     persistInvoiceHistory: () => h.api.persist('invoices', state.invoiceHistory),
     readAppsScriptOutbox: () => h.api.read('outbox', []), writeAppsScriptOutbox: jobs => h.api.persist('outbox', jobs)
   });

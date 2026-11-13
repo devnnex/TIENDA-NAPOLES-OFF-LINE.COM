@@ -25,7 +25,7 @@ function harness({ indexedDB = new IDBFactory(), localStorage, invoices = [], se
     incomeReport: null, optimisticSessionStates: new Map(), optimisticRequestStates: new Map(), checkoutClosures: clone(ledger),
     currentUser: { id: 'boss', role: 'boss' }, authToken: 'test', posFeatures: { abonos: true }, activePaymentTotal: 200, activePaymentBase: 200 };
   const context = vm.createContext({ state, console, indexedDB, localStorage, structuredClone, Date, Map, Set,
-    window: { indexedDB }, navigator: { onLine: !queued },
+    window: { indexedDB, open: () => ({ close() { events.push('popup-close'); } }) }, navigator: { onLine: !queued },
     LOCAL_DATA_DB: 'checkout-recovery', LOCAL_DATA_DB_VERSION: 1, LOCAL_DATA_STORE: 'records', DURABLE_LOCAL_KEYS: [],
     INVENTORY_STORAGE_KEY: 'inventory', INVOICE_STORAGE_KEY: 'invoices', INVENTORY_MOVEMENTS_STORAGE_KEY: 'movements', APPS_SCRIPT_OUTBOX_KEY: 'outbox',
     REMOTE_CONFIRMATION_HOLD_MS: 1500,
@@ -34,6 +34,7 @@ function harness({ indexedDB = new IDBFactory(), localStorage, invoices = [], se
     isManager: () => true, isLocalWalkInSession: () => false, persistWalkInDrafts() {}, persistOfflineAdminSnapshot() {},
     renderAdminLive() {}, renderAdmin() {}, persistPendingAdminRequests() {}, rememberCompletedAdminRequests() {}, readPendingAdminRequests: () => [],
     toast: (...args) => messages.push(args), $: () => ({ close() { events.push('dialog-close'); } }),
+    printThermalReceipt: (_session, sale) => events.push('print:' + sale.id),
     paidInventoryPlan: () => [], applyPaidInventoryLocally: () => { events.push('inventory'); state.inventoryMeta.stock -= 2; },
     readAppsScriptOutbox: () => jobs,
     writeAppsScriptOutbox: next => { jobs.splice(0, jobs.length, ...next); return context.api.persist('outbox', jobs); },
@@ -70,7 +71,7 @@ function harness({ indexedDB = new IDBFactory(), localStorage, invoices = [], se
     + section('  const CHECKOUT_INTENTS_KEY =', '  const performPayment =')
     + ';globalThis.api={persist:persistDurableJson,hydrate:hydrateDurableKey,read:readLocalJson,process:processPayment,recover:recoverPendingCheckouts,finish:finishCheckoutIntent,save:saveCheckoutIntent,commit:commitCheckout,merge:mergeOptimisticSessions,signature:checkoutSessionSignature,close:closeSession};', context);
   return { context, api: context.api, state, remote, events, messages, jobs, indexedDB, localStorage,
-    pay: id => context.api.process({ session_id: { value: id } }, { value: 'save' }) };
+    pay: (id, action = 'save') => context.api.process({ session_id: { value: id } }, { value: action }) };
 }
 
 for (const table of ['1', '3', '8', '20']) test('reconcilia la factura existente de mesa ' + table + ' con el cierre persistente, sin otro cobro', async () => {
@@ -101,7 +102,7 @@ test('una recarga o reinicio de PWA descarta la copia atrasada aun sin el overla
 });
 
 test('no oculta ni cierra consumo distinto con el mismo total y el mismo UUID de cuenta', async () => {
-  const old = account(), changed = clone(old); changed.session_items[0].id = 'another-line';
+  const old = account(), changed = clone(old); changed.session_items[0].id = 'another-line'; changed.session_items[0].menu_item_id = 'another-product';
   const h = harness({ sessions: [changed], invoices: [invoice(old)] });
   h.state.checkoutClosures[old.id] = { signature: h.api.signature(old) };
   h.state.optimisticSessionStates.set(old.id, { mode: 'remove' });
@@ -182,7 +183,7 @@ test('un cambio de productos durante el cobro conserva el intento aunque el impo
 
 test('consulta el consumo vigente antes de cerrar: productos distintos con igual importe no se descartan', async () => {
   const session = account(), h = harness({ sessions: [session], invoices: [invoice(session)] });
-  const changed = clone(session); changed.session_items[0].id = 'remote-new-product';
+  const changed = clone(session); changed.session_items[0].id = 'remote-new-product'; changed.session_items[0].menu_item_id = 'another-product';
   h.remote.set(session.id, changed);
   await h.pay(session.id);
   assert.equal(h.remote.get(session.id).status, 'open');
@@ -215,4 +216,104 @@ test('una factura sin pagos completos no prueba un cobro y conserva la cuenta', 
   await h.pay(session.id);
   assert.equal(h.state.sessions.length, 1);
   assert.equal(h.events.includes('remote-close'), false);
+});
+
+for (const action of ['save', 'print']) test('recupera el intento anterior con otros IDs de linea: ' + action, async () => {
+  const session = account(), sale = invoice(session);
+  sale.items[0].id = 'historic-report-line-id';
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id, action);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+  assert.equal(h.state.invoiceHistory.length, 1);
+  assert.equal(h.state.inventoryMeta.stock, 10);
+  assert.equal(h.remote.get(session.id).status, 'closed');
+  assert.equal(h.events.filter(event => event.startsWith('print:')).length, action === 'print' ? 1 : 0);
+});
+
+test('una factura agrupada equivale al mismo consumo repartido en varias lineas', async () => {
+  const session = account(), sale = invoice(session);
+  session.session_items = [ { ...session.session_items[0], quantity: 1 }, { ...session.session_items[0], id: 'line-split', quantity: 1 } ];
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+  assert.equal(h.state.invoiceHistory.length, 1);
+});
+
+test('una factura antigua sin metadatos de abonos recupera la cuenta sin cobrar el saldo otra vez', async () => {
+  const session = account(); session.session_payments = [{ id: 'old-abono', amount: 50 }];
+  const sale = invoice(session); delete sale.prepayments;
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+  assert.equal(h.state.invoiceHistory.length, 1);
+  assert.equal(h.state.inventoryMeta.stock, 10);
+});
+
+test('un producto realmente agregado despues de la factura no se descarta aunque tenga el mismo importe', async () => {
+  const session = account(), sale = invoice(session);
+  session.session_items[0].id = 'new-consumption'; session.session_items[0].created_at = '2026-11-12T18:00:00Z';
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 1);
+  assert.equal(h.events.includes('remote-close'), false);
+});
+
+for (const action of ['save', 'print']) test('el boton ' + action + ' conserva su opcion al recuperar un intento protegido sin factura local', async () => {
+  const session = account(), sale = invoice(session), h = harness({ sessions: [session] });
+  await h.api.save(sale, session, 0, 'prepared');
+  await h.pay(session.id, action);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+  assert.equal(h.state.invoiceHistory.length, 1);
+  assert.equal(h.events.filter(event => event.startsWith('print:')).length, action === 'print' ? 1 : 0);
+});
+
+test('recupera lineas de reporte con nombres de campos distintos y metadatos de base antiguos', async () => {
+  const session = account(), sale = invoice(session);
+  sale.items = [{ lineId: 'report-line', menuItemId: 'product', name: 'Agua', quantity: 2, unitPrice: 100 }];
+  sale.baseTotal = 100;
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+  assert.equal(h.state.invoiceHistory[0].id, sale.id);
+});
+
+test('una factura antigua sin referencia de catalogo se verifica por nombre, cantidad y precio', async () => {
+  const session = account(), sale = invoice(session); delete sale.items[0].menu_item_id;
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+});
+
+test('una restauracion parcial del consumo ya facturado termina el cierre sin generar otra venta', async () => {
+  const session = account(), sale = invoice(session); session.session_items[0].quantity = 1;
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+  assert.equal(h.state.invoiceHistory[0].totals.total, 200);
+  assert.equal(h.state.inventoryMeta.stock, 10);
+});
+
+test('el saldo final conocido de una factura antigua sigue protegiendo un abono nuevo', async () => {
+  const session = account(), sale = invoice(session); delete sale.prepayments; sale.remainingPaid = 200;
+  session.session_payments = [{ id: 'new-abono', amount: 50 }];
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 1);
+  assert.equal(h.events.includes('remote-close'), false);
+});
+
+test('un precio diferente no se confunde con el consumo facturado', async () => {
+  const session = account(), sale = invoice(session); session.session_items[0].unit_price = 110;
+  const h = harness({ sessions: [session], invoices: [sale] });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 1);
+  assert.equal(h.events.includes('remote-close'), false);
+});
+
+for (const action of ['save', 'print']) test('el boton ' + action + ' funciona si la recuperacion automatica ya retiro la mesa', async () => {
+  const session = account(), h = harness({ invoices: [invoice(session)] });
+  await h.pay(session.id, action);
+  assert.equal(h.state.invoiceHistory.length, 1);
+  assert.equal(h.events.includes('remote-close'), false);
+  assert.equal(h.events.filter(event => event.startsWith('print:')).length, action === 'print' ? 1 : 0);
 });

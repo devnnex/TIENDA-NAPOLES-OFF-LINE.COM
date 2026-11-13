@@ -1,7 +1,15 @@
 # Instalador de Tienda Napoles Offline
 
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.42.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.43.exe` con Inno Setup 6.
+
+La version 1.0.43 corrige el bloqueo al recuperar una factura anterior en los
+botones Cobrar sin imprimir y Cobrar e imprimir. Compara productos, cantidades
+y precios, admite lineas agrupadas y el formato de facturas antiguas, y termina
+el cierre con la misma factura sin repetir inventario. Conserva la proteccion
+de consumos o abonos nuevos. La recuperacion respeta la opcion de imprimir.
+Incluye pruebas de clic real de ambos botones. Usa cache v85. No requiere SQL
+ni actualizar Apps Script.
 
 La version 1.0.42 corrige la reaparicion de cuentas facturadas en todas las mesas.
 Guarda el recibo de cierre en la misma transaccion de IndexedDB que la factura,

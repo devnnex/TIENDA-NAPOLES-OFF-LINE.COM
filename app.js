@@ -11194,15 +11194,38 @@ const App = (() => {
     .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
   const checkoutSessionSignature = session => JSON.stringify([String(session.id),
     checkoutLinesSignature(session.session_items), Number(sessionTotals(session).total), Number(sessionPaid(session))]);
-  const checkoutInvoiceMatches = (invoice, session) => Boolean(invoice && session
-    && String(invoice.sessionId) === String(session.id)
-    && Number.isFinite(Date.parse(invoice.createdAt))
-    && Array.isArray(invoice.items) && invoice.items.length
-    && checkoutLinesSignature(invoice.items) === checkoutLinesSignature(session.session_items)
-    && Number(invoice.baseTotal ?? invoice.totals?.baseTotal ?? (Number(invoice.totals?.total) - Number(invoice.tipAmount || 0))) === Number(sessionTotals(session).total)
-    && (invoice.prepayments || []).reduce((sum, row) => sum + Number(row.amount || 0), 0) === Number(sessionPaid(session))
-    && Array.isArray(invoice.payments)
-    && invoice.payments.reduce((sum, row) => sum + Number(row.amount || 0), 0) === Number(invoice.totals?.total));
+  // Compare the billed products/quantities/prices, independent of row IDs or
+  // how the sales report groups its lines. Older receipts omit prepayment metadata.
+  const checkoutBilledLinesSignature = (items = [], byProductId = true) => {
+    const lines = new Map();
+    items.filter(item => item.status !== "cancelled").forEach(item => {
+      const product = String(item.menu_item_id || item.menuItemId || "");
+      const name = String(item.item_name ?? item.name ?? "").trim().toLocaleLowerCase("es-CO");
+      const key = JSON.stringify([byProductId ? product || name : name, Math.max(0, Math.round(Number(item.unit_price ?? item.unitPrice ?? 0)))]);
+      lines.set(key, Number(lines.get(key) || 0) + Number(item.quantity || 0));
+    });
+    return JSON.stringify([...lines].sort(([a], [b]) => a.localeCompare(b)));
+  };
+  const checkoutInvoiceMatches = (invoice, session) => {
+    if (!invoice || !session || String(invoice.sessionId) !== String(session.id)
+      || !Number.isFinite(Date.parse(invoice.createdAt)) || !Array.isArray(invoice.items) || !invoice.items.length
+      || !Array.isArray(invoice.payments)
+      || invoice.payments.reduce((sum, row) => sum + Number(row.amount || 0), 0) !== Number(invoice.totals?.total)) return false;
+    const active = items => items.filter(item => item.status !== "cancelled");
+    const byProductId = [...active(invoice.items), ...active(session.session_items || [])].every(item => item.menu_item_id || item.menuItemId);
+    const billed = new Map(JSON.parse(checkoutBilledLinesSignature(invoice.items, byProductId)));
+    const current = JSON.parse(checkoutBilledLinesSignature(session.session_items || [], byProductId));
+    // Partially restored rows can be a subset of an already paid receipt.
+    // Every current unit must be covered; additional products remain unpaid.
+    if (current.some(([key, quantity]) => quantity > Number(billed.get(key) || 0))) return false;
+    if (Array.isArray(invoice.prepayments)
+      && invoice.prepayments.reduce((sum, row) => sum + Number(row.amount || 0), 0) !== Number(sessionPaid(session))) return false;
+    if (!Array.isArray(invoice.prepayments) && invoice.remainingPaid != null
+      && Number(invoice.remainingPaid) !== Number(invoice.totals.total) - Number(sessionPaid(session))) return false;
+    const billedIds = new Set(invoice.items.map(item => String(item.id || item.lineId || "")).filter(Boolean));
+    return !(session.session_items || []).some(item => item.status !== "cancelled"
+      && item.created_at && !billedIds.has(String(item.id || "")) && Date.parse(item.created_at) > Date.parse(invoice.createdAt));
+  };
 
   const reconcileRecordedCheckout = async (invoice, session) => {
     if (!checkoutInvoiceMatches(invoice, session)) {
@@ -11390,30 +11413,38 @@ const App = (() => {
         if (!session) {
           $("#paymentDialog")?.close();
           toast("La factura ya está guardada. Revisa su estado de respaldo en Ventas.", "ok", "checkout-already-complete");
+          if (submitter?.value === "print") {
+            try { printThermalReceipt({ id: recorded.sessionId, table_id: recorded.tableId, payer_name: recorded.payerName || "" }, recorded); }
+            catch (_) { toast("Cobro guardado. No se pudo imprimir; reimprime desde Ventas.", "error", "checkout-print-error"); }
+          }
           return;
         }
+        const receiptWindow = submitter?.value === "print" ? window.open("", "_blank", "width=420,height=720") : null;
         state.paymentProcessing = true;
         try {
           if (await reconcileRecordedCheckout(recorded, session)) {
             $("#paymentDialog")?.close();
             renderAdminLive();
             toast("Cierre recuperado con la factura original. No se generó otro cobro.", "ok", "checkout-reconciled");
+            if (submitter?.value === "print") printThermalReceipt(session, recorded, receiptWindow);
             void flushAppsScriptOutbox();
-          }
-        } catch (error) { toast(String(error?.message || error), "error", "checkout-reconcile-error"); }
+          } else receiptWindow?.close();
+        } catch (error) { receiptWindow?.close(); toast(String(error?.message || error), "error", "checkout-reconcile-error"); }
         finally { state.paymentProcessing = false; }
         return;
       }
       const intent = readLocalJson(CHECKOUT_INTENTS_KEY, {})[form.session_id.value];
       if (intent) {
+        const receiptWindow = submitter?.value === "print" ? window.open("", "_blank", "width=420,height=720") : null;
         state.paymentProcessing = true;
         try {
           if (await finishCheckoutIntent(intent)) {
             $("#paymentDialog")?.close();
             toast("Cobro recuperado. Factura " + intent.invoice.number + ". Puedes reimprimirla desde Ventas.", "ok", "checkout-recovered");
+            if (submitter?.value === "print") printThermalReceipt(intent.session, intent.invoice, receiptWindow);
             void flushAppsScriptOutbox();
-          } else toast("El cobro sigue protegido y requiere revisión de la cuenta.", "error", "checkout-pending");
-        } catch (error) { toast(String(error?.message || error), "error", "checkout-resume-error"); }
+          } else { receiptWindow?.close(); toast("El cobro sigue protegido y requiere revisión de la cuenta.", "error", "checkout-pending"); }
+        } catch (error) { receiptWindow?.close(); toast(String(error?.message || error), "error", "checkout-resume-error"); }
         finally { state.paymentProcessing = false; }
         return;
       }

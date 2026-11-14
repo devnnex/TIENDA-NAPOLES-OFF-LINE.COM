@@ -37,6 +37,7 @@ const setup = ({ method = 'cash', validPayment = true, validStock = true, savedL
     readLocalJson: (key, fallback) => local.has(key) ? structuredClone(local.get(key)) : fallback,
     persistDurableJson: async (key, value) => { local.set(key, structuredClone(value)); return true; },
     persistCheckoutAtomically: async project => { project(); return savedLocally; },
+    persistOfflineAdminSnapshot() {},
     persistInvoiceHistory() {}, readAppsScriptOutbox: () => [], writeAppsScriptOutbox: async () => true,
     state, console,
     INVENTORY_STORAGE_KEY: 'inventory', INVOICE_STORAGE_KEY: 'invoices',

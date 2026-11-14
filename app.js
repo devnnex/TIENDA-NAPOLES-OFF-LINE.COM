@@ -312,7 +312,7 @@ const App = (() => {
     diez: 10
   };
   const DURABLE_LOCAL_KEYS = [
-    "napoles_checkout_intents_v1",
+    "napoles_checkout_intents_v1", "napoles_checkout_closures_v1",
     `napoles_shared_sales_shift_v1:${SUPABASE_CONFIG.url}`,
     INVENTORY_STORAGE_KEY,
     INVOICE_STORAGE_KEY,
@@ -2362,6 +2362,7 @@ const App = (() => {
     state.inventoryMeta = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
     const invoices = readLocalJson(INVOICE_STORAGE_KEY, []);
     state.invoiceHistory = Array.isArray(invoices) ? invoices : [];
+    state.checkoutClosures = readLocalJson("napoles_checkout_closures_v1", {});
     const movements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, []);
     state.inventoryMovements = Array.isArray(movements) ? movements : [];
     const storedTips = readLocalJson(TIP_SETTINGS_STORAGE_KEY, {});
@@ -4921,10 +4922,21 @@ const App = (() => {
 
   const mergeOptimisticSessions = (serverSessions = [], { readStartedAt = 0 } = {}) => {
     const merged = new Map(serverSessions.map((session) => [session.id, { ...session, session_items: mergeSessionItems(session.session_items) }]));
+    state.checkoutReconciliationCandidates ||= new Map();
+    serverSessions.forEach(session => {
+      if ((state.invoiceHistory || []).some(invoice => String(invoice.sessionId) === String(session.id))) {
+        state.checkoutReconciliationCandidates.set(String(session.id), session);
+      }
+    });
     state.optimisticSessionStates.forEach((overlay, sessionId) => {
       const now = Date.now();
       const serverSession = merged.get(sessionId);
       if (overlay.mode === "remove") {
+        const receipt = state.checkoutClosures?.[sessionId];
+        if (serverSession && receipt && receipt.signature !== checkoutSessionSignature(serverSession)) {
+          state.optimisticSessionStates.delete(sessionId);
+          return;
+        }
         merged.delete(sessionId);
         if (!serverSession && Date.now() >= Number(overlay.retainUntil || 0)) {
           state.optimisticSessionStates.delete(sessionId);
@@ -4969,6 +4981,12 @@ const App = (() => {
         if (Object.prototype.hasOwnProperty.call(overlay.expectedSession || {}, "table_id")) pending.restaurant_tables = overlay.session?.restaurant_tables;
         merged.set(sessionId,pending);
       }
+    });
+    // Rebuild the removal from the durable checkout receipt after reload/PWA restart.
+    // A different account on the same table, or changed consumption, remains visible.
+    Object.entries(state.checkoutClosures || {}).forEach(([id, receipt]) => {
+      const session = merged.get(id);
+      if (session && receipt.signature === checkoutSessionSignature(session)) merged.delete(id);
     });
     return Array.from(merged.values());
   };
@@ -5376,6 +5394,7 @@ const App = (() => {
     try {
       const changed = await loadAdminData();
       if (changed) renderAdminLive();
+      void recoverPendingCheckouts();
       void refreshBackgroundReports();
       return changed;
     } finally {
@@ -10612,7 +10631,8 @@ const App = (() => {
     const session = state.sessions.find((entry) => entry.id === id) || checkout?.session;
     if (!session) return null;
     const totals = sessionTotals(session);
-    if (checkout && (Number(checkout.totals.total) !== Number(totals.total) || checkout.paid !== sessionPaid(session))) {
+    if (checkout && (Number(checkout.totals.total) !== Number(totals.total) || checkout.paid !== sessionPaid(session)
+      || (checkout.session && checkoutSessionSignature(checkout.session) !== checkoutSessionSignature(session)))) {
       toast("La cuenta cambió durante el cobro. Actualiza y revisa el saldo.", "error", "close-session-changed"); return null;
     }
     if (isLocalWalkInSession(session)) {
@@ -10647,6 +10667,7 @@ const App = (() => {
     state.sessions = state.sessions.filter((entry) => entry.id !== id);
     state.requests = state.requests.map((request) => belongsToClosingTable(request) ? { ...request, status: "resolved" } : request);
     renderAdminLive();
+    persistOfflineAdminSnapshot();
     const closedAt = checkout?.closedAt || new Date().toISOString();
     const closure = { status: "closed", closed_at: closedAt, subtotal: totals.subtotal,
       discount: totals.discount, tax: totals.tax, service_fee: totals.serviceFee, total: totals.total };
@@ -10660,9 +10681,12 @@ const App = (() => {
     } else {
       saved = await retryPosMutation(() => state.sb.from("table_sessions").update(closure).eq("id",id).eq("status","open").select("*").single(), 4);
     }
+    if (saved && (String(saved.id) !== String(id) || saved.status !== "closed")) saved = null;
     if (!saved) {
       const confirmed = await readRealtimeData(state.sb.from("table_sessions").select("*").eq("id", id).maybeSingle(), 5000);
-      if (confirmed?.status === "closed" && String(confirmed.closed_at || "") === closedAt) saved = confirmed;
+      if (confirmed?.status === "closed" && (Date.parse(confirmed.closed_at) === Date.parse(closedAt)
+        || (checkout?.allowAlreadyClosed && Number(confirmed.total) === Number(totals.total)
+          && Number(confirmed.subtotal) === Number(totals.subtotal)))) saved = confirmed;
     }
     if (!saved) {
       state.optimisticSessionStates.delete(id);
@@ -10671,6 +10695,7 @@ const App = (() => {
       state.requests = state.requests.map((request) => belongsToClosingTable(request) && originalMap.has(request.id) ? originalMap.get(request.id) : request);
       persistPendingAdminRequests([...readPendingAdminRequests(), ...state.requests]);
       renderAdmin();
+      persistOfflineAdminSnapshot();
       toast("No se pudo cerrar la cuenta. Se restauro la informacion.", "error", `close-session-failed:${id}`);
       return null;
     }
@@ -11160,6 +11185,94 @@ const App = (() => {
   };
 
   const CHECKOUT_INTENTS_KEY = "napoles_checkout_intents_v1";
+  const CHECKOUT_CLOSURES_KEY = "napoles_checkout_closures_v1";
+  // A receipt belongs to an account UUID and its exact consumption, never a table number.
+  const checkoutLinesSignature = (items = []) => JSON.stringify(items
+    .filter(item => item.status !== "cancelled")
+    .map(item => [String(item.id || ""), String(item.menu_item_id || ""), String(item.item_name || ""),
+      Number(item.quantity || 0), Number(item.unit_price || 0)])
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+  const checkoutSessionSignature = session => JSON.stringify([String(session.id),
+    checkoutLinesSignature(session.session_items), Number(sessionTotals(session).total), Number(sessionPaid(session))]);
+  // Compare the billed products/quantities/prices, independent of row IDs or
+  // how the sales report groups its lines. Older receipts omit prepayment metadata.
+  const checkoutBilledLinesSignature = (items = [], byProductId = true) => {
+    const lines = new Map();
+    items.filter(item => item.status !== "cancelled").forEach(item => {
+      const product = String(item.menu_item_id || item.menuItemId || "");
+      const name = String(item.item_name ?? item.name ?? "").trim().toLocaleLowerCase("es-CO");
+      const key = JSON.stringify([byProductId ? product || name : name, Math.max(0, Math.round(Number(item.unit_price ?? item.unitPrice ?? 0)))]);
+      lines.set(key, Number(lines.get(key) || 0) + Number(item.quantity || 0));
+    });
+    return JSON.stringify([...lines].sort(([a], [b]) => a.localeCompare(b)));
+  };
+  const checkoutInvoiceMatches = (invoice, session) => {
+    if (!invoice || !session || String(invoice.sessionId) !== String(session.id)
+      || !Number.isFinite(Date.parse(invoice.createdAt)) || !Array.isArray(invoice.items) || !invoice.items.length
+      || !Array.isArray(invoice.payments)
+      || invoice.payments.reduce((sum, row) => sum + Number(row.amount || 0), 0) !== Number(invoice.totals?.total)) return false;
+    const active = items => items.filter(item => item.status !== "cancelled");
+    const byProductId = [...active(invoice.items), ...active(session.session_items || [])].every(item => item.menu_item_id || item.menuItemId);
+    const billed = new Map(JSON.parse(checkoutBilledLinesSignature(invoice.items, byProductId)));
+    const current = JSON.parse(checkoutBilledLinesSignature(session.session_items || [], byProductId));
+    // Partially restored rows can be a subset of an already paid receipt.
+    // Every current unit must be covered; additional products remain unpaid.
+    if (current.some(([key, quantity]) => quantity > Number(billed.get(key) || 0))) return false;
+    if (Array.isArray(invoice.prepayments)
+      && invoice.prepayments.reduce((sum, row) => sum + Number(row.amount || 0), 0) !== Number(sessionPaid(session))) return false;
+    if (!Array.isArray(invoice.prepayments) && invoice.remainingPaid != null
+      && Number(invoice.remainingPaid) !== Number(invoice.totals.total) - Number(sessionPaid(session))) return false;
+    const billedIds = new Set(invoice.items.map(item => String(item.id || item.lineId || "")).filter(Boolean));
+    return !(session.session_items || []).some(item => item.status !== "cancelled"
+      && item.created_at && !billedIds.has(String(item.id || "")) && Date.parse(item.created_at) > Date.parse(invoice.createdAt));
+  };
+
+  const reconcileRecordedCheckout = async (invoice, session) => {
+    if (!checkoutInvoiceMatches(invoice, session)) {
+      toast("Hay una factura anterior para esta cuenta, pero su consumo o sus abonos no coinciden. La cuenta se conserva para revisión; no se ha cobrado otra vez.", "error", "checkout-invoice-mismatch:" + session.id);
+      return false;
+    }
+    // Verify the current account before repairing an older build's stale snapshot.
+    // In particular, equal totals do not prove that the same products were billed.
+    let alreadyClosed = false;
+    if (navigator.onLine && !isLocalWalkInSession(session)) {
+      const relations = state.posFeatures?.abonos ? ",session_payments(*)" : "";
+      const query = state.sb.from("table_sessions").select("*,session_items(*)" + relations).eq("id", session.id).maybeSingle();
+      if (query.abortSignal) query.abortSignal(AbortSignal.timeout(5000));
+      let result;
+      try { result = await query; } catch (_) { result = null; }
+      if (!result || result.error) {
+        toast("No se pudo verificar el cierre de la factura. Se conserva la cuenta para reintentar sin otro cobro.", "error", "checkout-verification-pending:" + session.id);
+        return false;
+      }
+      alreadyClosed = !result.data || result.data.status === "closed";
+      if (result.data && !alreadyClosed) {
+        session = { ...result.data, session_payments: result.data.session_payments || session.session_payments || [] };
+        if (!checkoutInvoiceMatches(invoice, session)) {
+          state.optimisticSessionStates?.delete(session.id);
+          state.sessions = [...state.sessions.filter(row => String(row.id) !== String(session.id)), session];
+          renderAdminLive();
+        }
+      }
+    }
+    if (!checkoutInvoiceMatches(invoice, session)) {
+      toast("Hay una factura anterior para esta cuenta, pero su consumo o sus abonos no coinciden. La cuenta se conserva para revisión; no se ha cobrado otra vez.", "error", "checkout-invoice-mismatch:" + session.id);
+      return false;
+    }
+    // Preserve the original receipt and retry only its closure. Never create another sale.
+    session = JSON.parse(JSON.stringify(session));
+    await saveCheckoutIntent(invoice, session, sessionPaid(session), "prepared");
+    const closed = alreadyClosed || await closeSession(session.id, { paid: sessionPaid(session), totals: sessionTotals(session),
+      session, closedAt: invoice.createdAt, allowAlreadyClosed: true });
+    if (!closed) return false;
+    await saveCheckoutIntent(invoice, session, sessionPaid(session), "closed");
+    if ((!invoice.reportConfirmedAt || invoice.googlePending) && !state.reportMirror?.deleted?.[String(invoice.id || invoice.sessionId)]
+      && !readAppsScriptOutbox().some(job => job.action === "record_sale" && String(job.payload?.invoice?.sessionId) === String(session.id))) {
+      enqueueAppsScriptJob("record_sale", { invoice }, "sale:" + invoice.sessionId);
+    }
+    return commitCheckout({ invoice, session, paid: sessionPaid(session), stage: "closed" });
+  };
+
   const saveCheckoutIntent = async (invoice, session, paid, stage) => {
     const intents = readLocalJson(CHECKOUT_INTENTS_KEY, {});
     intents[session.id] = { invoice, session, paid, stage, updatedAt: new Date().toISOString() };
@@ -11168,14 +11281,17 @@ const App = (() => {
   };
 
   const commitCheckout = async (intent) => {
-    const { invoice, session } = intent;
+    const { session } = intent;
+    const invoice = { ...intent.invoice };
     const inventoryBefore = state.inventoryMeta;
     const movementsBefore = state.inventoryMovements;
     const invoicesBefore = state.invoiceHistory;
     const reportBefore = state.incomeReport;
+    const closuresBefore = state.checkoutClosures || {};
+    state.checkoutClosures = { ...closuresBefore };
     state.inventoryMeta = { ...inventoryBefore };
     state.inventoryMovements = [...movementsBefore];
-    state.invoiceHistory = [...invoicesBefore];
+    state.invoiceHistory = invoicesBefore.map(row => ({ ...row }));
     let saved = false;
     try {
       saved = await persistCheckoutAtomically(() => {
@@ -11185,6 +11301,9 @@ const App = (() => {
           applyInvoiceToInventory(invoice);
         }
         invoice.checkoutAccepted = true;
+        if (existing) existing.checkoutAccepted = true;
+        state.checkoutClosures[session.id] = { signature: checkoutSessionSignature(session), closedAt: invoice.createdAt };
+        void persistDurableJson(CHECKOUT_CLOSURES_KEY, state.checkoutClosures);
         persistInvoiceHistory();
         // Preserve all existing queued operations and persist the same stable sale.
         const jobs = readAppsScriptOutbox();
@@ -11195,6 +11314,9 @@ const App = (() => {
         void persistDurableJson(CHECKOUT_INTENTS_KEY, intents);
       });
       if (!saved) throw new Error("El cobro permanece protegido; no se pudo completar su guardado local.");
+      state.sessions = state.sessions.filter(row => String(row.id) !== String(session.id));
+      state.optimisticSessionStates?.delete(session.id);
+      persistOfflineAdminSnapshot();
       return true;
     } finally {
       if (!saved) {
@@ -11202,6 +11324,7 @@ const App = (() => {
         state.inventoryMovements = movementsBefore;
         state.invoiceHistory = invoicesBefore;
         state.incomeReport = reportBefore;
+        state.checkoutClosures = closuresBefore;
       }
     }
   };
@@ -11210,7 +11333,7 @@ const App = (() => {
     const { invoice, session, paid } = intent;
     if (intent.stage !== "closed") {
       const current = state.sessions.find(row => row.id === session.id);
-      if (current && (sessionPaid(current) !== paid || sessionTotals(current).total !== sessionTotals(session).total)) {
+      if (current && (Number(sessionPaid(current)) !== Number(paid) || checkoutSessionSignature(current) !== checkoutSessionSignature(session))) {
         toast("La cuenta cambió durante el cobro. El intento sigue protegido para revisión.", "error", "checkout-changed");
         return false;
       }
@@ -11234,7 +11357,12 @@ const App = (() => {
     checkoutRecoveryBusy = true;
     try {
       return await withCheckoutLock(async () => {
-        await hydrateDurableKey(CHECKOUT_INTENTS_KEY);
+        await Promise.all([CHECKOUT_INTENTS_KEY, CHECKOUT_CLOSURES_KEY, INVOICE_STORAGE_KEY,
+          INVENTORY_STORAGE_KEY, INVENTORY_MOVEMENTS_STORAGE_KEY, APPS_SCRIPT_OUTBOX_KEY].map(hydrateDurableKey));
+        state.invoiceHistory = readLocalJson(INVOICE_STORAGE_KEY, state.invoiceHistory);
+        state.inventoryMeta = readLocalJson(INVENTORY_STORAGE_KEY, state.inventoryMeta);
+        state.inventoryMovements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements);
+        state.checkoutClosures = readLocalJson(CHECKOUT_CLOSURES_KEY, state.checkoutClosures || {});
         const intents = Object.values(readLocalJson(CHECKOUT_INTENTS_KEY, {}));
         for (const intent of intents) {
           if (!await finishCheckoutIntent(intent)) {
@@ -11243,7 +11371,21 @@ const App = (() => {
           }
           toast("Se recuperó el cobro pendiente de " + intent.invoice.number + ".", "ok", "checkout-recovered:" + intent.session.id);
         }
-        if (intents.length) { renderAdminLive(); void flushAppsScriptOutbox(); }
+        let repaired = false;
+        const candidates = new Map(state.checkoutReconciliationCandidates || []);
+        state.sessions.forEach(session => candidates.set(String(session.id), session));
+        state.checkoutReconciliationAttempts ||= new Map();
+        for (const [id, session] of candidates) {
+          const invoice = state.invoiceHistory.find(row => String(row.sessionId) === id);
+          if (!invoice || !checkoutInvoiceMatches(invoice, session)) continue;
+          if (Date.now() - (state.checkoutReconciliationAttempts.get(id) || 0) < 30_000) continue;
+          state.checkoutReconciliationAttempts.set(id, Date.now());
+          if (await reconcileRecordedCheckout(invoice, session)) {
+            state.checkoutReconciliationCandidates?.delete(id);
+            repaired = true;
+          }
+        }
+        if (intents.length || repaired) { renderAdminLive(); void flushAppsScriptOutbox(); }
         return true;
       });
     } catch (error) {
@@ -11259,27 +11401,50 @@ const App = (() => {
     try { return await withCheckoutLock(async () => {
       // Another tab may have completed this account while this form was open.
       await Promise.all([INVENTORY_STORAGE_KEY, INVOICE_STORAGE_KEY, INVENTORY_MOVEMENTS_STORAGE_KEY,
-        APPS_SCRIPT_OUTBOX_KEY, CHECKOUT_INTENTS_KEY].map(hydrateDurableKey));
+        APPS_SCRIPT_OUTBOX_KEY, CHECKOUT_INTENTS_KEY, CHECKOUT_CLOSURES_KEY].map(hydrateDurableKey));
       state.invoiceHistory = readLocalJson(INVOICE_STORAGE_KEY, state.invoiceHistory);
       state.inventoryMeta = readLocalJson(INVENTORY_STORAGE_KEY, state.inventoryMeta);
       state.inventoryMovements = readLocalJson(INVENTORY_MOVEMENTS_STORAGE_KEY, state.inventoryMovements);
-      if (state.invoiceHistory.some(invoice => String(invoice.sessionId) === String(form.session_id.value))) {
-        state.sessions = state.sessions.filter(session => String(session.id) !== String(form.session_id.value));
-        $("#paymentDialog")?.close();
-        renderAdminLive();
-        toast("Esta cuenta ya fue cobrada. Puedes reimprimir su factura desde Ventas.", "ok", "checkout-already-complete");
+      state.checkoutClosures = readLocalJson(CHECKOUT_CLOSURES_KEY, state.checkoutClosures || {});
+      const recorded = state.invoiceHistory.find(invoice => String(invoice.sessionId) === String(form.session_id.value));
+      if (recorded) {
+        const session = state.sessions.find(row => String(row.id) === String(form.session_id.value))
+          || state.checkoutReconciliationCandidates?.get(String(form.session_id.value));
+        if (!session) {
+          $("#paymentDialog")?.close();
+          toast("La factura ya está guardada. Revisa su estado de respaldo en Ventas.", "ok", "checkout-already-complete");
+          if (submitter?.value === "print") {
+            try { printThermalReceipt({ id: recorded.sessionId, table_id: recorded.tableId, payer_name: recorded.payerName || "" }, recorded); }
+            catch (_) { toast("Cobro guardado. No se pudo imprimir; reimprime desde Ventas.", "error", "checkout-print-error"); }
+          }
+          return;
+        }
+        const receiptWindow = submitter?.value === "print" ? window.open("", "_blank", "width=420,height=720") : null;
+        state.paymentProcessing = true;
+        try {
+          if (await reconcileRecordedCheckout(recorded, session)) {
+            $("#paymentDialog")?.close();
+            renderAdminLive();
+            toast("Cierre recuperado con la factura original. No se generó otro cobro.", "ok", "checkout-reconciled");
+            if (submitter?.value === "print") printThermalReceipt(session, recorded, receiptWindow);
+            void flushAppsScriptOutbox();
+          } else receiptWindow?.close();
+        } catch (error) { receiptWindow?.close(); toast(String(error?.message || error), "error", "checkout-reconcile-error"); }
+        finally { state.paymentProcessing = false; }
         return;
       }
       const intent = readLocalJson(CHECKOUT_INTENTS_KEY, {})[form.session_id.value];
       if (intent) {
+        const receiptWindow = submitter?.value === "print" ? window.open("", "_blank", "width=420,height=720") : null;
         state.paymentProcessing = true;
         try {
           if (await finishCheckoutIntent(intent)) {
             $("#paymentDialog")?.close();
             toast("Cobro recuperado. Factura " + intent.invoice.number + ". Puedes reimprimirla desde Ventas.", "ok", "checkout-recovered");
+            if (submitter?.value === "print") printThermalReceipt(intent.session, intent.invoice, receiptWindow);
             void flushAppsScriptOutbox();
-          } else toast("El cobro sigue protegido y requiere revisión de la cuenta.", "error", "checkout-pending");
-        } catch (error) { toast(String(error?.message || error), "error", "checkout-resume-error"); }
+          } else { receiptWindow?.close(); toast("El cobro sigue protegido y requiere revisión de la cuenta.", "error", "checkout-pending"); }
+        } catch (error) { receiptWindow?.close(); toast(String(error?.message || error), "error", "checkout-resume-error"); }
         finally { state.paymentProcessing = false; }
         return;
       }
@@ -11296,12 +11461,6 @@ const App = (() => {
     }
     if (!(session.session_items || []).some((item) => item.status !== "cancelled")) {
       toast("Agrega al menos un producto antes de cobrar.", "error", `empty-payment:${session.id}`);
-      return;
-    }
-    if (state.invoiceHistory.some((invoice) => String(invoice.sessionId) === String(session.id))) {
-      $("#paymentDialog")?.close();
-      void closeSession(session.id);
-      toast("Esta cuenta ya fue cobrada. Se retiro la copia atrasada de la pantalla.", "ok", `payment-already-recorded:${session.id}`);
       return;
     }
     const checkoutPaid = sessionPaid(session);
@@ -11394,8 +11553,9 @@ const App = (() => {
       }))
     };
 
-    await saveCheckoutIntent(invoice, session, checkoutPaid, "prepared");
-    if (!await finishCheckoutIntent({ invoice, session, paid: checkoutPaid, stage: "prepared" })) {
+    const checkoutSession = JSON.parse(JSON.stringify(session));
+    await saveCheckoutIntent(invoice, checkoutSession, checkoutPaid, "prepared");
+    if (!await finishCheckoutIntent({ invoice, session: checkoutSession, paid: checkoutPaid, stage: "prepared" })) {
       receiptWindow?.close();
       toast("El cobro está protegido, pero falta confirmar el cierre de la cuenta. Reintenta para recuperar la misma operación.", "error", "checkout-close-pending");
       return;

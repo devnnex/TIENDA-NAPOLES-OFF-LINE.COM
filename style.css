@@ -5532,3 +5532,14 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 
 .service-walk-in-tile > .service-walk-in-delete { position: absolute; top: .45rem; right: .45rem; z-index: 1; width: 36px; min-width: 36px; height: 36px; margin: 0; padding: .35rem; border: 1px solid #f3b5b5; background: #fff; }
 .service-walk-in-tile .service-walk-in-count { top: auto; bottom: .45rem; }
+
+/* Permanent individual checkout: the same payment form, without an overlay. */
+#service.individual-sale-section { padding: 0; background: transparent; border: 0; box-shadow: none; }
+#service #paymentDialog.payment-inline { position: static; inset: auto; width: 100%; max-width: none; max-height: none; margin: 0; padding: 0; overflow: visible; box-shadow: none; }
+#service #paymentDialog.payment-inline .payment-card { width: 100%; max-width: none; max-height: none; overflow: visible; box-sizing: border-box; }
+.barcode-sale-entry { padding: .9rem; border: 1px solid var(--line, #d9dee5); border-radius: 14px; background: #f4f7ff; }
+.barcode-sale-entry[hidden] { display: none; }
+.barcode-sale-entry label { display: grid; gap: .45rem; }
+.barcode-sale-entry small { display: block; margin-top: .5rem; }
+.barcode-sale-entry input { width: 100%; box-sizing: border-box; }
+#individualSaleDraftControl { margin-bottom: 1rem; }

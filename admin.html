@@ -11,7 +11,7 @@
     <link rel="manifest" href="manifest.webmanifest" id="appManifest" type="application/manifest+json">
     <link rel="icon" href="pwa-icon.svg" id="appFavicon" type="image/svg+xml">
     <link rel="apple-touch-icon" href="pwa-icon.svg" id="appleTouchIcon">
-    <link rel="stylesheet" href="style.css?v=20261102-service-walk-in-delete-v1">
+    <link rel="stylesheet" href="style.css?v=20261111-individual-barcode-v1">
     <link rel="stylesheet" href="menu-cards.css?v=20261019-visual-details-v1">
     <script defer src="vendor/supabase-js.min.js"></script>
   </head>
@@ -49,7 +49,7 @@
       </div>
       <nav>
         <a href="#dashboard" class="dashboard-nav-link" data-admin-only><i data-lucide="layout-dashboard"></i> Inicio <span class="nav-request-badge" id="navRequestBadge" role="status" aria-label="Solicitudes pendientes" hidden>0</span></a>
-        <a href="#service"><i data-lucide="scan-line"></i> Atender mesa</a>
+        <a href="#service"><i data-lucide="scan-line"></i> Venta individual</a>
         <a href="#accounts"><i data-lucide="receipt-text"></i> Cuentas</a>
         <a href="#tips" class="tips-nav-link" data-tip-feature hidden><i data-lucide="hand-coins"></i> Propinas</a>
         <a href="#inventory" data-admin-only><i data-lucide="boxes"></i> Inventario</a>
@@ -87,7 +87,7 @@
           <span class="live-status live" id="softwareStatus" role="status"><i data-lucide="circle-check"></i> Usando el software</span>
         </div>
         <div class="admin-header-actions">
-          <a class="primary" href="index.html"><i data-lucide="external-link"></i> Ver cliente</a>
+          <button class="primary" id="openBarcodeSale" type="button"><i data-lucide="scan-barcode"></i> Vender con código de barras</button>
           <button class="ghost" id="openCashDrawer" type="button"><i data-lucide="archive-restore"></i> Abrir caja</button>
           <button class="ghost" id="configureCashDrawer" type="button" aria-label="Configurar cajón de caja" title="Configurar cajón de caja"><i data-lucide="settings-2"></i></button>
         </div>
@@ -512,40 +512,9 @@
         </div>
       </section>
 
-      <section class="panel" id="service" data-admin-section="service">
-        <div class="section-head">
-          <div>
-            <span class="eyebrow">Operacion de mesero</span>
-            <h2>Seleccionar y atender mesa</h2>
-          </div>
-        </div>
-        <div class="service-walk-in-grid" id="serviceWalkInGrid" data-manager-only aria-label="Ventas individuales"></div>
-        <div class="service-sales-layout">
-          <article class="service-points-panel">
-            <div class="service-points-head">
-              <div class="service-block-title"><span><i data-lucide="wine"></i></span><div><strong>Puntos sin QR</strong><small>Atiéndelos igual que una mesa y reconoce de dónde viene cada cuenta.</small></div></div>
-              <div class="service-zone-tabs" role="tablist" aria-label="Elegir zona">
-                <button class="ghost is-active" type="button" data-service-zone="bar" role="tab" aria-selected="true">Terrazas</button>
-                <button class="ghost" type="button" data-service-zone="planter" role="tab" aria-selected="false">Materas</button>
-              </div>
-            </div>
-            <div class="service-points-grid" id="servicePointsGrid"></div>
-            <button class="ghost service-point-add" id="addServicePoint" type="button" data-admin-only><i data-lucide="plus"></i> Agregar puesto</button>
-          </article>
-          <article class="service-tables-panel">
-            <div class="service-table-heading">
-              <div class="service-block-title"><span><i data-lucide="armchair"></i></span><div><strong>Ventas por mesa</strong><small>Verde libre, azul afuera, amarillo con cuenta abierta</small></div></div>
-              <label class="table-zone-filter">Mostrar
-                <select id="serviceTableZoneFilter" aria-label="Filtrar mesas por ubicación">
-                  <option value="all">Todas</option>
-                  <option value="outdoor">Afuera</option>
-                  <option value="indoor">Adentro</option>
-                </select>
-              </label>
-            </div>
-            <div class="compact-tables-grid" id="waiterTablesGrid"></div>
-          </article>
-        </div>
+      <section class="panel individual-sale-section" id="service" data-admin-section="service">
+        <label id="individualSaleDraftControl" hidden>Venta guardada<select id="individualSaleDraft" aria-label="Recuperar una venta guardada"></select></label>
+        <div id="individualSaleCheckout"></div>
       </section>
 
       <section class="panel admin-assistant-section" id="assistant" data-admin-section="assistant" data-admin-only>
@@ -737,6 +706,10 @@
           <label class="payment-tip-manual"><span><i data-lucide="banknote"></i> Propina en pesos (opcional)</span><input name="tip_amount" type="text" value="$0" inputmode="numeric" autocomplete="off" data-currency-input><small>Escribe el valor que deja el cliente para reemplazar la sugerencia.</small></label>
         </fieldset>
 
+        <div class="barcode-sale-entry" id="barcodeSaleEntry" hidden>
+          <label>Código de barras<input id="barcodeSaleInput" type="text" maxlength="80" autocomplete="off" placeholder="Escanea con la pistola y presiona Enter" aria-describedby="barcodeSaleStatus"></label>
+          <small id="barcodeSaleStatus" role="status" aria-live="polite"></small>
+        </div>
         <div class="payment-sale-lines" id="paymentSaleLines"></div>
         <button class="ghost payment-add-item" id="paymentAddItem" type="button" hidden><i data-lucide="plus"></i> Agregar otro producto</button>
 
@@ -807,6 +780,7 @@
         <div class="inventory-form">
           <label class="wide">Producto<input name="product_name" type="text" maxlength="100" placeholder="Ej. Cerveza Nacional" required></label>
           <label>Siglas<input name="product_code" type="text" maxlength="12" placeholder="Se generan: CN"></label>
+          <label>Código de barras<input name="barcode" type="text" maxlength="80" autocomplete="off" placeholder="Escanea aquí el producto"></label>
           <label>Categoria<select name="category_id" class="js-category-select"><option value="">Elegir categoria</option></select></label>
           <label class="wide">Nueva categoria<input name="new_category" type="text" maxlength="60" list="inventoryCategoryPresets" placeholder="Snack, Bebidas, Medicina u Otros"></label>
           <datalist id="inventoryCategoryPresets"><option value="Snack"></option><option value="Bebidas"></option><option value="Medicina"></option><option value="Otros"></option></datalist>
@@ -940,6 +914,7 @@
     <script defer src="vendor/jspdf.umd.min.js"></script>
     <script defer src="sales-shift.js?v=20261027-today-shift-v2"></script>
     <script defer src="menu-cards.js?v=20261019-visual-details-v1"></script>
-    <script defer src="app.js?v=20261112-payment-buttons-v2"></script>
+    <script defer src="offline-login-reset.js?v=20261111-individual-barcode-v1"></script>
+    <script defer src="app.js?v=20261114-checkout-recovery-local-v1"></script>
   </body>
 </html>

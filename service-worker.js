@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v85";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v86";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -10,7 +10,7 @@ const BRAND_CACHE = "tienda-napoles-pwa-brand-v1";
 const DYNAMIC_BRAND_ASSETS = new Set(["pwa-manifest.webmanifest", "pwa-icon-192.png", "pwa-icon-512.png"]);
 const APP_SHELL = [
   "./", "./index.html", "./admin.html", "./app.js", "./menu-cards.js", "./menu-cards.css", "./sales-shift.js", "./style.css",
-  "./manifest.webmanifest", "./pwa-icon.svg", "./tienda-napoles.ico", "./sound/alarm.mp3",
+  "./manifest.webmanifest", "./pwa-icon.svg", "./tienda-napoles.ico", "./sound/alarm.mp3", "./offline-login-reset.js",
   "./sound/receipt-received.mp3", "./images/check.png", "./images/mesero.png",
   "./vendor/supabase-js.min.js", "./vendor/lucide.min.js",
   "./vendor/qrcode.min.js", "./vendor/jspdf.umd.min.js"
@@ -1375,6 +1375,24 @@ const refreshLoginCache = () => {
 };
 
 self.addEventListener("message", (event) => {
+  if (event.data?.type === "PREPARE_BROWSER_RESET" && event.source?.id) {
+    event.waitUntil((async () => {
+      const windows = await self.clients.matchAll({type:"window", includeUncontrolled:true});
+      if (windows.filter(client => client.url.startsWith(self.registration.scope)).length > 1) {
+        event.ports?.[0]?.postMessage({ok:false, reason:"other_windows_open"}); return;
+      }
+      const previous = networkAvailable;
+      networkAvailable = false;
+      try {
+        if (flushingQueue) await flushingQueue;
+        if (onlineMutationIds.size) throw new Error("writes_in_progress");
+        event.ports?.[0]?.postMessage({ok:true, online:previous});
+      } catch (_) {
+        networkAvailable = previous;
+        event.ports?.[0]?.postMessage({ok:false, reason:"writes_in_progress"});
+      }
+    })());
+  }
   if (event.data?.type === "REFRESH_LOGIN_CACHE" && event.source?.id) {
     event.waitUntil(refreshLoginCache());
   }

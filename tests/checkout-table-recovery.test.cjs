@@ -17,7 +17,7 @@ const account = (table = '3', id = 'account-' + table) => ({ id, table_id: 'tabl
 const invoice = session => ({ id: session.id, sessionId: session.id, tableId: session.table_id, number: 'TN-' + session.id,
   createdAt: '2026-11-12T17:00:00.000Z', baseTotal: 200, totals: { subtotal: 200, total: 200 },
   items: clone(session.session_items), payments: [{ method: 'cash', amount: 200 }], prepayments: [], checkoutAccepted: true });
-function harness({ indexedDB = new IDBFactory(), localStorage, invoices = [], sessions = [], ledger = {}, queued = false, rejected = false } = {}) {
+function harness({ indexedDB = new IDBFactory(), localStorage, invoices = [], sessions = [], ledger = {}, queued = false, rejected = false, readError = false, snapshotError = false, hiddenRest = false } = {}) {
   const values = new Map();
   localStorage ||= { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: key => values.delete(key) };
   const remote = new Map(sessions.map(row => [row.id, clone(row)])), events = [], messages = [], jobs = [];
@@ -47,6 +47,15 @@ function harness({ indexedDB = new IDBFactory(), localStorage, invoices = [], se
   });
   state.sb = {
     rpc: async (_name, payload) => {
+      if (_name === 'get_admin_snapshot') {
+        events.push('authenticated-snapshot');
+        return snapshotError ? { error: { message: 'temporarily unavailable' } } : { data: { sessions: clone([...remote.values()].filter(row => row.status === 'open')) } };
+      }
+      if (_name === 'get_table_session_for_sync') {
+        events.push('authenticated-status');
+        const row = remote.get(payload.p_session_id);
+        return { data: { session: clone(row || null), exists: !!row } };
+      }
       events.push('remote-close');
       if (rejected) return { data: null, error: { message: 'rejected' } };
       const row = remote.get(payload.p_session_id);
@@ -59,7 +68,9 @@ function harness({ indexedDB = new IDBFactory(), localStorage, invoices = [], se
       let id;
       const query = { select() { return this; }, update() { return this; }, eq(key, value) { if (key === 'id') id = value; return this; },
         single() { return this; }, maybeSingle() { return this; },
-        then(resolve, reject) { return Promise.resolve({ data: table === 'table_sessions' ? clone(remote.get(id) || null) : [] }).then(resolve, reject); } };
+        then(resolve, reject) { return Promise.resolve(readError && table === 'table_sessions'
+          ? { error: { message: 'REST relationship unavailable' } }
+          : { data: table === 'table_sessions' ? clone(hiddenRest ? null : remote.get(id) || null) : [] }).then(resolve, reject); } };
       return query;
     }
   };
@@ -316,4 +327,99 @@ for (const action of ['save', 'print']) test('el boton ' + action + ' funciona s
   assert.equal(h.state.invoiceHistory.length, 1);
   assert.equal(h.events.includes('remote-close'), false);
   assert.equal(h.events.filter(event => event.startsWith('print:')).length, action === 'print' ? 1 : 0);
+});
+
+test('un cierre durable no vuelve a consultar la red ni a avisar al recibir un snapshot atrasado', async () => {
+  const session = account(), sale = invoice(session), h = harness({ sessions: [session], invoices: [sale], readError: true, snapshotError: true });
+  h.state.checkoutClosures[session.id] = { signature: h.api.signature(session), closedAt: sale.createdAt };
+  h.state.checkoutReconciliationCandidates = new Map([[session.id, session]]);
+  h.state.sessions = h.api.merge([session]);
+  await h.api.recover();
+  assert.equal(h.state.sessions.length, 0);
+  assert.equal(h.events.includes('remote-close'), false);
+  assert.equal(h.events.includes('authenticated-snapshot'), false);
+  assert.equal(h.messages.length, 0);
+  assert.equal(h.state.checkoutReconciliationCandidates.size, 0);
+});
+
+for (const hiddenRest of [false, true]) test('REST incompleto usa lectura autenticada y recupera sin otro cobro: oculto=' + hiddenRest, async () => {
+  const session = account(), sale = invoice(session), h = harness({ sessions: [session], invoices: [sale], hiddenRest, readError: !hiddenRest });
+  await h.pay(session.id);
+  assert.equal(h.state.sessions.length, 0, JSON.stringify(h.messages));
+  assert.equal(h.remote.get(session.id).status, 'closed');
+  assert.equal(h.state.invoiceHistory.length, 1);
+  assert.equal(h.state.inventoryMeta.stock, 10);
+  assert.equal(h.events.includes('authenticated-snapshot'), true);
+  assert.equal(h.messages.some(row => row[2]?.startsWith('checkout-verification-pending:')), false);
+});
+
+test('un error transitorio de lectura queda pendiente sin mostrar el mensaje de verificacion', async () => {
+  const session = account(), h = harness({ sessions: [session], invoices: [invoice(session)], readError: true, snapshotError: true });
+  await h.api.recover();
+  assert.equal(h.remote.get(session.id).status, 'open');
+  assert.equal(h.state.sessions.length, 1);
+  assert.equal(h.state.invoiceHistory.length, 1);
+  assert.equal(h.events.includes('remote-close'), false);
+  assert.equal(h.messages.length, 0);
+});
+
+for (const change of ['products', 'payments']) test('la lectura autenticada protege cambios remotos de ' + change, async () => {
+  const session = account(), h = harness({ sessions: [session], invoices: [invoice(session)], readError: true });
+  const changed = clone(session);
+  if (change === 'products') changed.session_items[0].menu_item_id = 'new-product';
+  else changed.session_payments = [{ id: 'new-payment', amount: 50 }];
+  h.remote.set(session.id, changed);
+  await h.pay(session.id);
+  assert.equal(h.remote.get(session.id).status, 'open');
+  assert.equal(h.state.sessions.length, 1);
+  assert.equal(h.events.includes('remote-close'), false);
+});
+
+test('un intento conflictivo no detiene la recuperacion de otra mesa', async () => {
+  const one = account('1'), two = account('2'), h = harness({ sessions: [one, two] });
+  await h.api.save(invoice(one), one, 0, 'prepared');
+  await h.api.save(invoice(two), two, 0, 'prepared');
+  h.state.sessions[0].session_items[0].quantity = 3;
+  await h.api.recover();
+  assert.equal(h.remote.get(one.id).status, 'open');
+  assert.equal(h.remote.get(two.id).status, 'closed');
+  assert.equal(h.api.read('napoles_checkout_intents_v1')[one.id].stage, 'prepared');
+  assert.equal(h.state.invoiceHistory.length, 1);
+  assert.equal(h.messages.some(row => row[1] === 'error'), false);
+});
+
+test('el clic de cobrar durante una recuperacion espera y conserva la impresion solicitada', async () => {
+  const one = account('1'), two = account('2');
+  const h = harness({ sessions: [one, two], invoices: [invoice(one), invoice(two)] });
+  const originalRpc = h.state.sb.rpc;
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  h.state.sb.rpc = async (name, payload) => {
+    if (name === 'replay_table_session_change' && payload.p_session_id === one.id) { started(); await pending; }
+    return originalRpc(name, payload);
+  };
+  const recovery = h.api.recover();
+  await ready;
+  const click = h.pay(two.id, 'print');
+  release();
+  await Promise.all([recovery, click]);
+  assert.equal(h.state.sessions.length, 0);
+  assert.equal(h.state.invoiceHistory.length, 2);
+  assert.equal(h.events.filter(event => event === 'print:' + two.id).length, 1);
+});
+
+test('un cierre rechazado no restaura el snapshot antiguo de otras cuentas', async () => {
+  const one = account('1'), two = account('2');
+  const h = harness({ sessions: [one, two], rejected: true });
+  h.state.sb.rpc = async () => {
+    h.state.sessions.find(row => row.id === two.id).session_items[0].quantity = 7;
+    h.state.sessions.push(account('3'));
+    return { data: null, error: { message: 'write failed' } };
+  };
+  await h.api.close(one.id, { session: one, totals: invoice(one).totals, paid: 0 });
+  assert.equal(h.state.sessions.find(row => row.id === two.id).session_items[0].quantity, 7);
+  assert.equal(h.state.sessions.some(row => row.id === 'account-3'), true);
+  assert.equal(h.state.sessions.some(row => row.id === one.id), true);
 });

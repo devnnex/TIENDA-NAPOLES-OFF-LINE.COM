@@ -77,6 +77,77 @@ try {
       $response.Headers["Cache-Control"] = "no-cache"
       $response.KeepAlive = $false
 
+      if ($request.Url.AbsolutePath -eq "/__tienda_napoles_browser_reset_health") {
+        Send-Text $response 200 "OK_BROWSER_RESET_V1"
+        continue
+      }
+
+      if ($request.Url.AbsolutePath -eq "/__tienda_napoles_browser_reset") {
+        if ($request.HttpMethod -ne "POST" -or
+            $request.Headers["Origin"] -ne "http://127.0.0.1:$Port" -or
+            $request.Headers["X-Tienda-Napoles-Reset"] -ne "1" -or
+            -not [System.Net.IPAddress]::IsLoopback($request.RemoteEndPoint.Address)) {
+          Send-Json $response 403 @{ error = "Solicitud local no autorizada." }
+          continue
+        }
+        if ($request.ContentLength64 -lt 1 -or $request.ContentLength64 -gt 67108864) {
+          Send-Json $response 413 @{ error = "Respaldo de navegador no valido." }
+          continue
+        }
+        try {
+          $reader = New-Object System.IO.StreamReader($request.InputStream, [System.Text.Encoding]::UTF8)
+          $snapshotText = $reader.ReadToEnd()
+          $snapshot = $snapshotText | ConvertFrom-Json -ErrorAction Stop
+          $backupDirectory = Join-Path $env:LOCALAPPDATA "TiendaNapolesOffline\browser-reset-backups"
+          $backupPath = Join-Path $backupDirectory "before-login.bin"
+          $pendingPath = Join-Path $backupDirectory "recovery-pending.txt"
+          Add-Type -AssemblyName System.Security
+          if ($snapshot.action -eq "recover") {
+            if ([System.IO.File]::Exists($pendingPath)) {
+              $resetId = [System.IO.File]::ReadAllText($pendingPath)
+              $recovered = [System.Security.Cryptography.ProtectedData]::Unprotect([System.IO.File]::ReadAllBytes($backupPath), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+              $jsonText = '{"ok":true,"resetId":"' + $resetId + '","recovery":' + [System.Text.Encoding]::UTF8.GetString($recovered) + '}'
+              $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($jsonText)
+              $response.ContentType = "application/json; charset=utf-8"
+              $response.ContentLength64 = $jsonBytes.Length
+              $response.OutputStream.Write($jsonBytes, 0, $jsonBytes.Length)
+            } else { Send-Json $response 200 @{ ok = $true; recovery = $null } }
+            continue
+          }
+          if ($snapshot.action -eq "complete") {
+            if ([System.IO.File]::Exists($pendingPath) -and [System.IO.File]::ReadAllText($pendingPath) -eq [string]$snapshot.resetId) {
+              [System.IO.File]::Delete($pendingPath)
+            }
+            Send-Json $response 200 @{ ok = $true }
+            continue
+          }
+          if ($snapshot.version -ne 1 -or $snapshot.origin -ne "http://127.0.0.1:$Port" -or $null -eq $snapshot.databases) {
+            throw "invalid_storage_snapshot"
+          }
+          if ([System.IO.File]::Exists($pendingPath)) { throw "pending_recovery_required" }
+          $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($snapshotText)
+          $protectedBytes = [System.Security.Cryptography.ProtectedData]::Protect($plainBytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+          $null = New-Item -ItemType Directory -Path $backupDirectory -Force
+          $temporaryPath = Join-Path $backupDirectory ([Guid]::NewGuid().ToString("N") + ".tmp")
+          $file = [System.IO.File]::Open($temporaryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+          try { $file.Write($protectedBytes, 0, $protectedBytes.Length); $file.Flush($true) } finally { $file.Dispose() }
+          if ([System.IO.File]::Exists($backupPath)) {
+            [System.IO.File]::Replace($temporaryPath, $backupPath, (Join-Path $backupDirectory "previous-login.bin"), $true)
+          } else { [System.IO.File]::Move($temporaryPath, $backupPath) }
+          $resetId = [Guid]::NewGuid().ToString("N")
+          $pendingBytes = [System.Text.Encoding]::UTF8.GetBytes($resetId)
+          $pendingFile = [System.IO.File]::Open($pendingPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+          try { $pendingFile.Write($pendingBytes, 0, $pendingBytes.Length); $pendingFile.Flush($true) } finally { $pendingFile.Dispose() }
+          # Sent only after a durable, Windows-user-encrypted backup exists.
+          $response.Headers["Clear-Site-Data"] = '"cache", "cookies", "storage"'
+          $response.Headers["Cache-Control"] = "no-store"
+          Send-Json $response 200 @{ ok = $true; backupSaved = $true; resetId = $resetId }
+        } catch {
+          Send-Json $response 503 @{ error = "No se pudo respaldar el navegador. No se borro el almacenamiento." }
+        }
+        continue
+      }
+
       if ($request.Url.AbsolutePath -eq "/__tienda_napoles_health") {
         Send-Text $response 200 "OK"
         continue

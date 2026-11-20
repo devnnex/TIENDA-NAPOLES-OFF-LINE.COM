@@ -22,7 +22,8 @@ test('Actualizar iconos procesa los nuevos y conserva los SVG ya dibujados', () 
 test('Navegacion muestra contenido durante el clic y conserva el control de permisos', () => {
   const calls = [];
   const state = { activeAdminSection: 'dashboard' };
-  const context = vm.createContext({ state, $$: () => [],
+  const context = vm.createContext({ state, $$: () => [], $: () => null,
+    openPermanentIndividualSale: () => calls.push('service'),
     syncAdminSectionAccess() {}, tipsEnabled: () => false,
     canAccessAdminSection: name => name !== 'users', firstAllowedAdminSection: () => 'service', allowedAdminSections: () => ['service', 'accounts', 'menu'],
     renderAccounts: () => calls.push('accounts'), renderServiceTables: () => calls.push('service'),
@@ -79,6 +80,7 @@ test('Preparar categorias no retrasa la interfaz ni devuelve al usuario a otra s
     readLocalJson: () => ({}), USER_CREDENTIALS_CACHE_KEY: 'pins',
     window: { addEventListener() {} }, history: { replaceState() {} },
     setLoading() {}, waitForAdminLogin: async () => calls.push('validated'),
+    resetOfflineBrowserOnLogin: async () => calls.push('reset'),
     loadBootstrap: () => { calls.push('cache'); return Promise.resolve(true); },
     loadInventoryStore() {}, loadUsers: async () => [], renderUsers() {},
     renderAdminShell: () => calls.push('shell'), renderBusinessForm() {},
@@ -90,6 +92,8 @@ test('Preparar categorias no retrasa la interfaz ni devuelve al usuario a otra s
   vm.runInContext(section('initAdmin', 'resumeRealtimeReception') + ';globalThis.init = initAdmin;', context);
   await context.init();
   assert.ok(calls.indexOf('validated') < calls.indexOf('cache'));
+  assert.ok(calls.indexOf('validated') < calls.indexOf('reset'));
+  assert.ok(calls.indexOf('reset') < calls.indexOf('cache'));
   assert.ok(calls.indexOf('cache') < calls.indexOf('shell'));
   assert.ok(calls.includes('storage'), 'Termina aunque la preparacion de categorias siga pendiente');
   assert.ok(calls.lastIndexOf('accounts') > calls.indexOf('dashboard'));

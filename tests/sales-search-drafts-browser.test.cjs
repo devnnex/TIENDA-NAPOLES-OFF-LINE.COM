@@ -93,18 +93,18 @@ test('venta individual: X inmediata, saldo actualizado y burbuja roja del borrad
   const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
   page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
   await page.evaluate(()=>salesApi.showAdminSection('dashboard'));
-  assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),false);
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').isVisible(),false);
   await page.locator('#newWalkInSale').click();await page.locator('#paymentAddItem').click();
   for(const [id,name,qty] of [['p','Agua','2'],['q','Café','3']]){
    await page.locator('#consumptionProductSearch').fill(name);await page.locator(`[data-consumption-product="${id}"]`).click();
    await page.locator('#consumptionForm [name="quantity"]').fill(qty);await page.locator('#consumptionQueueButton').click();
   }
   await page.locator('#consumptionDialog [data-cancel-consumption]').first().click();
-  assert.equal(await page.locator('[data-walk-in-draft-count]').innerText(),'1');
-  assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),true);
-  assert.equal(await page.locator('[data-walk-in-draft-count]').evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(240, 68, 56)');
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').innerText(),'1');
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').isVisible(),true);
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(240, 68, 56)');
   await boot(page,session.url);await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('dashboard');});
-  assert.equal(await page.locator('[data-walk-in-draft-count]').innerText(),'1');
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').innerText(),'1');
   await page.locator('#newWalkInSale').click();
   await page.evaluate(()=>salesApi.confirmConsumptionSelection(document.querySelector('#consumptionForm')));
   assert.equal(await page.locator('#paymentSaleLines [data-remove-walk-in-item]').count(),2);
@@ -116,7 +116,7 @@ test('venta individual: X inmediata, saldo actualizado y burbuja roja del borrad
   assert.equal(await page.locator('#paymentForm [name="payment_method"]:checked').inputValue(),'transfer');
   assert.equal(await page.locator('#consumptionDialog').evaluate(node=>node.open),false);
   await page.keyboard.press('Escape');
-  assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),true);
+  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').isVisible(),true);
   await boot(page,session.url);await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('dashboard');});
   await page.locator('#newWalkInSale').click();
   assert.equal(await page.locator('#paymentSaleLines [data-remove-walk-in-item]').count(),1);
@@ -125,7 +125,7 @@ test('venta individual: X inmediata, saldo actualizado y burbuja roja del borrad
   assert.equal(await page.locator('#paymentDialog').evaluate(node=>node.open),true);
   assert.equal(await page.locator('#paymentSaleLines [data-remove-walk-in-item]').count(),0);
   assert.equal(await page.locator('#paymentForm button[type="submit"]:enabled').count(),0);
-  await page.keyboard.press('Escape');assert.equal(await page.locator('[data-walk-in-draft-count]').isVisible(),false);
+  await page.keyboard.press('Escape');assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').isVisible(),false);
   assert.equal(await page.evaluate(()=>salesApi.state.sessions.filter(row=>row.local_only).length),0);
   assert.equal(await page.evaluate(()=>salesApi.state.invoiceHistory.length),0);
   assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.p.stock),100000);
@@ -265,51 +265,17 @@ test('venta individual: selección editable, guardar al salir, otra mesa, recarg
 });
 
 
-test('Atender mesa: cuatro ventas separadas, contador, salir, recargar y agregar más cuadros',async()=>{
- const session=await launch(),errors=[];
- try{for(const width of [1440,390]){
-  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
-  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
-  await page.evaluate(()=>salesApi.showAdminSection('service'));
-  assert.equal(await page.locator('[data-service-walk-in]').count(),4);
-  assert.equal(await page.locator('#addServiceWalkIn').innerText(),'+');
-  const sales=[];
-  for(const slot of [1,2]){
-   await page.locator('[data-service-walk-in="'+slot+'"]').click();
-   sales.push(await page.locator('#paymentForm [name="session_id"]').inputValue());
-   await page.locator('#paymentAddItem').click();
-   await page.locator('#consumptionProductSearch').fill(slot===1?'Agua':'Café');
-   await page.locator('[data-consumption-product="'+(slot===1?'p':'q')+'"]').click();
-   await page.locator('#consumptionForm [name="quantity"]').fill(String(slot+2));
-   await page.locator('#consumptionQueueButton').click();
-   await page.locator('#consumptionDialog [data-cancel-consumption]').first().click();
-   assert.equal(await page.locator('[data-service-walk-in="'+slot+'"] .service-walk-in-count').innerText(),'1');
-  }
-  assert.notEqual(sales[0],sales[1]);
-  await page.evaluate(()=>salesApi.showAdminSection('dashboard'));
-  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').innerText(),'2');
-  await page.evaluate(()=>salesApi.showAdminSection('service'));
-  await page.locator('#addServiceWalkIn').click();assert.equal(await page.locator('[data-service-walk-in]').count(),5);
-  await boot(page,session.url);
-  await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('service');});
-  assert.equal(await page.locator('[data-service-walk-in]').count(),5);
-  assert.equal(await page.locator('.service-walk-in-count').count(),2);
-  for(const slot of [1,2]){
-   await page.locator('[data-service-walk-in="'+slot+'"]').click();
-   assert.equal(await page.locator('#consumptionForm [name="session_id"]').inputValue(),sales[slot-1]);
-   assert.match(await page.locator('#consumptionSelectionLines').innerText(),slot===1?/Agua[\s\S]*3 ×/:/Café[\s\S]*4 ×/);
-   await page.keyboard.press('Escape');
-  }
-  await page.locator('[data-service-walk-in="5"]').click();await page.keyboard.press('Escape');
-  assert.equal(await page.locator('.service-walk-in-count').count(),2);
-  assert.equal(await page.evaluate(()=>salesApi.state.invoiceHistory.length),0);
-  assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.p.stock),100000);
-  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-  await page.screenshot({path:path.join(root,'..','proof-'+path.basename(root)+'-'+width+'.png'),fullPage:true});
-  await context.close();
- }assert.deepEqual(errors,[]);}finally{await session.close();}
+test('Venta individual: formulario de cobro fijo y retorno a Inicio conservando las mesas',async()=>{
+ const session=await launch();try{const context=await session.browser.newContext(),page=await context.newPage();await boot(page,session.url);
+ await page.evaluate(()=>salesApi.showAdminSection('service'));
+ assert.equal(await page.locator('#service #paymentDialog').isVisible(),true);
+ assert.equal(await page.locator('#paymentDialog').evaluate(node=>node.matches(':modal')),false);
+ assert.equal(await page.locator('#service [data-open-table], #service [data-service-zone], #service [data-service-walk-in]').count(),0);
+ await page.locator('#paymentDialog [data-cancel-payment]').first().click();
+ assert.equal(await page.evaluate(()=>salesApi.state.activeAdminSection),'dashboard');
+ assert.equal(await page.locator('[data-dashboard-walk-in]').count(),3);
+ await context.close();}finally{await session.close();}
 });
-
 
 test('Ventas: lista de productos debajo del buscador, filtrado, clic y teclado sin perder la búsqueda general',async()=>{
  const session=await launch(),errors=[];
@@ -348,69 +314,17 @@ test('Ventas: lista de productos debajo del buscador, filtrado, clic y teclado s
 });
 
 
-test('Atender mesa: papelera elimina solo el cuadro elegido, confirma borradores y conserva las demás ventas al recargar',async()=>{
- const session=await launch(),errors=[];
- try{for(const width of [1440,390]){
-  const context=await session.browser.newContext({viewport:{width,height:1000}}),page=await context.newPage();page.setDefaultTimeout(12000);
-  page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
-  await page.evaluate(()=>{
-   localStorage.setItem('tienda_napoles_service_walk_in_slots_v1','6');
-   salesApi.showAdminSection('service');
-  });
-  assert.equal(await page.locator('[data-service-walk-in]').count(),6);
-  assert.equal(await page.locator('[data-delete-service-walk-in]').count(),6);
-  const sales={};
-  for(const [slot,product,name] of [[2,'p','Agua'],[5,'q','Café']]){
-   await page.locator('[data-service-walk-in="'+slot+'"]').click();
-   sales[slot]=await page.locator('#paymentForm [name="session_id"]').inputValue();
-   await page.locator('#paymentAddItem').click();
-   await page.locator('#consumptionProductSearch').fill(name);await page.locator('[data-consumption-product="'+product+'"]').click();
-   await page.locator('#consumptionForm [name="quantity"]').fill('3');await page.locator('#consumptionQueueButton').click();
-   await page.locator('#consumptionDialog [data-cancel-consumption]').first().click();
-  }
-  const trash=page.locator('[data-delete-service-walk-in="5"]'),tile=trash.locator('..');
-  const trashBox=await trash.boundingBox(),tileBox=await tile.boundingBox();
-  assert.ok(trashBox.x>tileBox.x+tileBox.width/2&&trashBox.y<tileBox.y+tileBox.height/2);
-  assert.equal(await tile.evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(229, 239, 255)');
-  await page.locator('[data-delete-service-walk-in="4"]').click();
-  assert.equal(await page.locator('[data-service-walk-in]').count(),5);
-  assert.equal(await page.locator('[data-service-walk-in="4"]').count(),0);
-  assert.equal(await page.locator('#paymentDialog').evaluate(node=>node.open),false);
-  assert.equal(await page.locator('#actionConfirmDialog').evaluate(node=>node.open),false);
-  await page.locator('[data-delete-service-walk-in="2"]').click();
-  assert.match(await page.locator('#actionConfirmMessage').innerText(),/venta pendiente/);
-  await page.locator('#actionConfirmCancel').click();
-  assert.equal(await page.locator('[data-service-walk-in="2"]').count(),1);
-  assert.equal(await page.locator('.service-walk-in-count').count(),2);
-  await page.locator('[data-delete-service-walk-in="2"]').click();await page.locator('#actionConfirmAccept').click();
-  await page.waitForFunction(()=>!document.querySelector('[data-service-walk-in="2"]'));
-  assert.equal(await page.locator('.service-walk-in-count').count(),1);
-  assert.equal(await page.evaluate(id=>salesApi.state.sessions.some(s=>s.id===id),sales[2]),false);
-  assert.equal(await page.evaluate(id=>salesApi.state.sessions.some(s=>s.id===id),sales[5]),true);
-  await page.evaluate(()=>salesApi.showAdminSection('dashboard'));
-  assert.equal(await page.locator('#newWalkInSale [data-walk-in-draft-count]').innerText(),'1');
-  await boot(page,session.url);
-  await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('service');});
-  assert.deepEqual(await page.locator('[data-service-walk-in]').evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.serviceWalkIn))),[1,3,5,6]);
-  await page.locator('[data-service-walk-in="5"]').click();
-  assert.equal(await page.locator('#consumptionForm [name="session_id"]').inputValue(),sales[5]);
-  assert.match(await page.locator('#consumptionSelectionLines').innerText(),/Café.*3 ×/s);
-  await page.keyboard.press('Escape');
-  await page.locator('#addServiceWalkIn').click();
-  assert.equal(await page.locator('[data-service-walk-in="7"]').count(),1);
-  await page.locator('[data-delete-service-walk-in="7"]').click();
-  for(const slot of [1,3,6])await page.locator('[data-delete-service-walk-in="'+slot+'"]').click();
-  await page.locator('[data-delete-service-walk-in="5"]').click();await page.locator('#actionConfirmAccept').click();
-  await page.waitForFunction(()=>document.querySelectorAll('[data-service-walk-in]').length===0);
-  assert.equal(await page.evaluate(()=>salesApi.state.invoiceHistory.length),0);
-  assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.p.stock),100000);
-  assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.q.stock),100000);
-  assert.equal(await page.evaluate(()=>calls.some(call=>call.action==='record_sale')),false);
-  await boot(page,session.url);
-  await page.evaluate(()=>{salesApi.loadWalkInDrafts();salesApi.showAdminSection('service');});
-  assert.equal(await page.locator('[data-service-walk-in]').count(),0);
-  await page.locator('#addServiceWalkIn').click();assert.equal(await page.locator('[data-service-walk-in="1"]').count(),1);
-  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
-  await context.close();
- }assert.deepEqual(errors,[]);}finally{await session.close();}
+test('Venta individual: los borradores anteriores de cuadros adicionales siguen recuperables',async()=>{
+ const session=await launch();try{const context=await session.browser.newContext(),page=await context.newPage();await boot(page,session.url);
+ await page.evaluate(()=>{
+  for(const slot of [4,5])salesApi.state.sessions.push({id:'old-'+slot,service_slot:slot,local_only:true,sale_channel:'walk_in',status:'open',session_items:[{id:'item-'+slot,item_name:'Producto '+slot,quantity:slot,unit_price:100,status:'served'}]});
+  salesApi.showAdminSection('service');
+ });
+ assert.equal(await page.locator('#individualSaleDraftControl').isVisible(),true);
+ assert.equal(await page.locator('#paymentForm [name="session_id"]').inputValue(),'old-4');
+ await page.locator('#individualSaleDraft').selectOption('old-5');
+ assert.equal(await page.locator('#paymentForm [name="session_id"]').inputValue(),'old-5');
+ assert.match(await page.locator('#paymentSaleLines').innerText(),/Producto 5/);
+ assert.equal(await page.evaluate(()=>salesApi.state.sessions.filter(session=>session.status==='open').length),2);
+ await context.close();}finally{await session.close();}
 });

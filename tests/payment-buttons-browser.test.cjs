@@ -17,7 +17,7 @@ test('clic real en ambos botones: cobro nuevo, factura antigua restaurada e inte
   let browser;
   try {
     browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
-    for (const scenario of ['fresh', 'restored', 'pending']) for (const action of ['save', 'print']) {
+    for (const scenario of ['fresh', 'restored', 'pending']) for (const action of ['save', 'print']) for (const paid of [0, 50, 200]) {
       const context = await browser.newContext(), page = await context.newPage(), errors = [];
       page.on('pageerror', error => errors.push(error.message));
       await page.route('https://**/*', route => route.fulfill({ status: 503, body: 'test-network-disabled' }));
@@ -27,16 +27,16 @@ test('clic real en ambos botones: cobro nuevo, factura antigua restaurada e inte
         .replace('  return { init };', '  return { init, state, bindAdmin, openPaymentDialog, saveCheckoutIntent, readLocalJson };')
         .replace('document.addEventListener("DOMContentLoaded", App.init);', 'window.buttonApi = App;');
       await page.addScriptTag({ content: code });
-      await page.evaluate(async scenario => {
+      await page.evaluate(async ({ scenario, paid }) => {
         document.body.classList.add('admin-authenticated');
         window.closes = 0; window.prints = 0; window.popups = 0; window.receiptHtml = '';
         window.open = () => { popups++; return { closed: false, document: { open() {}, write(html) { receiptHtml = html; }, close() {} },
           requestAnimationFrame(fn) { fn(); }, focus() {}, print() { prints++; }, close() {} }; };
         const session = { id: 'a0100000-0000-4000-8000-000000000003', table_id: 'table-3', status: 'open', sale_channel: 'table',
-          payer_name: 'Prueba', session_payments: [], session_items: [{ id: 'line-3', menu_item_id: 'product-3', item_name: 'Agua', quantity: 2, unit_price: 100, status: 'served' }] };
+          payer_name: 'Prueba', session_payments: paid ? [{ id: 'prepayment', amount: paid, payment_method: 'transfer', created_at: '2026-11-12T16:00:00Z' }] : [], session_items: [{ id: 'line-3', menu_item_id: 'product-3', item_name: 'Agua', quantity: 2, unit_price: 100, status: 'served' }] };
         const invoice = { id: session.id, sessionId: session.id, number: 'TN-original', table: 'Mesa 3',
           createdAt: '2026-11-12T17:00:00Z', items: session.session_items.map(row => ({ ...row, id: 'historic-report-row' })),
-          payments: [{ method: 'cash', amount: 200 }], totals: { subtotal: 200, total: 200 }, checkoutAccepted: true };
+          prepayments: session.session_payments, remainingPaid: 200 - paid, payments: [...(paid ? [{ method: 'transfer', amount: paid }] : []), ...(paid < 200 ? [{ method: 'cash', amount: 200 - paid }] : [])], totals: { subtotal: 200, total: 200 }, checkoutAccepted: true };
         Object.assign(buttonApi.state, { page: 'admin', currentUser: { id: 'boss', role: 'boss', full_name: 'Caja' }, authToken: 'test',
           business: { business_name: 'Tienda Nápoles', tips_enabled: false }, activeAdminSection: 'service',
           tables: [{ id: 'table-3', table_name: 'Mesa 3', table_number: 3, is_active: true }], sessions: [session],
@@ -52,21 +52,29 @@ test('clic real en ambos botones: cobro nuevo, factura antigua restaurada e inte
           from(table) { return { update() { return this; }, eq() { return this; }, select() { return this; }, maybeSingle() { return this; },
             then(resolve) { return Promise.resolve({ data: table === 'table_sessions' ? structuredClone(remote) : [] }).then(resolve); } }; }
         };
-        if (scenario === 'pending') await buttonApi.saveCheckoutIntent(invoice, structuredClone(session), 0, 'prepared');
+        if (scenario === 'pending') await buttonApi.saveCheckoutIntent(invoice, structuredClone(session), paid, 'prepared');
         buttonApi.bindAdmin(); buttonApi.openPaymentDialog(session.id);
-      }, scenario);
+      }, { scenario, paid });
       await page.locator('#paymentForm button[value="' + action + '"]').click();
       let completed = true;
-      try { await page.waitForFunction(() => buttonApi.state.invoiceHistory.length === 1 && !buttonApi.state.paymentProcessing && !document.querySelector('#paymentDialog').open, { timeout: 5000 }); }
+      try { await page.waitForFunction(() => buttonApi.state.invoiceHistory.length === 1 && !buttonApi.state.paymentProcessing
+        && !buttonApi.state.sessions.some(row => row.id === 'a0100000-0000-4000-8000-000000000003')
+        && (!document.querySelector('#paymentDialog').open || document.querySelector('#paymentForm').session_id.value !== 'a0100000-0000-4000-8000-000000000003'), { timeout: 5000 }); }
       catch { completed = false; }
       const result = await page.evaluate(() => ({ closes, prints, popups, invoices: buttonApi.state.invoiceHistory.length,
-        sessions: buttonApi.state.sessions.length, stock: buttonApi.state.inventoryMeta['product-3'].stock,
-        processing: buttonApi.state.paymentProcessing, dialog: document.querySelector('#paymentDialog').open,
+        sessions: buttonApi.state.sessions.length, sessionRows: buttonApi.state.sessions.map(row => ({ id: row.id, channel: row.sale_channel, status: row.status, items: row.session_items?.length })), stock: buttonApi.state.inventoryMeta['product-3'].stock,
+        remainingPaid: buttonApi.state.invoiceHistory[0]?.remainingPaid, totalPaid: buttonApi.state.invoiceHistory[0]?.payments.reduce((sum, row) => sum + row.amount, 0), processing: buttonApi.state.paymentProcessing, dialog: document.querySelector('#paymentDialog').open,
+        dialogSession: document.querySelector('#paymentForm').session_id.value,
         receiptPaid: receiptHtml.includes('PAGADO'), text: document.body.innerText.slice(-2000) }));
       assert.equal(completed, true, scenario + '/' + action + ': ' + JSON.stringify(result));
       assert.equal(result.closes, 1, scenario + '/' + action);
       assert.equal(result.invoices, 1);
-      assert.equal(result.sessions, 0);
+      assert.equal(result.remainingPaid, 200 - paid);
+      assert.equal(result.totalPaid, 200);
+      assert.equal(result.sessionRows.some(row => row.id === 'a0100000-0000-4000-8000-000000000003'), false);
+      // This local version opens an empty individual sale after finishing checkout.
+      assert.equal(result.sessionRows.every(row => row.channel === 'walk_in' && row.items === 0), true);
+      if (result.dialog) assert.notEqual(result.dialogSession, 'a0100000-0000-4000-8000-000000000003');
       assert.equal(result.stock, 8, 'No repite el descuento de inventario: ' + scenario);
       assert.equal(result.prints, action === 'print' ? 1 : 0);
       assert.equal(result.popups, action === 'print' ? 1 : 0);

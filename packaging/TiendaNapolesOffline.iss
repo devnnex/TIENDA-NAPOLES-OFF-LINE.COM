@@ -1,5 +1,5 @@
 #define AppName "Tienda Nápoles Offline"
-#define AppVersion "1.0.43"
+#define AppVersion "1.0.44"
 
 [Setup]
 AppId={{1B759C3D-EEAC-42F1-8C91-A400775027C1}
@@ -37,6 +37,7 @@ Source: "..\index.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\menu-cards.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\menu-cards.css"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\app.js"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\offline-login-reset.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\sales-shift.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\service-worker.js"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\style.css"; DestDir: "{app}"; Flags: ignoreversion

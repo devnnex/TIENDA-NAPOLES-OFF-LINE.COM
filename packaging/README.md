@@ -1,23 +1,51 @@
 # Instalador de Tienda Napoles Offline
 
+La versión 1.0.44 (20 de noviembre de 2026) conserva el diseño de esta copia
+de trabajo y corrige la recuperación de cuentas cobradas. Los cierres durables
+no vuelven a consultar la red ante una lectura atrasada. Cuando REST falla o
+no muestra la cuenta, la recuperación usa las RPC autenticadas existentes;
+un error de lectura queda pendiente sin mostrar el aviso de verificación.
+Conserva las comprobaciones de productos y abonos, los identificadores de
+factura y el descuento único de inventario. Un intento conflictivo no detiene
+los demás, y un clic durante la recuperación conserva la acción solicitada.
+El borrado de consumos conserva los abonos y las modificaciones concurrentes.
+Usa cache v86. No requiere una nueva migración SQL ni actualizar Apps Script.
+
+El push a main de AppVersion activa `build-installer-release.yml`, que compila
+este commit y publica v1.0.44. La landing consulta `releases/latest` y recibe
+el nuevo instalador automáticamente una vez publicada la Release.
+Las notas de preparación de 1.0.42 que siguen son históricas.
+
 `build-installer.ps1` compila un iniciador Windows sin consola y genera un unico
-`dist/Tienda-Napoles-Offline-Setup-1.0.43.exe` con Inno Setup 6.
+`dist/Tienda-Napoles-Offline-Setup-1.0.44.exe` con Inno Setup 6.
 
-La version 1.0.43 corrige el bloqueo al recuperar una factura anterior en los
-botones Cobrar sin imprimir y Cobrar e imprimir. Compara productos, cantidades
-y precios, admite lineas agrupadas y el formato de facturas antiguas, y termina
-el cierre con la misma factura sin repetir inventario. Conserva la proteccion
-de consumos o abonos nuevos. La recuperacion respeta la opcion de imprimir.
-Incluye pruebas de clic real de ambos botones. Usa cache v85. No requiere SQL
-ni actualizar Apps Script.
+La version 1.0.42 muestra el formulario fijo de cobro en Venta individual,
+agrega las tres ventas independientes de Inicio y permite guardar y leer
+codigos de barras. Incluye `offline-login-reset.js`, el servidor con respaldo
+cifrado y limpieza completa al entrar, y la recuperacion de datos operativos.
+La barra de almacenamiento puede volver a mostrar uso al recuperar los datos
+necesarios y preparar el modo offline. Usa cache v84.
 
-La version 1.0.42 corrige la reaparicion de cuentas facturadas en todas las mesas.
-Guarda el recibo de cierre en la misma transaccion de IndexedDB que la factura,
-reconcilia cuentas antiguas con su factura original y recupera respaldos pendientes
-sin repetir la venta ni descontar otra vez inventario. Comprueba productos y abonos
-antes de cerrar; conserva cualquier consumo distinto para revision. Usa cache v84.
-No requiere SQL ni actualizar Apps Script. Instalar sobre la misma aplicacion con
-el mismo usuario de Windows conserva los datos locales.
+El iniciador comprueba que el servidor activo soporte esta limpieza. Si sigue
+activo un servidor anterior identificado como Napoles, lo reemplaza por el
+instalado actualizado, incluso cuando usa la misma carpeta. Conserva las
+comprobaciones que evitan cerrar procesos ajenos.
+
+Los codigos requieren la migracion
+`supabase/migrations/20261111120000_product_barcodes.sql` (el usuario confirmo
+que ya la ejecuto en el proyecto compartido por BCA y OFF-LINE).
+
+Preparacion local del 11 de noviembre de 2026: no se ha hecho push ni creado
+ninguna Release. La landing consulta `releases/latest`. Cuando se autorice el
+push a main, el cambio de AppVersion activa `build-installer-release.yml`,
+que compila el codigo de ese commit y publica v1.0.42 para la misma landing.
+No se requiere modificar la pagina.
+
+La copia compilada para revision local se conserva fuera del repositorio,
+en `.delivery/release-1.0.42/`, junto con su SHA256 y el manifiesto de fuentes.
+No se agrega otro instalador a dist durante esta preparacion: asi el push
+activa solo el flujo de compilacion desde fuentes y evita dos publicaciones
+del mismo numero de version con binarios compilados en equipos diferentes.
 
 La version 1.0.41 agrega una papelera en cada venta individual de Atender mesa.
 Quita el cuadro elegido sin renumerar las demas ventas, conserva la eliminacion

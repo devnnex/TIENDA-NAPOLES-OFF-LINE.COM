@@ -15,8 +15,8 @@ using System.Windows.Forms;
 [assembly: AssemblyDescription("Iniciador de Tienda Napoles Offline sin consola")]
 [assembly: AssemblyCompany("Tienda Napoles")]
 [assembly: AssemblyProduct("Tienda Napoles Offline")]
-[assembly: AssemblyVersion("1.0.23.0")]
-[assembly: AssemblyFileVersion("1.0.23.0")]
+[assembly: AssemblyVersion("1.0.42.0")]
+[assembly: AssemblyFileVersion("1.0.42.0")]
 
 public static class TiendaNapolesOffline
 {
@@ -25,6 +25,7 @@ public static class TiendaNapolesOffline
     private const string InstallMarkerUrl = "http://127.0.0.1:8766/tienda-napoles-installed.marker";
     private const string DrawerHealthUrl = "http://127.0.0.1:8766/__tienda_napoles_drawer_health";
     private const string LoginHealthUrl = "http://127.0.0.1:8766/__tienda_napoles_login_health";
+    private const string BrowserResetHealthUrl = "http://127.0.0.1:8766/__tienda_napoles_browser_reset_health";
     private const string InstallMarker = "TiendaNapolesOffline:1B759C3D-EEAC-42F1-8C91-A400775027C1";
 
     [STAThread]
@@ -45,9 +46,9 @@ public static class TiendaNapolesOffline
                 return;
             }
 
-            if (ServerIsReady() && (!ServerIsInstalledCopy() || !ServerSupportsDrawer() || !ServerSupportsLogin()))
+            if (ServerIsReady() && (!ServerIsInstalledCopy() || !ServerSupportsDrawer() || !ServerSupportsLogin() || !ServerSupportsBrowserReset()))
             {
-                if (!TryStopPreviousServer(appDirectory, !ServerSupportsDrawer() || !ServerSupportsLogin()))
+                if (!TryStopPreviousServer(appDirectory, !ServerSupportsDrawer() || !ServerSupportsLogin() || !ServerSupportsBrowserReset()))
                 {
                     ShowError("El puerto local esta ocupado por otro proceso que no se pudo identificar como Tienda Napoles. Cierra esa aplicacion e intenta de nuevo.");
                     return;
@@ -167,6 +168,21 @@ public static class TiendaNapolesOffline
             request.Timeout = 1000;
             using (var response = (HttpWebResponse)request.GetResponse())
                 return response.StatusCode == HttpStatusCode.OK;
+        }
+        catch (WebException) { return false; }
+    }
+
+    private static bool ServerSupportsBrowserReset()
+    {
+        try
+        {
+            var request = (HttpWebRequest)WebRequest.Create(BrowserResetHealthUrl);
+            request.Proxy = null;
+            request.Timeout = 1000;
+            request.ReadWriteTimeout = 1000;
+            using (var response = (HttpWebResponse)request.GetResponse())
+            using (var reader = new StreamReader(response.GetResponseStream()))
+                return response.StatusCode == HttpStatusCode.OK && reader.ReadToEnd().Trim() == "OK_BROWSER_RESET_V1";
         }
         catch (WebException) { return false; }
     }

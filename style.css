@@ -5513,7 +5513,7 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 /* Individual sale removal and pending draft indicator. */
 .payment-sale-lines > .payment-walk-in-line { display: grid; grid-template-columns: minmax(0, 1fr) auto 34px; align-items: center; }
 .payment-walk-in-line > span { min-width: 0; overflow-wrap: anywhere; }
-#newWalkInSale [data-walk-in-draft-count][hidden] { display: none; }
+[data-dashboard-walk-in] [data-walk-in-draft-count][hidden] { display: none; }
 
 /* Ventas individuales retenidas en Atender mesa. */
 .service-walk-in-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: .65rem; margin-bottom: 1rem; }

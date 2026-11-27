@@ -25,7 +25,7 @@ function adminHarness({healthy=true,hidden=false}={}){
   setInterval:(fn,delay)=>{const id=++next;timers.set(id,{fn,delay,due:now+delay});return id;},clearInterval:id=>timers.delete(id),
   window:{setTimeout:(fn,delay)=>{const id=++next;timers.set(id,{fn,delay:0,due:now+delay});return id;}},
   pollAdminRequests:()=>{calls.requests++;},loadAdminData:async()=>{calls.snapshot++;if(gate)await gate;return false;},
-  refreshCoreNow:async()=>{calls.core++;state.coreRefreshedAt=now;},isBoss:()=>true,loadUsers:()=>{calls.users++;},renderAdminLive(){},refreshBackgroundReports(){}});
+  refreshCoreNow:async()=>{calls.core++;state.coreRefreshedAt=now;},isBoss:()=>true,loadUsers:()=>{calls.users++;},renderAdminLive(){},refreshBackgroundReports(){},recoverPendingCheckouts(){}});
  vm.runInContext(block('  let adminRefreshPending =','  const startAdminPolling =')+section('startAdminPolling',source.includes('  const pendingAdminReadScope =')?'pendingAdminReadScope':'pendingAdminRequestsStorageKey')+';globalThis.api={startAdminPolling,refreshAdminNow};',context);
  const advance=async ms=>{const end=now+ms;while(true){const due=[...timers].filter(([,t])=>t.due<=end).sort((a,b)=>a[1].due-b[1].due)[0];if(!due)break;now=due[1].due;if(due[1].delay)due[1].due+=due[1].delay;else timers.delete(due[0]);due[1].fn();await settle();}now=end;await settle();};
  return {state,calls,api:context.api,advance,setGate:value=>{gate=value;},context};

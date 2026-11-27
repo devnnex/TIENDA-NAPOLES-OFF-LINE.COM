@@ -123,8 +123,15 @@ const App = (() => {
   const rememberRemoteConfirmation = detail => {
     if (!Array.isArray(detail?.confirmedRows) || !detail.entity) return;
     state.confirmedRemoteRows ||= new Map();
-    for (const row of detail.confirmedRows) if (row?.id) state.confirmedRemoteRows.set(detail.entity + ":" + row.id, { row, at: Date.now() });
-    if (state.confirmedRemoteRows.size > 4000) state.confirmedRemoteRows.delete(state.confirmedRemoteRows.keys().next().value);
+    const confirmedAt = Date.now();
+    for (const row of detail.confirmedRows) {
+      if (!row?.id) continue;
+      const key = detail.entity + ":" + row.id;
+      // Refresh insertion order so a recently updated receipt is retained.
+      state.confirmedRemoteRows.delete(key);
+      state.confirmedRemoteRows.set(key, { row, at: confirmedAt });
+    }
+    while (state.confirmedRemoteRows.size > 4000) state.confirmedRemoteRows.delete(state.confirmedRemoteRows.keys().next().value);
   };
 
   const REQUEST_LABELS = {
@@ -744,7 +751,7 @@ const App = (() => {
     const normalizedRaw = typeof raw === "number" ? String(Math.max(0, Math.round(raw))) : String(raw ?? "");
     const digits = normalizedRaw.replace(/\D/g, "").slice(0, 15);
     if (!digits) return allowEmpty ? "" : "$0";
-    return `$${Number(digits).toLocaleString("es-CO", { maximumFractionDigits: 0 })}`;
+    return `$${(formattedCurrencyInput.formatter ||= new Intl.NumberFormat("es-CO", { maximumFractionDigits: 0 })).format(Number(digits))}`;
   };
 
   const setCurrencyInputValue = (input, value) => {
@@ -830,25 +837,23 @@ const App = (() => {
   const uid = () =>
     crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  let iconRefreshScheduled = false;
-  const refreshIcons = () => {
-    if (!window.lucide || iconRefreshScheduled) return;
-    iconRefreshScheduled = true;
-    window.requestAnimationFrame(() => {
-      iconRefreshScheduled = false;
-      window.lucide?.createIcons({
-        root: { querySelectorAll: (selector) => document.querySelectorAll(`${selector}:not(svg)`) }
-      });
+  const refreshIcons = (scope = document) => {
+    if (scope && window.lucide) window.lucide.createIcons({
+      root: { querySelectorAll: (selector) => {
+        const pending = scope.querySelectorAll(`${selector}:not(svg)`);
+        return scope.matches?.(`${selector}:not(svg)`) ? [scope, ...pending] : pending;
+      } }
     });
   };
 
-  const paintRowsProgressively = (target, renderers, { append = false } = {}) => {
+  const paintRowsProgressively = (target, renderers, { append = false, afterPaint = null } = {}) => {
     const revision = (target.rowPaintRevision || 0) + 1;
     target.rowPaintRevision = revision;
     const pending = paintRowsProgressively.pending ||= new Map();
     pending.delete(target);
     paintRowsProgressively.resume = () => {
       for (const [list, next] of pending) {
+        if (!list.isConnected) { pending.delete(list); continue; }
         if (list.closest("[data-admin-section]")?.classList.contains("section-active")) {
           pending.delete(list); window.setTimeout(next, 0);
         }
@@ -861,12 +866,29 @@ const App = (() => {
       const section = target.closest("[data-admin-section]");
       if (section && !section.classList.contains("section-active")) { pending.set(target, paint); return; }
       const shiftDialog = document.querySelector("#salesShiftDialog[open]");
-      if (shiftDialog) { shiftDialog.addEventListener("close", () => window.setTimeout(paint, 0), { once: true }); return; }
+      if (shiftDialog) {
+        target.rowPaintShiftResume = paint;
+        if (target.rowPaintShiftDialog !== shiftDialog) {
+          target.rowPaintShiftDialog = shiftDialog;
+          shiftDialog.addEventListener("close", () => {
+            target.rowPaintShiftDialog = null;
+            const resume = target.rowPaintShiftResume;
+            target.rowPaintShiftResume = null;
+            if (resume) window.setTimeout(resume, 0);
+          }, { once: true });
+        }
+        return;
+      }
       const started = performance.now(), parts = [];
       do { parts.push(renderers[offset++]()); }
       while (offset < renderers.length && parts.length < 20 && performance.now() - started < 4);
+      const previousLast = target.lastElementChild;
       target.insertAdjacentHTML("beforeend", parts.join(""));
-      refreshIcons();
+      const newRows = [];
+      for (let row = previousLast ? previousLast.nextElementSibling : target.firstElementChild; row; row = row.nextElementSibling) newRows.push(row);
+      // Only visit this batch; scanning the whole document for every batch grows quadratically.
+      for (const row of newRows) refreshIcons(row);
+      afterPaint?.(newRows);
       if (offset < renderers.length) {
         if (window.scheduler?.postTask) void window.scheduler.postTask(paint, { priority: "background" });
         else window.setTimeout(paint, 0);
@@ -1037,10 +1059,12 @@ const App = (() => {
 
   const cachedQrDataUrl = async (text, size = 720) => {
     const key = `${size}:${text}`;
-    if (!state.qrCache.has(key)) {
-      state.qrCache.set(key, generateQrDataUrl(text, size));
-    }
-    return state.qrCache.get(key);
+    if (state.qrCache.has(key)) return state.qrCache.get(key);
+    const pending = generateQrDataUrl(text, size);
+    state.qrCache.set(key, pending);
+    while (state.qrCache.size > 160) state.qrCache.delete(state.qrCache.keys().next().value);
+    try { return await pending; }
+    catch (error) { if (state.qrCache.get(key) === pending) state.qrCache.delete(key); throw error; }
   };
 
   const renderQrImage = async (target, text, alt = "QR") => {
@@ -1050,12 +1074,13 @@ const App = (() => {
     target.classList.add("qr-loading");
     try {
       const dataUrl = await cachedQrDataUrl(text, 420);
+      if (target.dataset.qrText !== text) return;
       target.innerHTML = `<img src="${dataUrl}" alt="${alt}">`;
     } catch (error) {
-      target.innerHTML = `${icon("qr-code", 20)}`;
+      if (target.dataset.qrText === text) target.innerHTML = `${icon("qr-code", 20)}`;
     } finally {
-      target.classList.remove("qr-loading");
-      refreshIcons();
+      if (target.dataset.qrText === text) target.classList.remove("qr-loading");
+      refreshIcons(target);
     }
   };
 
@@ -1097,6 +1122,7 @@ const App = (() => {
       renderMenuManager();
       renderTableManager();
       renderTableFormQr();
+      renderGeneratedTableQrs();
     }
     if (section === "inventory") renderInventory();
     if (section === "movements") {
@@ -2445,9 +2471,13 @@ const App = (() => {
 
   const renderServiceWalkInSales = () => {
     const grid = $("#serviceWalkInGrid");
-    if (!grid) return;
+    if (!grid || (state.page === "admin" && state.activeAdminSection !== "service")) return;
     const sessions = serviceWalkInSessions();
     const slots = serviceWalkInSlots(sessions);
+    const signature = JSON.stringify([slots, sessions.map(session => [session.service_slot,
+      (session.session_items || []).some(item => item.status !== "cancelled"), session.consumption_draft])]);
+    if (grid.dataset.renderSignature === signature) return;
+    grid.dataset.renderSignature = signature;
     grid.innerHTML = slots.map(slot => {
       const session = sessions.find(entry => entry.service_slot === slot);
       const draft = session?.consumption_draft;
@@ -2456,7 +2486,7 @@ const App = (() => {
           || draft.fields?.quantity || draft.search?.trim())));
       return `<article class="service-point-tile service-walk-in-tile ${pending ? "occupied" : "free"}"><button type="button" data-service-walk-in="${slot}" aria-label="Venta individual ${slot}${pending ? ": venta pendiente" : ": libre"}">${icon("shopping-bag", 22)}<span><strong>Venta individual ${slot}</strong><small>${pending ? "Venta pendiente" : "Libre"}</small></span>${pending ? '<em class="service-walk-in-count" aria-label="1 venta pendiente">1</em>' : ""}</button><button class="icon-btn danger service-walk-in-delete" type="button" data-delete-service-walk-in="${slot}" aria-label="Eliminar cuadro de Venta individual ${slot}" title="Eliminar cuadro">${icon("trash-2", 16)}</button></article>`;
     }).join("") + `<button class="ghost service-walk-in-add" type="button" id="addServiceWalkIn" aria-label="Agregar cuadro de venta individual"><span aria-hidden="true" style="font-size:2rem;line-height:1">+</span></button>`;
-    refreshIcons();
+    refreshIcons(grid);
   };
 
   const addServiceWalkInSlot = () => {
@@ -4937,8 +4967,9 @@ const App = (() => {
   const mergeOptimisticSessions = (serverSessions = [], { readStartedAt = 0 } = {}) => {
     const merged = new Map(serverSessions.map((session) => [session.id, { ...session, session_items: mergeSessionItems(session.session_items) }]));
     state.checkoutReconciliationCandidates ||= new Map();
+    const invoicedSessionIds = new Set((state.invoiceHistory || []).map(invoice => String(invoice.sessionId)));
     serverSessions.forEach(session => {
-      if ((state.invoiceHistory || []).some(invoice => String(invoice.sessionId) === String(session.id))) {
+      if (invoicedSessionIds.has(String(session.id))) {
         state.checkoutReconciliationCandidates.set(String(session.id), session);
       }
     });
@@ -5740,14 +5771,21 @@ const App = (() => {
       state.readBudget?.settled("core",Boolean(data?.business && Array.isArray(data?.tables) && Array.isArray(data?.categories) && Array.isArray(data?.items)),readScope);
       const coreLoaded = Array.isArray(data?.tables) && Array.isArray(data?.categories) && Array.isArray(data?.items);
       state.syncFresh ||= {};
+      let coreChanged = false;
       if (businessLoaded && coreLoaded) {
         const currentQueue = typeof getOfflineSyncStatus === 'function' ? await getOfflineSyncStatus() : {blockingRecords:[]};
         const fresh = mergePendingCoreData(data,{blockingRecords:[...(queue.blockingRecords || []),...(currentQueue.blockingRecords || [])]},baseline);
-        state.business = fresh.business; state.tables = fresh.tables; state.categories = fresh.categories; state.items = fresh.items;
+        coreChanged = JSON.stringify([state.business,state.tables,state.categories,state.items])
+          !== JSON.stringify([fresh.business,fresh.tables,fresh.categories,fresh.items]);
+        if (coreChanged) {
+          state.business = fresh.business; state.tables = fresh.tables; state.categories = fresh.categories; state.items = fresh.items;
+        }
         state.coreRefreshedAt = Date.now();
       }
       if (businessLoaded && coreLoaded) state.coreDirectReadSucceeded = true;
       state.syncFresh.core = Boolean(businessLoaded && coreLoaded);
+      // Healthy unchanged snapshots update freshness without rebuilding the UI.
+      if (!coreChanged) return businessLoaded && coreLoaded;
       applyBusinessTipSettings();
       if (!state.outdoorTableDraftDirty) state.outdoorTableDraftIds = null;
       if (businessLoaded && coreLoaded) persistBootstrapCache();
@@ -6123,7 +6161,8 @@ const App = (() => {
     const renderSignature = JSON.stringify([state.alertFilter, visibleAlerts.map((request) =>
       [request.kind, request.request_ids, request.entries.map((entry) => [entry.id, entry.message, entry.created_at])])]);
     box.classList.toggle("has-alerts", alerts.length > 0);
-    const alertCards = visibleAlerts
+    const changed = renderSignature !== state.alertRenderSignature;
+    const alertCards = changed ? visibleAlerts
       .map(
         (request) => `
               <article class="alert-card alert-${request.kind}" data-alert-card="${request.id}">
@@ -6148,7 +6187,7 @@ const App = (() => {
               </article>
             `
       )
-      .join("");
+      .join("") : "";
 
     $("#floatingAlerts")?.remove();
     if (renderSignature !== state.alertRenderSignature) {
@@ -6171,19 +6210,24 @@ const App = (() => {
       state.lastAlertSignature = signature;
       playAlarm(activeRequests());
     }
-    refreshIcons();
+    if (changed) refreshIcons(box);
   };
 
-  const compactTableTiles = (zoneFilter = "all", groupFilter = "all", query = "") => normalTables()
+  const compactTableTiles = (zoneFilter = "all", groupFilter = "all", query = "") => {
+    const sessions = new Map(), requests = new Map();
+    for (const session of state.sessions) if (!sessions.has(session.table_id) && sessionHasConsumption(session)) sessions.set(session.table_id, session);
+    for (const request of state.requests) if (request.status === "pending") requests.set(request.table_id, (requests.get(request.table_id) || 0) + 1);
+    return normalTables()
     .filter((table) => table.is_active !== false)
     .filter((table) => tableMatchesZone(table, zoneFilter))
     .filter((table) => tableMatchesGroup(table, groupFilter) && tableMatchesSearch(table, query))
     .map((table) => {
-      const session = state.sessions.find((entry) => entry.table_id === table.id && sessionHasConsumption(entry));
-      const pending = state.requests.filter((request) => request.table_id === table.id && request.status === "pending").length;
+      const session = sessions.get(table.id);
+      const pending = requests.get(table.id) || 0;
       const occupied = Boolean(session);
       return `<button class="compact-table-tile ${occupied ? "occupied" : "free"} ${isOutdoorTable(table) ? "outdoor" : "indoor"} ${isTerraceTable(table) ? "terrace" : ""} ${pending ? "needs-attention" : ""}" type="button" data-open-table="${escapeHTML(table.id)}" title="Agregar consumo en ${escapeHTML(tableLabel(table))}"><span class="table-furniture-icon">${icon("armchair", 23)}</span><strong>M${escapeHTML(table.table_number)}</strong>${occupied ? `<small>${money(sessionTotal(session))}</small>` : "<small>Libre</small>"}${pending ? `<em>${pending}</em>` : ""}</button>`;
     }).join("");
+  };
 
   const renderTables = () => {
     const box = $("#tablesGrid");
@@ -6645,6 +6689,7 @@ const App = (() => {
   };
 
   let barcodeScanChain = Promise.resolve();
+  let barcodeLiveRenderPending = false;
   const addBarcodeToSale = async (sessionId, rawCode) => {
     const code = String(rawCode || "").trim();
     const status = $("#barcodeSaleStatus");
@@ -6662,8 +6707,11 @@ const App = (() => {
     // Reuse the same local consumption and checkout path; stock changes on payment.
     const result = await addConsumptionBatch({ session_id: { value: sessionId }, pending_table_id: { value: "" },
       payer_name: { value: session.payer_name || "" } }, [{ menuItemId: item.id, itemName: item.name,
-      unitPrice: Number(item.price || 0), quantity: 1, notes: "", payerName: session.payer_name || "" }]);
+      unitPrice: Number(item.price || 0), quantity: 1, notes: "", payerName: session.payer_name || "" }], { barcodeScan: true });
     if (!result) return fail("No se pudo agregar el producto. Escanéalo de nuevo.");
+    state.individualProductFlashes ||= new WeakMap();
+    (result.items || []).forEach(line => state.individualProductFlashes.set(line, Date.now() + 2200));
+    state.lastBarcodeScan = { sessionId, itemId: result.items?.at(-1)?.id };
     if (state.activeAdminSection === "dashboard" && $("#paymentForm")?.session_id.value === sessionId) {
       // Update totals without resetting the selected payment method or cash input.
       const updated = state.sessions.find(entry => entry.id === sessionId);
@@ -6674,6 +6722,8 @@ const App = (() => {
       refreshIcons();
     }
     if (status) status.textContent = item.name + " agregado.";
+    const addedRow = $("#paymentSaleLines .barcode-last-added");
+    addedRow?.scrollIntoView({ block: "nearest", behavior: "instant" });
     return true;
   };
 
@@ -7688,12 +7738,12 @@ const App = (() => {
     return buttons[index];
   };
 
-  const renderMenuManager = () => {
-    const signature = JSON.stringify([state.categories, state.items, state.inventoryMeta]);
-    if (signature === state.menuManagerRenderSignature && $("#itemList")?.firstElementChild) return;
-    state.menuManagerRenderSignature = signature;
+  const renderCategorySelects = () => {
+    const signature = JSON.stringify(state.categories.map(category => [category.id, category.name]));
     const categorySelects = $$(".js-category-select");
     categorySelects.forEach((select) => {
+      if (select.dataset.categorySignature === signature) return;
+      select.dataset.categorySignature = signature;
       const selectedValue = select.value;
       const excludedInventoryCategories = new Set(["entrada", "entradas", "plato fuerte", "platos fuertes", "postre", "postres"]);
       const categories = select.closest("#inventoryForm")
@@ -7706,14 +7756,19 @@ const App = (() => {
       if ([...select.options].some((option) => option.value === selectedValue)) select.value = selectedValue;
     });
 
+  };
+
+  const renderMenuManager = () => {
+    renderCategorySelects();
+    if (state.page === "admin" && state.activeAdminSection !== "menu") return;
+    const signature = JSON.stringify([state.categories, state.items]);
+    if (signature === state.menuManagerRenderSignature && $("#itemList")?.firstElementChild) return;
+    state.menuManagerRenderSignature = signature;
     renderConsumptionProductOptions($("#consumptionProductSearch")?.value || "");
 
     const categoryList = $("#categoryList");
     if (categoryList) {
-      categoryList.innerHTML = state.categories.length
-        ? state.categories
-            .map(
-              (category) => `
+      if (state.categories.length) paintRowsProgressively(categoryList, state.categories.map(category => () => `
                 <div class="manager-row category-manager-row">
                   <div class="category-token">${icon("tag", 16)}</div>
                   <div>
@@ -7726,17 +7781,13 @@ const App = (() => {
                   </div>
                 </div>
               `
-            )
-            .join("")
-        : emptyState("Sin categorias", "Crea categorias para ordenar el menu.", "tags");
+      ));
+      else { categoryList.rowPaintRevision = (categoryList.rowPaintRevision || 0) + 1; categoryList.innerHTML = emptyState("Sin categorias", "Crea categorias para ordenar el menu.", "tags"); }
     }
 
     const itemList = $("#itemList");
     if (itemList) {
-      itemList.innerHTML = state.items.length
-        ? state.items
-            .map(
-              (item) => `
+      if (state.items.length) paintRowsProgressively(itemList, state.items.map(item => () => `
                 <div class="manager-row item-row product-manager-row">
                   <div class="product-thumb">
                     ${
@@ -7760,11 +7811,11 @@ const App = (() => {
                   </div>
                 </div>
               `
-            )
-            .join("")
-        : emptyState("Sin productos", "Agrega platos, bebidas o servicios.", "chef-hat");
+      ));
+      else { itemList.rowPaintRevision = (itemList.rowPaintRevision || 0) + 1; itemList.innerHTML = emptyState("Sin productos", "Agrega platos, bebidas o servicios.", "chef-hat"); }
     }
-    refreshIcons();
+    refreshIcons(categoryList);
+    refreshIcons(itemList);
   };
 
   const inventorySummary = () => state.items.reduce((summary, item) => {
@@ -7797,27 +7848,30 @@ const App = (() => {
   const renderInventoryCategoryFilter = () => {
     const select = $("#inventoryCategoryFilter");
     if (!select) return;
+    const usedCategoryIds = new Set(state.items.map(item => String(item.category_id || "")));
     const categories = [...state.categories]
-      .filter((category) => category?.id && state.items.some((item) => String(item.category_id || "") === String(category.id)))
+      .filter((category) => category?.id && usedCategoryIds.has(String(category.id)))
       .sort((left, right) => Number(left.sort_order || 0) - Number(right.sort_order || 0) || String(left.name || "").localeCompare(String(right.name || ""), "es"));
     const validIds = new Set(categories.map((category) => String(category.id)));
-    const hasUncategorized = state.items.some((item) => !item.category_id);
+    const hasUncategorized = usedCategoryIds.has("");
     if (state.inventoryCategoryFilter !== "all"
       && state.inventoryCategoryFilter !== "uncategorized"
       && !validIds.has(String(state.inventoryCategoryFilter))) {
       state.inventoryCategoryFilter = "all";
     }
     if (state.inventoryCategoryFilter === "uncategorized" && !hasUncategorized) state.inventoryCategoryFilter = "all";
-    select.innerHTML = [
+    const markup = [
       '<option value="all">Todas</option>',
       ...categories.map((category) => `<option value="${escapeHTML(category.id)}">${escapeHTML(category.name || "Sin categoría")}</option>`),
       ...(hasUncategorized ? ['<option value="uncategorized">Sin categoría</option>'] : [])
     ].join("");
+    if (select.innerHTML !== markup) select.innerHTML = markup;
     select.value = state.inventoryCategoryFilter;
   };
 
   const renderInventory = () => {
     if (state.activeAdminSection && state.activeAdminSection !== "inventory") return;
+    renderCategorySelects();
     const metrics = $("#inventoryMetrics");
     const list = $("#inventoryList");
     if (!metrics || !list) return;
@@ -7858,7 +7912,7 @@ const App = (() => {
               <div class="inventory-numbers">
                 <span><small>Costo</small><strong>${money(inventory.costPrice)}</strong></span>
                 <span><small>Venta</small><strong>${money(item.price)}</strong></span>
-                <span class="inventory-profit"><small>Utilidad</small><strong>${money(profit)}</strong><em>${margin.toLocaleString("es-CO", { maximumFractionDigits: 1 })}% margen</em></span>
+                <span class="inventory-profit"><small>Utilidad</small><strong>${money(profit)}</strong><em>${(renderInventory.marginFormatter ||= new Intl.NumberFormat("es-CO", { maximumFractionDigits: 1 })).format(margin)}% margen</em></span>
               </div>
               <div class="inventory-row-actions">
                 <button class="ghost small inventory-adjust-trigger" type="button" data-inventory-adjust="${escapeHTML(item.id)}">${icon("package-plus", 16)} Unidades</button>
@@ -7884,12 +7938,12 @@ const App = (() => {
   const purchaseDateKey = (value) => {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return "";
-    const parts = new Intl.DateTimeFormat("en-US", {
+    const parts = (purchaseDateKey.formatter ||= new Intl.DateTimeFormat("en-US", {
       timeZone: "America/Bogota",
       year: "numeric",
       month: "2-digit",
       day: "2-digit"
-    }).formatToParts(date).reduce((result, part) => ({ ...result, [part.type]: part.value }), {});
+    })).formatToParts(date).reduce((result, part) => ({ ...result, [part.type]: part.value }), {});
     return `${parts.year}-${parts.month}-${parts.day}`;
   };
 
@@ -7931,6 +7985,7 @@ const App = (() => {
       })
       .filter((movement) => state.purchaseProductFilter === "all" || String(movement.productId) === state.purchaseProductFilter)
       .filter((movement) => {
+        if (!state.purchaseDateFrom && !state.purchaseDateTo) return true;
         const dateKey = purchaseDateKey(movement.date);
         return (!state.purchaseDateFrom || dateKey >= state.purchaseDateFrom)
           && (!state.purchaseDateTo || dateKey <= state.purchaseDateTo);
@@ -7955,7 +8010,8 @@ const App = (() => {
       if (id && !products.has(id)) products.set(id, { id, name: movement.product || "Producto", code: movement.code || "" });
     });
     const options = Array.from(products.values()).sort((left, right) => left.name.localeCompare(right.name, "es"));
-    select.innerHTML = `<option value="all">Todos los productos</option>${options.map((product) => `<option value="${escapeHTML(product.id)}">${escapeHTML(product.name)}${product.code ? ` (${escapeHTML(product.code)})` : ""}</option>`).join("")}`;
+    const markup = `<option value="all">Todos los productos</option>${options.map((product) => `<option value="${escapeHTML(product.id)}">${escapeHTML(product.name)}${product.code ? ` (${escapeHTML(product.code)})` : ""}</option>`).join("")}`;
+    if (select.innerHTML !== markup) select.innerHTML = markup;
     select.value = options.some((product) => product.id === selected) ? selected : "all";
     state.purchaseProductFilter = select.value;
   };
@@ -7992,6 +8048,13 @@ const App = (() => {
     const list = $("#purchaseHistoryList");
     const feedback = $("#purchaseFilterFeedback");
     if (!summary || !list || !feedback) return;
+    const dialog = list.closest("dialog");
+    if (dialog && !dialog.dataset.purchasePaintCleanupBound) {
+      dialog.dataset.purchasePaintCleanupBound = "1";
+      dialog.addEventListener("close", () => {
+        if (!dialog.open) list.rowPaintRevision = (list.rowPaintRevision || 0) + 1;
+      });
+    }
     const invalidRange = state.purchaseDateFrom && state.purchaseDateTo && state.purchaseDateFrom > state.purchaseDateTo;
     const purchases = invalidRange ? [] : purchaseMovements();
     const totalUnits = purchases.reduce((sum, movement) => sum + Number(movement.delta || 0), 0);
@@ -7999,14 +8062,14 @@ const App = (() => {
     const productCount = new Set(purchases.map((movement) => String(movement.productId || movement.product))).size;
     summary.innerHTML = `
       <article><span>${icon("wallet-cards", 20)} Total invertido</span><strong>${money(totalSpent)}</strong><small>Seg&uacute;n los filtros actuales</small></article>
-      <article><span>${icon("package-plus", 20)} Unidades compradas</span><strong>${totalUnits.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong><small>En ${purchases.length} ${purchases.length === 1 ? "registro" : "registros"}</small></article>
+      <article><span>${icon("package-plus", 20)} Unidades compradas</span><strong>${reportNumber(totalUnits)}</strong><small>En ${purchases.length} ${purchases.length === 1 ? "registro" : "registros"}</small></article>
       <article><span>${icon("boxes", 20)} Productos</span><strong>${productCount}</strong><small>Productos distintos</small></article>`;
     feedback.textContent = invalidRange
       ? "La fecha inicial no puede ser posterior a la fecha final."
       : `${purchases.length} ${purchases.length === 1 ? "compra encontrada" : "compras encontradas"}.`;
     feedback.classList.toggle("is-error", Boolean(invalidRange));
-    list.innerHTML = purchases.length
-      ? purchases.map((movement) => {
+    const rowRenderers = purchases.length
+      ? purchases.map((movement) => () => {
           const quantity = Number(movement.delta || 0);
           const unitCost = purchaseUnitCost(movement);
           const total = quantity * unitCost;
@@ -8017,7 +8080,7 @@ const App = (() => {
             <span class="purchase-record-icon">${icon("shopping-basket", 20)}</span>
             <div class="purchase-record-main"><strong>${escapeHTML(productName)}</strong><small>${escapeHTML(movement.code || "Sin siglas")} &middot; ${escapeHTML(formatIncomeDate(movement.date))}</small></div>
             <div class="purchase-record-calculation">
-              <span>Agregaste <strong>${quantity.toLocaleString("es-CO", { maximumFractionDigits: 2 })}</strong> ${quantity === 1 ? "unidad" : "unidades"}</span>
+              <span>Agregaste <strong>${reportNumber(quantity)}</strong> ${quantity === 1 ? "unidad" : "unidades"}</span>
               <small>${exactCost ? "Costo unitario registrado" : "Calculado con el costo actual"}${movement.user ? ` &middot; ${escapeHTML(movement.user)}` : ""}</small>
               <div class="purchase-cost-editor">
                 <label>Costo real por unidad<input type="text" inputmode="numeric" autocomplete="off" value="${formattedCurrencyInput(unitCost)}" data-currency-input data-purchase-unit-cost data-purchase-quantity="${quantity}"></label>
@@ -8026,9 +8089,14 @@ const App = (() => {
             </div>
             <div class="purchase-record-actions"><strong class="purchase-record-total" data-purchase-total>${money(total)}</strong>${movementId ? `<button class="icon-btn danger-text purchase-record-remove" type="button" data-hide-purchase="${escapeHTML(movementId)}" aria-label="Quitar compra de ${escapeHTML(productName)} de la lista" title="Quitar de la lista">${icon("trash-2", 16)}</button>` : ""}</div>
           </article>`;
-        }).join("")
-      : emptyState(invalidRange ? "Revisa las fechas" : "Sin compras", invalidRange ? "Corrige el rango para consultar el historial." : "No hay entradas de unidades que coincidan con estos filtros.", invalidRange ? "calendar-x" : "shopping-cart");
-    bindCurrencyInputs(list);
+        })
+      : [() => emptyState(invalidRange ? "Revisa las fechas" : "Sin compras", invalidRange ? "Corrige el rango para consultar el historial." : "No hay entradas de unidades que coincidan con estos filtros.", invalidRange ? "calendar-x" : "shopping-cart")];
+    if (typeof paintRowsProgressively === "function") {
+      paintRowsProgressively(list, rowRenderers, { afterPaint: rows => rows.forEach(row => bindCurrencyInputs(row)) });
+    } else {
+      list.innerHTML = rowRenderers.map(render => render()).join("");
+      bindCurrencyInputs(list);
+    }
     refreshIcons();
   };
 
@@ -9949,11 +10017,18 @@ const App = (() => {
   };
 
   const renderGeneratedTableQrs = () => {
-    $$("[data-table-qr]").forEach((target) => {
-      const table = state.tables.find((entry) => entry.id === target.dataset.tableQr);
-      if (!table) return;
-      renderQrImage(target, qrTextForTable(table), `QR ${tableLabel(table)}`);
-    });
+    const revision = (renderGeneratedTableQrs.revision || 0) + 1;
+    renderGeneratedTableQrs.revision = revision;
+    if (state.activeAdminSection !== "menu") return;
+    const targets = $$("[data-table-qr]"), tables = new Map(state.tables.map(table => [String(table.id), table]));
+    let offset = 0;
+    const next = async () => {
+      if (revision !== renderGeneratedTableQrs.revision || state.activeAdminSection !== "menu") return;
+      const target = targets[offset++], table = tables.get(String(target?.dataset.tableQr));
+      if (target?.isConnected && table) await renderQrImage(target, qrTextForTable(table), `QR ${tableLabel(table)}`);
+      if (offset < targets.length) window.setTimeout(next, 0);
+    };
+    if (targets.length) window.setTimeout(next, 0);
   };
 
   const renderTableFormQr = () => {
@@ -10119,7 +10194,7 @@ const App = (() => {
 
   const renderTips = () => {
     syncTipFeatureVisibility();
-    if (!tipsEnabled()) return;
+    if (!tipsEnabled() || (state.page === "admin" && state.activeAdminSection !== "tips")) return;
     const kpis = $("#tipsKpis");
     const recordsBox = $("#tipsRecords");
     const peopleInput = $("#tipSplitPeople");
@@ -10128,8 +10203,15 @@ const App = (() => {
     if (!kpis || !recordsBox || !peopleInput || !splitResult) return;
     if (resetButton) resetButton.hidden = !isManager();
     const tipInvoices = state.invoiceHistory
-      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0 && !state.clearedTipInvoiceKeys.has(tipInvoiceKey(invoice)))
-      .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
+      .filter((invoice) => Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0) > 0 && !state.clearedTipInvoiceKeys.has(tipInvoiceKey(invoice)));
+    const signature = JSON.stringify([localDateKey(), state.tipSplitPeople, state.tipSettings.percentage,
+      tipInvoices.map(invoice => [invoice.id, invoice.createdAt, invoice.table, invoice.number, invoice.waiterName,
+        invoice.tipAmount, invoice.baseTotal, invoice.totals])]);
+    if (recordsBox.dataset.renderSignature === signature) return;
+    recordsBox.dataset.renderSignature = signature;
+    tipInvoices.sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
+    const dateFormatter = renderTips.dateFormatter ||= new Intl.DateTimeFormat("es-CO", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+    const timeFormatter = renderTips.timeFormatter ||= new Intl.DateTimeFormat("es-CO", { hour: "2-digit", minute: "2-digit" });
     const todayKey = localDateKey();
     const todayInvoices = tipInvoices.filter((invoice) => localDateKey(invoice.createdAt) === todayKey);
     const todayTotal = todayInvoices.reduce((sum, invoice) => sum + Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0), 0);
@@ -10141,20 +10223,20 @@ const App = (() => {
       <article><span>${icon("percent", 20)} Porcentaje activo</span><strong>${state.tipSettings.percentage}%</strong><small>Aplicado solo cuando el cliente lo acepta</small></article>
       <article><span>${icon("users-round", 20)} Por persona</span><strong>${money(todayTotal / people)}</strong><small>Dividido entre ${people} ${people === 1 ? "persona" : "personas"}</small></article>`;
     splitResult.innerHTML = `<span>A cada persona le corresponde</span><strong>${money(todayTotal / people)}</strong><small>${money(todayTotal)} ÷ ${people}</small>`;
-    recordsBox.innerHTML = tipInvoices.length
-      ? tipInvoices.map((invoice) => {
+    if (tipInvoices.length) paintRowsProgressively(recordsBox, tipInvoices.map(invoice => () => {
           const date = new Date(invoice.createdAt || Date.now());
           const tip = Number(invoice.tipAmount ?? invoice.totals?.tip ?? 0);
           const chargedTotal = Number(invoice.totals?.total || 0);
           const baseTotal = Number(invoice.baseTotal ?? invoice.totals?.baseTotal ?? chargedTotal - tip);
           return `<article class="tip-record">
             <span class="tip-record-icon">${icon("receipt-text", 18)}</span>
-            <div><strong>${escapeHTML(invoice.table || "Venta")}</strong><span>${escapeHTML(invoice.number || "Factura")}</span><small>${date.toLocaleDateString("es-CO", { weekday: "long", day: "numeric", month: "long", year: "numeric" })} · ${date.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}</small><small>${escapeHTML(invoice.waiterName || "Equipo")} · Consumo ${money(baseTotal)} · Cobrado ${money(chargedTotal)}</small></div>
+            <div><strong>${escapeHTML(invoice.table || "Venta")}</strong><span>${escapeHTML(invoice.number || "Factura")}</span><small>${dateFormatter.format(date)} · ${timeFormatter.format(date)}</small><small>${escapeHTML(invoice.waiterName || "Equipo")} · Consumo ${money(baseTotal)} · Cobrado ${money(chargedTotal)}</small></div>
             <strong>+${money(tip)}</strong>
           </article>`;
-        }).join("")
-      : emptyState("Aún no hay propinas facturadas", "Cuando cobres una cuenta con propina aparecerá aquí con todos sus detalles.", "hand-coins");
-    refreshIcons();
+        }));
+    else { recordsBox.rowPaintRevision = (recordsBox.rowPaintRevision || 0) + 1; recordsBox.innerHTML = emptyState("Aún no hay propinas facturadas", "Cuando cobres una cuenta con propina aparecerá aquí con todos sus detalles.", "hand-coins"); }
+    refreshIcons(kpis);
+    refreshIcons(recordsBox);
   };
 
   const resetTips = () => {
@@ -10995,9 +11077,50 @@ const App = (() => {
     if (!target) return;
     const quickSale = isLocalWalkInSession(session);
     const items = (session.session_items || []).filter((item) => item.status !== "cancelled");
-    target.innerHTML = items.length
-      ? items.map((item) => `<div${quickSale ? ` data-edit-walk-in-item="${escapeHTML(item.id)}" title="Doble clic para editar este producto"` : ""} class="${quickSale ? "payment-walk-in-line" : ""} ${quickSale && state.individualProductFlashes?.get(item) > Date.now() ? "consumption-just-added" : ""}"><span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong>${quickSale ? `<button class="icon-btn danger" type="button" data-remove-walk-in-item="${escapeHTML(item.id)}" aria-label="Quitar ${escapeHTML(item.item_name)}" title="Quitar producto">${icon("x", 15)}</button>` : ""}</div>`).join("")
-      : '<p class="payment-empty-sale">Agrega el producto para continuar con el cobro.</p>';
+    // Keep the existing rows and their icons/animations when the scanner appends
+    // another unit. Rebuilding the whole cart on every scan gets slower as it grows.
+    if (target.paymentSessionId !== session.id || target.paymentQuickSale !== quickSale) {
+      target.replaceChildren();
+      target.paymentRows = new Map();
+      target.paymentSessionId = session.id;
+      target.paymentQuickSale = quickSale;
+    }
+    const rows = target.paymentRows ||= new Map();
+    if (!items.length) {
+      if (!target.querySelector('.payment-empty-sale')) target.innerHTML = '<p class="payment-empty-sale">Agrega el producto para continuar con el cobro.</p>';
+      rows.clear();
+      return;
+    }
+    target.querySelector('.payment-empty-sale')?.remove();
+    const activeKeys = new Set();
+    const now = Date.now();
+    let position = target.firstElementChild;
+    items.forEach((item, index) => {
+      const key = String(item.id || `line-${index}`);
+      activeKeys.add(key);
+      let row = rows.get(key);
+      if (!row) {
+        row = document.createElement('div');
+        rows.set(key, row);
+      }
+      const signature = JSON.stringify([item.id, item.item_name, Number(item.quantity || 0), Number(item.unit_price || 0)]);
+      if (row.paymentLineSignature !== signature) {
+        row.innerHTML = `<span>${Number(item.quantity || 0)} &times; ${escapeHTML(item.item_name)}</span><strong>${money(Number(item.quantity || 0) * Number(item.unit_price || 0))}</strong>${quickSale ? `<button class="icon-btn danger" type="button" data-remove-walk-in-item="${escapeHTML(item.id)}" aria-label="Quitar ${escapeHTML(item.item_name)}" title="Quitar producto">${icon("x", 15)}</button>` : ""}`;
+        if (quickSale) {
+          row.dataset.editWalkInItem = item.id;
+          row.title = "Doble clic para editar este producto";
+        }
+        row.paymentLineSignature = signature;
+      }
+      row.classList.toggle('payment-walk-in-line', quickSale);
+      row.classList.toggle('consumption-just-added', quickSale && state.individualProductFlashes?.get(item) > now);
+      row.classList.toggle('barcode-last-added', quickSale && state.lastBarcodeScan?.sessionId === session.id && state.lastBarcodeScan?.itemId === item.id);
+      if (row !== position) target.insertBefore(row, position);
+      position = row.nextElementSibling;
+    });
+    for (const [key, row] of rows) {
+      if (!activeKeys.has(key)) { row.remove(); rows.delete(key); }
+    }
   };
 
   const openPaymentDialog = (sessionId) => {
@@ -11975,7 +12098,7 @@ const App = (() => {
     if (!quickCheckout) setTableConsumptionPreviewVisible(Boolean(previewWasVisible));
   };
 
-  const addConsumptionBatch = async (form, drafts) => {
+  const addConsumptionBatch = async (form, drafts, { barcodeScan = false } = {}) => {
     let sessionId = form.session_id.value;
     let session = state.sessions.find((entry) => entry.id === sessionId);
     const pendingTableId = form.pending_table_id.value;
@@ -12035,10 +12158,16 @@ const App = (() => {
     form.session_id.value = optimisticSessionId;
     form.pending_table_id.value = "";
     state.accountsRenderSignature = "";
-    renderAdminLive();
-    renderTableConsumptionPreview(optimisticSession);
-    renderLastConsumptionTime(optimisticSession);
-    toast(`${drafts.length} ${drafts.length === 1 ? "producto agregado" : "productos agregados"} a la cuenta.`, "ok", `consumption-batch-optimistic:${optimisticSessionId}`);
+    if (barcodeScan && isLocalWalkInSession(session)) {
+      // The scanner updates its cart/status below; repaint the background when
+      // checkout closes instead of rebuilding the dashboard for every unit.
+      barcodeLiveRenderPending = true;
+    } else {
+      renderAdminLive();
+      renderTableConsumptionPreview(optimisticSession);
+      renderLastConsumptionTime(optimisticSession);
+    }
+    if (!barcodeScan || !isLocalWalkInSession(session)) toast(`${drafts.length} ${drafts.length === 1 ? "producto agregado" : "productos agregados"} a la cuenta.`, "ok", `consumption-batch-optimistic:${optimisticSessionId}`);
 
     if (isLocalWalkInSession(session)) {
       state.optimisticSessionStates.set(optimisticSessionId, { mode: "upsert", localOnly: true, session: optimisticSession });
@@ -13023,6 +13152,7 @@ const App = (() => {
     $("#individualSaleDraft")?.addEventListener("change", () => void openPermanentIndividualSale());
     $("#paymentDialog")?.addEventListener("close", () => {
       window.setTimeout(() => {
+        if (barcodeLiveRenderPending) { barcodeLiveRenderPending = false; renderAdminLive(); }
         if (state.activeAdminSection === "service" && !state.paymentProcessing
           && !$("#consumptionDialog")?.open && !$("#paymentDialog")?.open) void openPermanentIndividualSale();
       }, 0);

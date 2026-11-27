@@ -96,7 +96,7 @@ function device(server, page = 'client') {
     renderClientQueue() {}, songTurnCount: () => 0, pendingBillIds: () => [], readRequestOutbox: () => [],
     renderAssistant: () => { renders++; }, renderAdminChat: () => { renders++; }, renderAdminLive: () => { renders++; },
     playClientChatReceipt() {}, playAdminChatReceipt() {}, assistantSay() {}, setPeerTyping() {},
-    mergeOptimisticRequests: rows => rows, mergeOptimisticSessions: rows => rows,
+    mergeOptimisticRequests: rows => rows, mergeOptimisticSessions: rows => rows, recoverPendingCheckouts() {},
     refreshBackgroundReports() { if(server.reportGate) { server.reportReads=(server.reportReads||0)+1; return server.reportGate; } }, notifyAdminPeers() {}, flushPeerRefreshes() {}, startConfirmedReportSync() {}, syncConfirmedReports() {}, refreshInventoryFromPeer() {}, isBoss: () => false,
     setRealtimeStatus() {}, refreshCoreNow() {}, loadUsers() {}
   });

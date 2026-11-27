@@ -1,7 +1,7 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),http=require('node:http');
 const {chromium}=require('playwright-core');
 const root=path.resolve(__dirname,'..');
-const instrument=source=>source.replace('  return { init };','  return { init, state, bindAdmin, showAdminSection, renderIncomeReport, incomeFiltersFromForm, loadIncomeReport, previewIncomeSearch, setIncomeRange, createWalkInSale, loadWalkInDrafts, openConsumptionDialog, queueConsumptionDraft, clearConsumptionEntry, confirmConsumptionSelection, resetInventoryForm, editInventoryProduct, saveInventoryProduct, openPaymentDialog, addBarcodeToSale, processPayment };').replace('document.addEventListener("DOMContentLoaded", App.init);','window.salesApi=App;');
+const instrument=source=>source.replace('  return { init };','  return { init, state, bindAdmin, showAdminSection, renderIncomeReport, incomeFiltersFromForm, loadIncomeReport, previewIncomeSearch, setIncomeRange, createWalkInSale, loadWalkInDrafts, openConsumptionDialog, queueConsumptionDraft, clearConsumptionEntry, confirmConsumptionSelection, resetInventoryForm, editInventoryProduct, saveInventoryProduct, openPaymentDialog, addBarcodeToSale, renderPaymentSaleLines, processPayment };').replace('document.addEventListener("DOMContentLoaded", App.init);','window.salesApi=App;');
 async function launch(){
  const server=http.createServer((req,res)=>{
   const file=new URL(req.url,'http://local').pathname.slice(1);
@@ -183,4 +183,45 @@ test('Cobro de pistola y cobro fijo: factura única, descuento de stock y formul
  assert.match(await page.locator('#paymentSaleLines').innerText(),/Agrega el producto/);
  assert.equal(await page.locator('#paymentDialog').evaluate(node=>node.matches(':modal')),false);
  await context.close();}finally{await session.close();}
+});
+
+
+test('Pistola en jornada larga: carrito grande conserva filas, confirma en verde y no cobra al escanear',async()=>{
+ const session=await launch(),errors=[];
+ try{const context=await session.browser.newContext({viewport:{width:1440,height:1000}}),page=await context.newPage();page.setDefaultTimeout(15000);
+ page.on('pageerror',error=>errors.push(error.message));await boot(page,session.url);
+ await page.addScriptTag({path:path.join(root,'vendor/lucide.min.js')});
+ await page.evaluate(()=>{salesApi.state.items[0].barcode='0012345678905';salesApi.showAdminSection('dashboard');});
+ await page.locator('#openBarcodeSale').click();
+ await page.evaluate(()=>{
+  const id=document.querySelector('#paymentForm [name="session_id"]').value,account=salesApi.state.sessions.find(row=>row.id===id);
+  account.session_items=Array.from({length:250},(_,i)=>({id:'seed-'+i,session_id:id,menu_item_id:'p',item_name:'Agua',quantity:1,unit_price:100,status:'served',created_at:new Date().toISOString()}));
+  salesApi.openPaymentDialog(id);
+  window.firstCartRow=document.querySelector('#paymentSaleLines').firstElementChild;
+  window.firstCartIcon=firstCartRow.querySelector('svg');
+ });
+ await page.locator('#paymentForm .payment-methods label').filter({has:page.locator('input[value="transfer"]')}).click();
+ const timings=await page.evaluate(async()=>{
+  const id=document.querySelector('#paymentForm [name="session_id"]').value,times=[];
+  for(let i=0;i<40;i++){
+   const start=performance.now();if(!await salesApi.addBarcodeToSale(id,'0012345678905'))throw Error('Scan failed');times.push(performance.now()-start);
+  }
+  return {maxMs:Math.max(...times),averageMs:times.reduce((sum,n)=>sum+n,0)/times.length};
+ });
+ // A keyboard scanner can enqueue several Enter/Tab terminated codes before painting.
+ await page.evaluate(()=>{const input=document.querySelector('#barcodeSaleInput');for(let i=0;i<10;i++){input.value='0012345678905';input.dispatchEvent(new KeyboardEvent('keydown',{key:i%2?'Tab':'Enter',bubbles:true}));}});
+ await page.waitForFunction(()=>document.querySelectorAll('#paymentSaleLines [data-remove-walk-in-item]').length===300);
+ assert.equal(await page.evaluate(()=>document.querySelector('#paymentSaleLines').firstElementChild===firstCartRow),true,'An earlier product must retain its DOM row');
+ assert.equal(await page.evaluate(()=>firstCartIcon&&firstCartRow.querySelector('svg')===firstCartIcon),true,'Earlier icons must be retained');
+ assert.equal(await page.locator('#paymentSaleLines .barcode-last-added').count(),1);
+ assert.equal(await page.locator('#paymentSaleLines > div').last().evaluate(node=>node.classList.contains('barcode-last-added')&&node.classList.contains('consumption-just-added')),true);
+ await page.waitForTimeout(2300);
+ assert.equal(await page.locator('#paymentSaleLines .barcode-last-added').evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(187, 247, 208)','Green remains visible after animation ends');
+ assert.equal(await page.locator('#paymentForm [name="payment_method"]:checked').inputValue(),'transfer');
+ assert.equal(await page.evaluate(()=>salesApi.state.inventoryMeta.p.stock),100000);
+ assert.equal(await page.evaluate(()=>salesApi.state.invoiceHistory.length),0);
+ assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('tienda_napoles_walk_in_drafts_v1')||'[]').flatMap(row=>row.session_items||[]).length),300,'All scanned products must remain durable before payment');
+ console.log('Large barcode cart scan timings (ms):',JSON.stringify(timings));
+ assert.ok(timings.maxMs<300,'A scan blocked the main thread for '+timings.maxMs+' ms');
+ assert.deepEqual(errors,[]);await context.close();}finally{await session.close();}
 });

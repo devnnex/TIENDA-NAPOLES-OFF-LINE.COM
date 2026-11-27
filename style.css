@@ -5543,3 +5543,10 @@ body[data-page="client"] .client-queue-badge { gap: .65rem; margin-inline: 1rem;
 .barcode-sale-entry small { display: block; margin-top: .5rem; }
 .barcode-sale-entry input { width: 100%; box-sizing: border-box; }
 #individualSaleDraftControl { margin-bottom: 1rem; }
+
+/* A successful scan stays visible even after its brief confirmation pulse. */
+.payment-sale-lines > .barcode-last-added { background: #bbf7d0; border-color: #16a34a; color: #14532d; box-shadow: inset 4px 0 #16a34a; }
+.payment-sale-lines > .barcode-last-added strong { color: #14532d; }
+.payment-sale-lines > .barcode-last-added.consumption-just-added { animation-name: barcodeAddedFlash; }
+@keyframes barcodeAddedFlash { 0%, 100% { background: #bbf7d0; } 50% { background: #86efac; box-shadow: inset 4px 0 #15803d, 0 0 0 2px #86efac; } }
+@media (prefers-reduced-motion: reduce) { .payment-sale-lines > .barcode-last-added.consumption-just-added { animation: none; } }

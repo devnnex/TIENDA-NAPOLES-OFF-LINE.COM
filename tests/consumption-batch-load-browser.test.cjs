@@ -26,7 +26,7 @@ test('OFF-LINE confirma lotes grandes con doble espacio sin duplicarlos y conser
    await page.keyboard.press('Space');await page.keyboard.press('Space');assert.equal(await page.evaluate(()=>inserted.length),batch+1);
    await page.waitForFunction(()=>!document.querySelector('#consumptionDialog').open);assert.ok(await page.evaluate(()=>performance.now()-flashAt)>=2100,'Conserva los 2,2 s del parpadeo.');
   }
-  const result=await page.evaluate(()=>{clearInterval(heartbeat);const rows=batchApi.state.sessions[0].session_items;return {timings,maxLag:Math.max(...lags),batches:inserted.map(rows=>rows.length),lines:rows.length,ids:new Set(rows.map(row=>row.id)).size};});
+  const result=await page.evaluate(()=>{clearInterval(heartbeat);const rows=batchApi.state.sessions.find(session=>session.id==='account').session_items;return {timings,maxLag:Math.max(...lags),batches:inserted.map(rows=>rows.length),lines:rows.length,ids:new Set(rows.map(row=>row.id)).size};});
   assert.deepEqual(result.batches,[80,80,80]);assert.equal(result.lines,740);assert.equal(result.ids,740);assert.deepEqual(errors,[]);
   t.diagnostic(JSON.stringify(result));if(!process.env.POS_BENCHMARK_SOURCE){assert.ok(Math.max(...result.timings)<1500,'La confirmación local no debe bloquear varios segundos.');assert.ok(result.maxLag<1500,'La interfaz debe seguir atendiendo eventos.');}
  }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}

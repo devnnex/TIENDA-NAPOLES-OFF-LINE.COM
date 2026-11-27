@@ -19,7 +19,7 @@ function consumptionContext({open=true,drafts=[],custom=false}={}){
   '#consumptionLayout':layout,'#consumptionSubmitButton span':{},'#consumptionOptionalFields':{},'#tableSessionActions':{},'#consumptionQueueButton':{},'#consumptionEyebrow':{},'#consumptionDialogTitle':{}};
  const notices=[];
  const state={sessions:[session],items:custom?[]:[{id:'product-1',name:'Producto del inventario'}],consumptionDrafts:drafts,consumptionDraftEditIndex:2};
- const context=vm.createContext({state,$:selector=>fields[selector],toast:message=>notices.push(message),
+ const context=vm.createContext({state,$:selector=>fields[selector],toast:message=>notices.push(message),isLocalWalkInSession:()=>false,
   applyConsumptionRoleRestrictions(){},renderConsumptionSelection(){},renderTableConsumptionPreview(){previewRenders++;},refreshConsumptionInventory:async()=>true,
   setCurrencyInputValue(input,value){input.value=value;},inventoryFor:()=>({code:'PR'}),renderConsumptionProductOptions(){},closeConsumptionProductOptions(){},refreshIcons(){}});
  vm.runInContext(section('editConsumption','deleteConsumption')+';globalThis.edit = editConsumption;',context);

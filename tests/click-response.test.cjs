@@ -28,7 +28,7 @@ test('Navegacion muestra contenido durante el clic y conserva el control de perm
     canAccessAdminSection: name => name !== 'users', firstAllowedAdminSection: () => 'service', allowedAdminSections: () => ['service', 'accounts', 'menu'],
     renderAccounts: () => calls.push('accounts'), renderServiceTables: () => calls.push('service'),
     renderWaiterTableSelect() {}, renderMenuManager: () => calls.push('products'),
-    renderTableManager() {}, renderTableFormQr() {}, refreshIcons() {},
+    renderTableManager() {}, renderTableFormQr() {}, renderGeneratedTableQrs() {}, refreshIcons() {},
     window: { setTimeout() { throw Error('No debe diferir el contenido'); }, requestAnimationFrame() { throw Error('No debe diferir el contenido'); } }
   });
   vm.runInContext(section('showAdminSection', 'findTableFromUrl') + ';globalThis.show = showAdminSection;', context);

@@ -1,5 +1,27 @@
 # Instalador de Tienda Napoles Offline
 
+## Version 1.0.46 ? 27 de noviembre de 2026
+
+Optimiza navegacion, catalogo, inventario, compras, movimientos, reportes y
+propinas con renderizado progresivo, reutilizacion del DOM y formateadores,
+indices de busqueda y caches limitadas. Las confirmaciones de sincronizacion
+comparten una limpieza por rafaga para reducir el trabajo en jornadas largas.
+
+La venta con pistola conserva las filas al acumular productos y resalta en
+verde el ultimo producto registrado. Cada lectura mantiene el borrador local;
+el cobro conserva la validacion de stock, factura unica y medio de pago.
+
+Usa cache de interfaz v88; conserva las colas y los datos existentes. No requiere
+migraciones SQL ni un nuevo despliegue de Apps Script. Las pruebas de carga se
+ejecutan automaticamente con el workflow performance-regression.yml.
+
+El cambio de AppVersion activa build-installer-release.yml. Se compila este
+mismo commit y se publica v1.0.46 con un instalador verificado antes de marcarlo
+latest. La landing consulta releases/latest y descarga la nueva version sin
+modificar sus enlaces.
+
+## Historial
+
 La versión 1.0.44 (20 de noviembre de 2026) conserva el diseño de esta copia
 de trabajo y corrige la recuperación de cuentas cobradas. Los cierres durables
 no vuelven a consultar la red ante una lectura atrasada. Cuando REST falla o

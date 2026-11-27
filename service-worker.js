@@ -1,4 +1,4 @@
-const OFFLINE_CACHE = "tienda-napoles-offline-shell-v87";
+const OFFLINE_CACHE = "tienda-napoles-offline-shell-v88";
 const REMOTE_CACHE = "tienda-napoles-offline-remote-v7";
 const OFFLINE_DB = "tienda-napoles-offline-sync-v1";
 const OFFLINE_STORE = "entries";
@@ -471,10 +471,19 @@ const purgeConfirmedEntries = async () => {
     .filter((entry) => entry.status === "confirmed"
       && now - new Date(entry.confirmedAt || 0).getTime() >= CONFIRMED_RETENTION_MS)
     .map((entry) => removeEntry(entry.id)));
+  return entries.some((entry) => entry.status === "confirmed"
+    && now - new Date(entry.confirmedAt || 0).getTime() < CONFIRMED_RETENTION_MS);
 };
 
+let confirmedCleanupTimer = null;
 const scheduleConfirmedCleanup = () => {
-  setTimeout(() => { void purgeConfirmedEntries(); }, CONFIRMED_RETENTION_MS);
+  if (confirmedCleanupTimer !== null) return;
+  confirmedCleanupTimer = setTimeout(async () => {
+    confirmedCleanupTimer = null;
+    // One scan services the entire burst. A newer receipt still gets a later
+    // cleanup even when no further sale arrives to schedule another timer.
+    if (await purgeConfirmedEntries()) scheduleConfirmedCleanup();
+  }, CONFIRMED_RETENTION_MS);
 };
 
 const onlineMutationIds = new Set();
